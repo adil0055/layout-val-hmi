@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layoutval"
+version = "0.1.0"
+description = "Camera-based layout validation for automotive HMI instrument clusters"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+# Every runtime dependency is Apache-2.0 or BSD-3. See docs/licences.md.
+dependencies = [
+    "numpy>=1.24",              # BSD-3
+    "opencv-python-headless>=4.7",  # Apache-2.0 (4.7+ ships ArUco/ChArUco in main)
+    "scikit-image>=0.21",       # BSD-3
+    "PyYAML>=6.0",              # MIT
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+layoutval = "layoutval.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]

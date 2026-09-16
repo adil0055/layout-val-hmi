@@ -1,0 +1,35 @@
+{
+  "name": "cluster_root",
+  "type": "screen",
+  "x": 0, "y": 0, "width": 960, "height": 360,
+  "children": [
+    {
+      "name": "telltale_row",
+      "type": "group",
+      "x": 120, "y": 74, "width": 240, "height": 40,
+      "children": [
+        { "name": "TELLTALE_BATTERY_LOW",  "type": "telltale", "x": 0,   "y": 0, "width": 60, "height": 40 },
+        { "name": "TELLTALE_OIL_PRESSURE", "type": "telltale", "x": 96,  "y": 0, "width": 52, "height": 40 },
+        { "name": "TELLTALE_ABS",          "type": "telltale", "x": 184, "y": 0, "width": 54, "height": 40 }
+      ]
+    },
+    {
+      "name": "speed_group",
+      "type": "group",
+      "x": 432, "y": 250, "width": 62, "height": 22,
+      "children": [
+        { "name": "LABEL_SPEED_UNITS", "type": "text", "x": 0, "y": 0, "width": 62, "height": 22 }
+      ]
+    },
+    {
+      "name": "gauge_group",
+      "type": "group",
+      "x": 660, "y": 100, "width": 200, "height": 200,
+      "children": [
+        { "name": "GAUGE_PLATE",  "type": "image",  "x": 0,  "y": 0,  "width": 200, "height": 200 },
+        { "name": "NEEDLE_SPEED", "type": "needle", "x": 16, "y": 16, "width": 168, "height": 168 }
+      ]
+    },
+    { "name": "FUEL_BAR", "type": "image", "x": 120, "y": 300, "width": 120, "height": 18 }
+  ]
+}
