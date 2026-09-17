@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -41,6 +42,43 @@ from layoutval.repeatability import (
     study_from_measurements,
 )
 from layoutval.types import RunReport, Verdict
+
+
+#: Where a board export comes from, said at the point someone is missing one.
+BOARD_HINT = (
+    "It is written by the cluster: run it with --calibration-export FILE.\n"
+    "       Find an existing one with:  find ~ -name board.json 2>/dev/null"
+)
+
+
+def _require(path_str: str, flag: str, hint: str = "") -> Path:
+    """A missing or unreadable file argument, said plainly.
+
+    These paths are typed at a shell, so the common failures are a typo, a
+    relative path from the wrong directory, and a file that has not been
+    produced yet. A traceback answers none of those; it just says the open
+    failed, forty lines down.
+    """
+    path = Path(path_str).expanduser()
+    if path.is_dir():
+        raise SystemExit(f"error: {flag} {path} is a directory, not a file")
+    if not path.is_file():
+        here = Path.cwd()
+        message = [f"error: {flag} {path} does not exist"]
+        if not path.is_absolute():
+            message.append(f"       (looked relative to {here})")
+        if hint:
+            message.append(f"       {hint}")
+        raise SystemExit("\n".join(message))
+    return path
+
+
+def _read_json(path_str: str, flag: str, hint: str = "") -> Any:
+    path = _require(path_str, flag, hint)
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"error: {flag} {path} could not be read as JSON: {exc}")
 
 
 def _read(path: Path) -> np.ndarray:
@@ -88,7 +126,7 @@ def cmd_calibrate_geometry(args: argparse.Namespace) -> int:
     frame = median_stack(_frames(args.frames))
     intr = None
     if args.intrinsics:
-        intr = Intrinsics.from_dict(json.loads(Path(args.intrinsics).read_text()))
+        intr = Intrinsics.from_dict(_read_json(args.intrinsics, "--intrinsics"))
         frame = Undistorter(intr)(frame)
 
     display_size = tuple(args.display_size)
@@ -124,8 +162,8 @@ def cmd_calibrate_geometry(args: argparse.Namespace) -> int:
 
 
 def cmd_import_design(args: argparse.Namespace) -> int:
-    tree = json.loads(Path(args.export).read_text())
-    field_map = json.loads(Path(args.field_map).read_text()) if args.field_map else None
+    tree = _read_json(args.export, "export")
+    field_map = _read_json(args.field_map, "--field-map") if args.field_map else None
     profile = import_design_tree(
         tree,
         screen=args.screen,
@@ -170,7 +208,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     pipeline.options.frames_per_measurement = min(
         pipeline.options.frames_per_measurement, len(frames)
     )
-    values = json.loads(Path(args.values).read_text()) if args.values else None
+    values = _read_json(args.values, "--values") if args.values else None
 
     # Rectify once and measure that frame, rather than capturing twice: the
     # overlay must be drawn on the same pixels the verdict was formed from.
@@ -225,9 +263,10 @@ def cmd_repeatability(args: argparse.Namespace) -> int:
 
 
 def cmd_linearity(args: argparse.Namespace) -> int:
-    profile = LayoutProfile.load(args.profile)
-    reference = _read(Path(args.reference)) if args.reference else profile.reference()
-    values = json.loads(Path(args.values).read_text()) if args.values else None
+    profile = LayoutProfile.load(_require(args.profile, "--profile"))
+    reference = (_read(_require(args.reference, "--reference")) if args.reference
+                 else profile.reference())
+    values = _read_json(args.values, "--values") if args.values else None
     study = run_linearity(profile, reference, values=values)
     study.save(args.out)
     print(f"wrote {args.out}")
@@ -250,10 +289,11 @@ def cmd_linearity(args: argparse.Namespace) -> int:
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
-    profile = LayoutProfile.load(args.profile)
-    study = RepeatabilityStudy.load(args.study)
+    profile = LayoutProfile.load(_require(args.profile, "--profile"))
+    study = RepeatabilityStudy.load(_require(args.study, "--study"))
     if args.linearity:
-        apply_linearity(profile, LinearityStudy.load(args.linearity))
+        apply_linearity(profile, LinearityStudy.load(
+            _require(args.linearity, "--linearity")))
     result = gate(profile, study)
     print(result.report())
     return 0 if result.passed else 1
@@ -266,7 +306,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
     display_points = None
     display_size = tuple(args.display_size)
     if args.board:
-        board = json.loads(Path(args.board).read_text())
+        board = _read_json(args.board, "--board", BOARD_HINT)
         try:
             # corners_pixel_centre, not corners_qt: the detector puts pixel
             # column x's centre at x, and Qt puts it at x + 0.5.
@@ -275,17 +315,19 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
             display_size = tuple(board["canvas"])
         except (KeyError, TypeError, ValueError) as exc:
             raise SystemExit(
-                f"{args.board} is not a board export ({exc}). It should be what "
-                "the HMI's --calibration-export writes."
+                f"error: {args.board} is not a board export ({exc}). It should be "
+                "what the cluster's --calibration-export writes."
             )
         print(f"board: {pattern[0]}x{pattern[1]} inner corners on a "
               f"{display_size[0]}x{display_size[1]} canvas, from {args.board}")
 
-    profile = LayoutProfile.load(args.profile) if args.profile else None
-    calibration = Calibration.load(args.calibration) if args.calibration else None
+    profile = (LayoutProfile.load(_require(args.profile, "--profile"))
+               if args.profile else None)
+    calibration = (Calibration.load(_require(args.calibration, "--calibration"))
+                   if args.calibration else None)
     if calibration is None and args.intrinsics:
         calibration = Calibration(
-            intrinsics=Intrinsics.from_dict(json.loads(Path(args.intrinsics).read_text())),
+            intrinsics=Intrinsics.from_dict(_read_json(args.intrinsics, "--intrinsics")),
             geometry=DisplayGeometry(H=np.eye(3), display_size=tuple(args.display_size)),
         )
 
@@ -300,7 +342,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         display_size=display_size,
         fixed_camera=args.fixed_camera,
         drift_alarm_px=args.drift_alarm_px,
-        values=json.loads(Path(args.values).read_text()) if args.values else None,
+        values=_read_json(args.values, "--values") if args.values else None,
     )
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
 
