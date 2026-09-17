@@ -222,6 +222,7 @@ class CaptureSession:
         pattern_size: tuple[int, int] = (9, 6),
         square_px: float = 100.0,
         pattern_origin: tuple[float, float] = (0.0, 0.0),
+        display_points: np.ndarray | None = None,
         display_size: tuple[int, int] | None = None,
         fixed_camera: bool = False,
         drift_alarm_px: float = 2.0,
@@ -235,6 +236,10 @@ class CaptureSession:
         self.pattern_size = pattern_size
         self.square_px = square_px
         self.pattern_origin = pattern_origin
+        self.display_points = (
+            None if display_points is None
+            else np.asarray(display_points, dtype=np.float64).reshape(-1, 2)
+        )
         self.fixed_camera = fixed_camera
         self.drift_alarm_px = drift_alarm_px
         self.values = values or {}
@@ -302,8 +307,16 @@ class CaptureSession:
                             when=datetime.now().isoformat(timespec="seconds"))
         self._store(rec.name, frame)
         undistorted = self._undistort(frame)
-        points = chessboard_display_points(
-            self.pattern_size, self.square_px, self.pattern_origin
+        # Prefer the board's own exported corners over reconstructing them.
+        # The HMI writes exactly where it drew them, which sidesteps both
+        # guessing the square size and the half-pixel between Qt's convention
+        # and the detector's -- and that half pixel goes straight into the
+        # homography and from there into every measurement through it.
+        points = (
+            self.display_points if self.display_points is not None
+            else chessboard_display_points(
+                self.pattern_size, self.square_px, self.pattern_origin
+            )
         )
         try:
             geometry = homography_from_display_pattern(

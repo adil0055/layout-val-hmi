@@ -74,8 +74,19 @@ and have the answer come back. Start the server on the machine that will do the
 measuring:
 
 ```bash
-layoutval capture-server --profile profiles/main.yaml --pattern 14 5 --square-px 100
+# on the cluster machine: put it on its board and write out where the corners are
+./run.sh --calibration checker --calibration-export board.json
+
+# on the machine doing the measuring
+layoutval capture-server --board board.json --profile profiles/main.yaml
 ```
+
+`--board` takes the file the cluster's own `--calibration-export` writes, which
+carries the exact corner coordinates. Prefer it over describing the board with
+`--pattern`/`--square-px`/`--origin`: nothing has to be guessed, and it uses the
+pixel-centre corners rather than Qt's, which differ by half a pixel — and that
+half pixel goes straight into the homography and from there into every
+measurement taken through it.
 
 It prints a URL carrying a one-run token. Open it on a phone on the same
 network and walk three steps:

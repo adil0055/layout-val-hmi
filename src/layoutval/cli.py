@@ -262,6 +262,25 @@ def cmd_gate(args: argparse.Namespace) -> int:
 def cmd_capture_server(args: argparse.Namespace) -> int:
     from layoutval.server import CaptureSession, CaptureServer
 
+    pattern = tuple(args.pattern)
+    display_points = None
+    display_size = tuple(args.display_size)
+    if args.board:
+        board = json.loads(Path(args.board).read_text())
+        try:
+            # corners_pixel_centre, not corners_qt: the detector puts pixel
+            # column x's centre at x, and Qt puts it at x + 0.5.
+            display_points = np.array(board["corners_pixel_centre"], dtype=np.float64)
+            pattern = tuple(board["pattern_size"])
+            display_size = tuple(board["canvas"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SystemExit(
+                f"{args.board} is not a board export ({exc}). It should be what "
+                "the HMI's --calibration-export writes."
+            )
+        print(f"board: {pattern[0]}x{pattern[1]} inner corners on a "
+              f"{display_size[0]}x{display_size[1]} canvas, from {args.board}")
+
     profile = LayoutProfile.load(args.profile) if args.profile else None
     calibration = Calibration.load(args.calibration) if args.calibration else None
     if calibration is None and args.intrinsics:
@@ -274,10 +293,11 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         Path(args.out),
         profile=profile,
         calibration=calibration,
-        pattern_size=tuple(args.pattern),
+        pattern_size=pattern,
         square_px=args.square_px,
         pattern_origin=tuple(args.origin),
-        display_size=tuple(args.display_size),
+        display_points=display_points,
+        display_size=display_size,
         fixed_camera=args.fixed_camera,
         drift_alarm_px=args.drift_alarm_px,
         values=json.loads(Path(args.values).read_text()) if args.values else None,
@@ -409,9 +429,14 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--profile", help="layout profile; without one, only calibrate and reference work")
     c.add_argument("--calibration", help="start from a stored rig calibration")
     c.add_argument("--intrinsics", help="camera intrinsics, if you have them")
+    c.add_argument("--board",
+                   help="the cluster's own board export (its --calibration-export). "
+                        "Preferred: it carries the exact corners, so nothing has to "
+                        "be guessed or converted")
     c.add_argument("--display-size", nargs=2, type=int, default=[1920, 720])
     c.add_argument("--pattern", nargs=2, type=int, default=[9, 6],
-                   help="inner corners of the chessboard the cluster draws")
+                   help="inner corners of the chessboard the cluster draws; "
+                        "ignored when --board is given")
     c.add_argument("--square-px", type=float, default=100.0)
     c.add_argument("--origin", nargs=2, type=float, default=[0.0, 0.0],
                    help="display coordinate of the board's first inner corner region")
