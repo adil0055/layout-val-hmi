@@ -341,13 +341,82 @@ def test_reference_refuses_before_calibration(server, rig):
     assert "calibrate" in result["detail"]
 
 
-def test_calibration_says_so_when_the_board_is_not_there(server, rig):
-    """The usual cause is the wrong screen, and the message has to say that."""
+def test_calibration_says_the_board_was_never_shown(server, rig):
+    """Selecting Calibrate does not put a board on the cluster, and the
+    overwhelmingly common failure is thinking that it does."""
     host, port = server.server_address
     url = f"http://{host}:{port}/upload?t={server.token}"
     result = post(url, "calibrate", shoot(rig, "main"))
     assert result["verdict"] == "FAILED"
-    assert "board" in result["detail"] or "pattern not found" in result["detail"]
+    detail = result["detail"]
+    assert "does not look like one" in detail
+    assert "showing the pattern" in detail
+    assert "-calibrate.jpg" in detail  # and where to go and look
+
+
+def test_calibration_distinguishes_a_board_it_could_not_read(rig, tmp_path):
+    """A board that is present but does not match is a different problem."""
+    session = CaptureSession(tmp_path / "caps", pattern_size=(20, 20),
+                             display_size=rig.display.size)
+    srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = srv.server_address
+        result = post(f"http://{host}:{port}/upload?t={srv.token}",
+                      "calibrate", shoot(rig, "checkerboard"))
+        assert result["verdict"] == "FAILED"
+        assert "did not read as 20x20" in result["detail"]
+        assert "does not look like one" not in result["detail"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_hand_described_board_says_it_cannot_be_confirmed(rig, tmp_path):
+    """A detector will match a smaller grid inside a bigger one.
+
+    Asking for a 3x3 board of 40 px squares is a self-consistent reading of the
+    9x6 one the cluster drew: it solves cleanly, at the wrong scale, and the
+    sampling ratio comes out around 2, which is exactly what a good calibration
+    looks like. Nothing at this end can tell the two apart, so the caveat has to
+    be stated rather than a check implied.
+    """
+    session = CaptureSession(tmp_path / "caps", pattern_size=(3, 3),
+                             square_px=40.0, display_size=rig.display.size)
+    srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = srv.server_address
+        result = post(f"http://{host}:{port}/upload?t={srv.token}",
+                      "calibrate", shoot(rig, "checkerboard"))
+        # It does succeed, and that is the point being documented.
+        assert result["verdict"] == "OK", result
+        assert "described by hand" in result["detail"]
+        assert "wrong scale" in result["detail"]
+        assert "--board" in result["detail"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_board_export_carries_no_such_caveat(rig, tmp_path):
+    """With the cluster's own corners there is nothing to second-guess."""
+    import numpy as _np
+
+    from layoutval.calibration import chessboard_display_points
+
+    points = chessboard_display_points(PATTERN, SQUARE_PX, PATTERN_ORIGIN)
+    session = CaptureSession(tmp_path / "caps", pattern_size=PATTERN,
+                             display_points=_np.asarray(points),
+                             display_size=rig.display.size)
+    srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = srv.server_address
+        result = post(f"http://{host}:{port}/upload?t={srv.token}",
+                      "calibrate", shoot(rig, "checkerboard"))
+        assert result["verdict"] == "OK", result
+        assert "described by hand" not in result["detail"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def test_calibrate_then_reference_then_validate(server, rig, tmp_path):

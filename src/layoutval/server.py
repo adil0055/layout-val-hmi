@@ -394,13 +394,9 @@ class CaptureSession:
             geometry = homography_from_display_pattern(
                 undistorted, self.pattern_size, points, display_size=self.display_size
             )
-        except RuntimeError as exc:
+        except RuntimeError:
             rec.verdict = "FAILED"
-            rec.detail = (
-                f"{exc} Check the whole board is in frame, square on, and that "
-                f"--pattern matches what the cluster is drawing "
-                f"({self.pattern_size[0]}x{self.pattern_size[1]} inner corners)."
-            )
+            rec.detail = self._why_no_board(frame, rec.name)
             return rec
 
         self.calibration = Calibration(
@@ -417,6 +413,21 @@ class CaptureSession:
             f"{geometry.residual_px:.3f} camera px, sampling ratio {ratio:.2f} "
             "camera px per display px"
         )
+        # A chessboard detector will find a smaller grid inside a bigger one, so
+        # a pattern size that does not match what was drawn need not fail: it can
+        # solve cleanly at the wrong scale, and nothing downstream notices. There
+        # is no test for it here -- describing a 3x3 board of 40 px squares is a
+        # self-consistent reading of a 9x6 one, and this end cannot know which
+        # was drawn. Only the board's own export can settle it, so say plainly
+        # when it was not used rather than imply the question was checked.
+        if self.display_points is None:
+            rec.detail += (
+                ". Note: the board was described by hand rather than taken from "
+                "--board, so nothing here can confirm it is the board the cluster "
+                "actually drew -- a detector will match a smaller grid inside a "
+                "larger one and solve cleanly at the wrong scale. Prefer --board "
+                "with the file the cluster exported"
+            )
         if ratio < 2.0:
             rec.detail += (
                 ". Below 2 you cannot reliably resolve a one-display-pixel "
@@ -427,6 +438,39 @@ class CaptureSession:
         self.reference = None
         self.reference_camera = None
         return rec
+
+    def _why_no_board(self, frame: np.ndarray, saved_as: str) -> str:
+        """Why a calibration frame had no chessboard in it.
+
+        Overwhelmingly the answer is that the cluster was not showing one --
+        selecting Calibrate on the phone says how to read the photograph, it
+        does not put a board on the screen. That is worth distinguishing from a
+        board that is present but unreadable, because the two have nothing to do
+        with each other, and the frame itself is on disk either way.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean, spread = float(gray.mean()), float(gray.std())
+        wanted = f"{self.pattern_size[0]}x{self.pattern_size[1]} inner corners"
+        where = f"The frame is saved as {saved_as} -- open it and see what it caught."
+
+        # A chessboard filling the frame is half black and half white, so it has
+        # a wide spread. A cluster screen is mostly dark background.
+        if spread < 45:
+            return (
+                "no chessboard here, and this frame does not look like one: it is "
+                f"{'very dark' if mean < 50 else 'low in contrast'} "
+                f"(mean {mean:.0f}, spread {spread:.0f} of 255). "
+                "Is the cluster actually showing the pattern? Selecting Calibrate "
+                "here only says how to read the photograph; the cluster has to be "
+                f"put on its chessboard separately. {where}"
+            )
+        return (
+            f"a board may be there but it did not read as {wanted}. Fill the frame "
+            "with it, square on, with the whole board and a margin around it "
+            "visible, and watch for glare on the glass. If the cluster is drawing "
+            "a different board, re-export it and restart with that --board file. "
+            f"{where}"
+        )
 
     def _reference(self, frame: np.ndarray, base: str) -> CaptureRecord:
         rec = CaptureRecord(name=f"{base}.jpg", action="reference",
