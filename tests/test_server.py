@@ -433,12 +433,14 @@ def test_calibrate_then_reference_then_validate(server, rig, tmp_path):
 
     result = post(url, "reference", shoot(rig))
     assert result["verdict"] == "OK", result["detail"]
-    assert get(f"http://{host}:{port}/status?t={server.token}")["has_reference"] is True
+    status = get(f"http://{host}:{port}/status?t={server.token}")
+    assert status["has_reference"] is True
+    # No profile was loaded, so the reference supplied the inventory.
+    assert status["auto_inventory"] is True
+    assert status["elements"] > 0
 
-    # No profile was loaded, so there is no inventory to measure against.
     result = post(url, "validate", shoot(rig))
-    assert result["verdict"] == "FAILED"
-    assert "profile" in result["detail"]
+    assert result["verdict"] in ("PASS", "REVIEW"), result
 
     assert (server.session.out_dir / "calibration.json").is_file()
 
@@ -515,6 +517,112 @@ def test_a_captured_fault_is_measured_and_reported(tmp_path):
 
         overlay = session.out_dir / faulty["overlay"]
         assert overlay.is_file()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_the_whole_loop_works_with_no_profile_at_all(tmp_path):
+    """Calibrate, reference, validate -- with nothing authored.
+
+    This is the state a rig is in before anyone has exported a design or taught
+    a signal, and it has to be able to answer something rather than nothing.
+    """
+    bench = build_bench()
+    bench.reset()
+    session = CaptureSession(
+        tmp_path / "captures",
+        pattern_size=PATTERN,
+        square_px=SQUARE_PX,
+        pattern_origin=PATTERN_ORIGIN,
+        display_size=bench.display.size,
+        fixed_camera=True,
+    )
+    assert session.profile is None
+    srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = srv.server_address
+        url = f"http://{host}:{port}/upload?t={srv.token}"
+
+        # Each refusal has to say which step is missing, in the order they
+        # are needed rather than whichever check happens to run first.
+        early = post(url, "validate", shoot(bench.rig))
+        assert early["verdict"] == "FAILED"
+        assert "calibrate first" in early["detail"]
+
+        bench.rig.show("checkerboard")
+        assert post(url, "calibrate", bench.rig.read())["verdict"] == "OK"
+        bench.rig.show("main")
+
+        no_reference = post(url, "validate", bench.rig.read())
+        assert no_reference["verdict"] == "FAILED"
+        assert "reference" in no_reference["detail"]
+
+        taken = post(url, "reference", bench.rig.read())
+        assert taken["verdict"] == "OK", taken
+        assert "found in this frame" in taken["detail"]
+        assert session.profile is not None and len(session.profile) >= 4
+        assert all(spec.source == "auto" for spec in session.profile)
+
+        status = get(f"http://{host}:{port}/status?t={srv.token}")
+        assert status["auto_inventory"] is True
+        assert status["elements"] == len(session.profile)
+
+        # Nothing changed, so nothing should be reported.
+        clean = post(url, "validate", bench.rig.read())
+        assert clean["verdict"] in ("PASS", "REVIEW"), clean
+
+        # Move one element and it has to come back, named for where it was.
+        bench.display.offsets["TELLTALE_ABS"] = (6.0, 0.0)
+        faulty = post(url, "validate", bench.rig.read())
+        assert faulty["verdict"] == "FAIL", faulty
+        moved = [r for r in faulty["rows"] if r["verdict"] == "FAIL"]
+        assert moved, faulty
+        assert any(r["id"].startswith("auto@") for r in moved)
+        assert any("6." in r["detail"] or "5." in r["detail"] for r in moved), moved
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_an_authored_profile_is_never_replaced_by_a_discovered_one(rig, tmp_path):
+    """The authored inventory is the better answer and must survive."""
+    from layoutval.profile import LayoutProfile
+    from layoutval.types import ElementSpec
+
+    authored = LayoutProfile("mine", rig.display.size)
+    authored.add(ElementSpec(id="MINE", bbox=(100.0, 100.0, 40.0, 40.0)))
+    session = CaptureSession(tmp_path / "caps", profile=authored,
+                             pattern_size=PATTERN, square_px=SQUARE_PX,
+                             pattern_origin=PATTERN_ORIGIN,
+                             display_size=rig.display.size)
+    srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = srv.server_address
+        url = f"http://{host}:{port}/upload?t={srv.token}"
+        assert post(url, "calibrate", shoot(rig, "checkerboard"))["verdict"] == "OK"
+        taken = post(url, "reference", shoot(rig))
+        assert taken["verdict"] == "OK"
+        assert "found in this frame" not in taken["detail"]
+        assert [spec.id for spec in session.profile] == ["MINE"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_auto_inventory_can_be_turned_off(rig, tmp_path):
+    session = CaptureSession(tmp_path / "caps", auto_profile=False,
+                             pattern_size=PATTERN, square_px=SQUARE_PX,
+                             pattern_origin=PATTERN_ORIGIN,
+                             display_size=rig.display.size)
+    srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = srv.server_address
+        url = f"http://{host}:{port}/upload?t={srv.token}"
+        assert post(url, "calibrate", shoot(rig, "checkerboard"))["verdict"] == "OK"
+        assert post(url, "reference", shoot(rig))["verdict"] == "OK"
+        assert session.profile is None
+        assert post(url, "validate", shoot(rig))["verdict"] == "FAILED"
     finally:
         srv.shutdown()
         srv.server_close()

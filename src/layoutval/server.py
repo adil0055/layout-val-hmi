@@ -63,6 +63,7 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
+from layoutval.autoprofile import profile_from_reference
 from layoutval.calibration import (
     Calibration,
     DriftTracker,
@@ -299,6 +300,7 @@ class CaptureSession:
         fixed_camera: bool = False,
         drift_alarm_px: float = 2.0,
         values: dict[str, float] | None = None,
+        auto_profile: bool = True,
     ) -> None:
         self.lock = threading.Lock()
         self.out_dir = Path(out_dir)
@@ -315,6 +317,8 @@ class CaptureSession:
         self.fixed_camera = fixed_camera
         self.drift_alarm_px = drift_alarm_px
         self.values = values or {}
+        self.auto_profile = auto_profile
+        self._profile_is_auto = False
         self.display_size = display_size or (
             calibration.geometry.display_size if calibration else (1920, 720)
         )
@@ -340,6 +344,7 @@ class CaptureSession:
             "calibrated": self.calibration is not None,
             "has_reference": self.reference is not None,
             "has_profile": self.profile is not None,
+            "auto_inventory": self._profile_is_auto,
             "elements": len(self.profile) if self.profile else 0,
             "display_size": list(self.display_size),
             "fixed_camera": self.fixed_camera,
@@ -492,6 +497,25 @@ class CaptureSession:
             f"rectified to {self.reference.shape[1]}x{self.reference.shape[0]} "
             "display px and kept as the reference"
         )
+
+        # With no authored inventory, take one from the frame itself rather than
+        # having nothing to measure. Only ever replaces an inventory this made
+        # earlier -- an authored profile is the better answer and is left alone.
+        if self.auto_profile and (self.profile is None or self._profile_is_auto):
+            found = profile_from_reference(
+                self.reference,
+                screen=self.profile.screen if self.profile else "auto",
+                display_size=self.display_size,
+            )
+            self.profile = found
+            self._profile_is_auto = True
+            rec.detail += (
+                f". No layout profile was loaded, so {len(found)} element(s) were "
+                "found in this frame and will be measured against it. That answers "
+                "whether a later frame matches this one, not whether the build "
+                "matches the design, and it treats everything as fixed -- keep the "
+                "cluster in the state it is in now"
+            )
         return rec
 
     def _validate(self, frame: np.ndarray, base: str) -> CaptureRecord:
@@ -508,7 +532,10 @@ class CaptureSession:
             return rec
         if self.profile is None:
             rec.verdict = "FAILED"
-            rec.detail = "no layout profile loaded, so there is no inventory to measure"
+            rec.detail = (
+                "no inventory to measure. Take a reference first -- with no "
+                "--profile, the elements are found in the reference frame"
+            )
             return rec
 
         undistorted = self._undistort(frame)
@@ -676,7 +703,9 @@ async function refresh() {
     const s = await r.json();
     $("s-cal").textContent = s.calibrated ? "yes" : "no";
     $("s-ref").textContent = s.has_reference ? "yes" : "no";
-    $("s-el").textContent = s.has_profile ? s.elements : "no profile";
+    $("s-el").textContent = s.has_profile
+      ? s.elements + (s.auto_inventory ? " (from reference)" : "")
+      : "after reference";
     $("s-sr").textContent = s.sampling_ratio ? s.sampling_ratio.toFixed(2) : "—";
     $("s-n").textContent = s.captures;
     document.querySelector('[data-a="calibrate"]').classList.toggle("done", s.calibrated);

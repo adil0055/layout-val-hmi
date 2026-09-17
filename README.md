@@ -64,6 +64,7 @@ FUEL_BAR              injected (+2.25,+0.00) px  measured (+2.02,-0.01) px  -> R
 | `linearity` | Sub-pixel bias per element. |
 | `report` | JSON, annotated overlays, JUnit. |
 | `server` | Phone capture over the local network, and the page it opens. |
+| `autoprofile` | An inventory taken from the reference frame, when there is no authored one. |
 | `authoring` | Snap assistance and a segmentation-model hook — **authoring only**. |
 | `simulator` | Synthetic cluster and virtual camera, for tests and the demo. |
 
@@ -105,6 +106,32 @@ Open it on a phone on the same network and walk three steps:
 
 The verdict, the failing elements and the annotated overlay come back to the
 phone. Captures, reports and overlays land in `--out`.
+
+### Without a layout profile
+
+There is nothing to measure until an inventory exists, and building one —
+exporting it from the design tool, or teaching it by toggling CAN signals — is a
+piece of work. So when no `--profile` is given, the **Reference** step takes an
+inventory from the reference frame itself: a cluster is bright elements on a
+dark background, which segments cleanly, and each lit region becomes a
+measurable element.
+
+It works, to the same sub-pixel accuracy, and it is the weaker of the two
+questions:
+
+- it answers **does this frame match the reference frame**, not *does the build
+  match the design*. A layout error present when the reference was taken is
+  baked into the reference and will never be reported;
+- it cannot name anything, so a defect comes back as `auto@312,75` rather than
+  `TELLTALE_ABS` — the annotated overlay is what turns that back into an
+  element;
+- it treats everything as fixed, so the cluster has to stay in the same state.
+  A needle at a different speed is a moving element to an authored profile and a
+  failure to this one.
+
+Pass `--no-auto-profile` to refuse rather than measure, and `--profile` once
+there is a real inventory; an authored profile is never replaced by a discovered
+one.
 
 **A phone in your hand is not a fixed camera, and this does not pretend
 otherwise.** Every number here rests on the camera not moving, and a hand-held

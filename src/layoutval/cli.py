@@ -349,6 +349,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         fixed_camera=args.fixed_camera,
         drift_alarm_px=args.drift_alarm_px,
         values=_read_json(args.values, "--values") if args.values else None,
+        auto_profile=not args.no_auto_profile,
     )
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
 
@@ -377,6 +378,11 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
     print(f"  Typing it in is fine too — the token is {server.token} and it is not")
     print("  case sensitive, with no letter O, letter l or letter i in it.")
     print()
+    if profile is None and not args.no_auto_profile:
+        print("  No --profile, so the elements will be found in the reference frame.")
+        print("  That measures against the reference, not against the design, and")
+        print("  treats everything as fixed -- keep the cluster in one state.")
+        print()
     print("  1  Calibrate   cluster showing its chessboard, filling the frame")
     print("  2  Reference   cluster showing the screen under test, correct")
     print("  3  Validate    the same screen, with whatever you are testing")
@@ -518,6 +524,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--quiet", action="store_true")
     c.add_argument("--no-qr", action="store_true",
                    help="do not draw the scannable code")
+    c.add_argument("--no-auto-profile", action="store_true",
+                   help="without --profile, do not take an inventory from the "
+                        "reference frame; refuse to validate instead")
     c.set_defaults(func=cmd_capture_server)
 
     c = sub.add_parser("demo", help="run the whole pipeline against the built-in simulator")
