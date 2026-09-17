@@ -10,6 +10,7 @@ import pytest
 
 from layoutval.calibration import (
     Calibration,
+    DisplayGeometry,
     DriftTracker,
     calibrate_intrinsics,
     chessboard_display_points,
@@ -68,6 +69,65 @@ def test_homography_from_display_edges_is_a_workable_fallback():
     corners = geometry.display_to_camera(np.array([[0.0, 0.0], [960.0, 360.0]]))
     truth = bench.geometry.display_to_camera(np.array([[0.0, 0.0], [960.0, 360.0]]))
     assert np.max(np.abs(corners - truth)) < 6.0
+
+
+def test_screen_content_matches_the_chessboard(bench):
+    """No pattern on the screen, and the same answer.
+
+    Scored the way it matters: rectify with each mapping and measure where the
+    elements land against the true framebuffer. benchmarks/calibration_methods.py
+    is the full sweep across pose, focus, sampling and distortion.
+    """
+    from layoutval.autoprofile import profile_from_reference
+    from layoutval.calibration import homography_from_screen_content
+    from layoutval.measure import measure_translation
+
+    truth = bench.display.render()
+    frame = bench.undistort(median_stack(capture(bench.rig, n=5)))
+    geometry = homography_from_screen_content(
+        truth, frame, display_size=bench.display.size
+    )
+    assert geometry.method.startswith("screen_content")
+    assert geometry.inliers >= 12
+
+    probe = profile_from_reference(truth, screen="p", display_size=bench.display.size)
+    assert len(probe) >= 4
+
+    def element_rms(H):
+        rect = DisplayGeometry(H=H, display_size=bench.display.size).rectify(frame)
+        errs = [
+            math.hypot(m.dx, m.dy)
+            for spec in probe
+            for m in [measure_translation(truth, rect, spec)]
+            if m.dx is not None
+        ]
+        return math.sqrt(sum(e * e for e in errs) / len(errs))
+
+    from_content = element_rms(geometry.H)
+    from_board = element_rms(bench.geometry.H)
+    assert from_content < 0.35, from_content
+    # Within a fifth of a pixel of the pattern, having drawn no pattern.
+    assert abs(from_content - from_board) < 0.2, (from_content, from_board)
+
+
+def test_screen_content_refuses_a_nonsense_mapping(bench):
+    """A homography fitted to bad matches can be arithmetically fine and
+    geometrically absurd, and nothing downstream would point back here."""
+    from layoutval.calibration import _check_display_quad
+
+    # A perspective term strong enough to send the far edge behind the camera
+    # turns the quad into a bowtie.
+    folded = np.array([[1.0, 0, 0], [0, 1.0, 0], [0, -0.004, 1.0]])
+    with pytest.raises(RuntimeError, match="folds"):
+        _check_display_quad(folded, (960, 360), (900, 1600))
+
+    # Mirrored: still convex, still the wrong answer.
+    mirrored = np.array([[-1.0, 0, 960.0], [0, 1.0, 0], [0, 0, 1.0]])
+    with pytest.raises(RuntimeError, match="mirrors"):
+        _check_display_quad(mirrored, (960, 360), (900, 1600))
+    tiny = np.array([[0.001, 0, 0], [0, 0.001, 0], [0, 0, 1.0]])
+    with pytest.raises(RuntimeError, match="times the frame area"):
+        _check_display_quad(tiny, (960, 360), (900, 1600))
 
 
 def test_calibrate_intrinsics_refuses_too_few_views():

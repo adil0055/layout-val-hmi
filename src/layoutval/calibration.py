@@ -408,6 +408,157 @@ def homography_from_charuco(
     )
 
 
+def homography_from_screen_content(
+    render: np.ndarray,
+    camera_frame: np.ndarray,
+    *,
+    display_size: tuple[int, int] | None = None,
+    min_inliers: int = 12,
+    ratio: float = 0.75,
+    refine: bool = True,
+    ecc_iterations: int = 400,
+) -> DisplayGeometry:
+    """Method D -- no pattern at all: match the screen against its own framebuffer.
+
+    The other three methods need the cluster to draw something for the benefit
+    of the camera.  This one does not: if the framebuffer is available -- and it
+    is, on the machine running the HMI -- then the screen's own artwork is the
+    calibration target.  ``render`` is that framebuffer, in display coordinates;
+    ``camera_frame`` is a photograph of it.
+
+    Two stages, and both are needed:
+
+    * **SIFT and RANSAC** give the correspondence.  At matched scale that is
+      already as accurate as a chessboard, but it degrades when the render and
+      the photograph differ in scale or sharpness -- 0.05 px becomes 0.7 px on
+      an under-sampled rig, because scale-invariant keypoints localise less
+      precisely across a large scale ratio.
+    * **ECC in homography mode**, seeded from that, closes it back up.  Measured
+      against a chessboard across pose, noise, focus, sampling ratio and lens
+      distortion, the pair stays within about 0.02 px of it everywhere; the
+      seed on its own does not.
+
+    SIFT is used rather than ORB because ORB's seed is far looser (1.16 px
+    against 0.05) -- with ECC behind it either converges to the same answer, but
+    a looser seed is likelier to converge to the wrong one.  SIFT's patent
+    expired in 2020 and it is Apache-2.0 in main OpenCV, so there is no licence
+    reason to avoid it.
+
+    Content does not have to match exactly.  A different speed, a telltale that
+    is off, a bar at another level: all measured within 0.01 px of the
+    matched-content case, because RANSAC discards what moved and the rest of the
+    screen carries the fit.
+    """
+    if display_size is None:
+        display_size = (render.shape[1], render.shape[0])
+    render_gray = to_gray(render)
+    camera_gray = to_gray(camera_frame)
+
+    sift = cv2.SIFT_create()
+    kp_display, desc_display = sift.detectAndCompute(render_gray, None)
+    kp_camera, desc_camera = sift.detectAndCompute(camera_gray, None)
+    if desc_display is None or desc_camera is None or min(len(kp_display), len(kp_camera)) < 8:
+        raise RuntimeError(
+            "too little detail to match on. A nearly blank screen has nothing to "
+            "align; put some content on it, or use a calibration pattern"
+        )
+
+    pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(desc_display, desc_camera, k=2)
+    # Lowe's ratio test: a keypoint whose best match is barely better than its
+    # second best is ambiguous, and a cluster is full of near-identical tick
+    # marks for it to be ambiguous between.
+    good = [m for m, n in pairs if m.distance < ratio * n.distance]
+    if len(good) < min_inliers:
+        raise RuntimeError(
+            f"only {len(good)} confident matches between the framebuffer and the "
+            "photograph. Check the render is of the screen actually on display, "
+            "and that the whole screen is in frame"
+        )
+
+    src = np.float32([kp_display[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([kp_camera[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+    if H is None:
+        raise RuntimeError("homography solve failed on the matched points")
+    inliers = int(mask.sum()) if mask is not None else 0
+    if inliers < min_inliers:
+        raise RuntimeError(
+            f"only {inliers} of {len(good)} matches agreed on a single mapping. "
+            "That usually means the render and the photograph are of different "
+            "screens"
+        )
+
+    method = "screen_content"
+    if refine:
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+                    int(ecc_iterations), 1e-8)
+        try:
+            _, refined = cv2.findTransformECC(
+                render_gray, camera_gray, H.astype(np.float32),
+                cv2.MOTION_HOMOGRAPHY, criteria, None, 5,
+            )
+            H = np.asarray(refined, dtype=np.float64)
+            method = "screen_content+ecc"
+        except cv2.error:
+            # The seed stands. It is the weaker answer and the caller is told.
+            method = "screen_content(unrefined)"
+
+    _check_display_quad(H, display_size, camera_frame.shape)
+    residual = _homography_residual(
+        src.reshape(-1, 2)[mask.ravel() == 1] if mask is not None else src.reshape(-1, 2),
+        dst.reshape(-1, 2)[mask.ravel() == 1] if mask is not None else dst.reshape(-1, 2),
+        H,
+    )
+    geometry = DisplayGeometry(
+        H=H, display_size=display_size, method=method, residual_px=residual
+    )
+    geometry.inliers = inliers  # type: ignore[attr-defined]
+    geometry.matches = len(good)  # type: ignore[attr-defined]
+    return geometry
+
+
+def _check_display_quad(
+    H: np.ndarray, display_size: tuple[int, int], frame_shape: tuple[int, ...]
+) -> None:
+    """Refuse a mapping that does not put the display anywhere sensible.
+
+    A homography fitted to bad correspondences can be arithmetically fine and
+    geometrically nonsense -- folded over, inside out, or mapping the screen to a
+    sliver.  None of that fails later in a way that points back here, so it is
+    caught at the source.
+    """
+    w, h = display_size
+    corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
+    quad = cv2.perspectiveTransform(corners.reshape(-1, 1, 2), H).reshape(-1, 2)
+    if not np.isfinite(quad).all():
+        raise RuntimeError("the solved mapping is not finite")
+    if not cv2.isContourConvex(quad.astype(np.float32)):
+        raise RuntimeError(
+            "the solved mapping folds the display over itself, so the matches it "
+            "was fitted to cannot all be right"
+        )
+    # Shoelace, signed: a convex quad stays convex when mirrored, so convexity
+    # alone does not catch a mapping that has turned the screen back to front.
+    # A camera looking at a display does not do that.
+    signed = 0.0
+    for i in range(4):
+        x0, y0 = quad[i]
+        x1, y1 = quad[(i + 1) % 4]
+        signed += x0 * y1 - x1 * y0
+    if signed <= 0:
+        raise RuntimeError(
+            "the solved mapping mirrors the display, which a camera looking at a "
+            "screen does not do -- the matches it was fitted to are wrong"
+        )
+    area = abs(signed) / 2.0
+    frame_area = float(frame_shape[0] * frame_shape[1])
+    if not 0.01 * frame_area <= area <= 12.0 * frame_area:
+        raise RuntimeError(
+            f"the display maps to {area / frame_area:.3g} times the frame area, "
+            "which is not a camera looking at a screen"
+        )
+
+
 def _fit_line(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Total-least-squares line fit.  Returns (point_on_line, unit_direction)."""
     vx, vy, x0, y0 = cv2.fitLine(

@@ -75,12 +75,21 @@ and have the answer come back. Start the server on the machine that will do the
 measuring:
 
 ```bash
-# on the cluster machine: put it on its board and write out where the corners are
-./run.sh --calibration checker --calibration-export board.json
+# with no pattern at all: hand it the framebuffer and it matches the screen
+./run.sh --screenshot screen.png        # on the cluster machine
+layoutval capture-server --render screen.png
 
-# on the machine doing the measuring
+# or with the cluster's chessboard, which is the more accurate of the two
+./run.sh --calibration checker --calibration-export board.json
 layoutval capture-server --board board.json --profile profiles/main.yaml
 ```
+
+`--render` takes a display-space image of what the cluster is drawing and
+calibrates by matching the screen's own content, so the cluster never has to
+leave the screen under test. It measures within about 0.02 px of the chessboard
+across pose, focus, sampling ratio and lens distortion — see
+`benchmarks/calibration_methods.py` and [docs/rig.md](docs/rig.md). The content
+does not have to match the photograph exactly; RANSAC discards whatever moved.
 
 `--board` takes the file the cluster's own `--calibration-export` writes, which
 carries the exact corner coordinates. Prefer it over describing the board with

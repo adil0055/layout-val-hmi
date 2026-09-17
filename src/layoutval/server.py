@@ -70,6 +70,7 @@ from layoutval.calibration import (
     Undistorter,
     chessboard_display_points,
     homography_from_display_pattern,
+    homography_from_screen_content,
 )
 from layoutval.pipeline import Pipeline, PipelineOptions
 from layoutval.profile import LayoutProfile
@@ -301,6 +302,7 @@ class CaptureSession:
         drift_alarm_px: float = 2.0,
         values: dict[str, float] | None = None,
         auto_profile: bool = True,
+        render: np.ndarray | None = None,
     ) -> None:
         self.lock = threading.Lock()
         self.out_dir = Path(out_dir)
@@ -319,6 +321,10 @@ class CaptureSession:
         self.values = values or {}
         self.auto_profile = auto_profile
         self._profile_is_auto = False
+        #: The framebuffer, in display coordinates. When present, Calibrate
+        #: matches the screen's own artwork instead of needing a pattern drawn
+        #: for it, so the cluster never has to leave the screen under test.
+        self.render = render
         self.display_size = display_size or (
             calibration.geometry.display_size if calibration else (1920, 720)
         )
@@ -348,6 +354,7 @@ class CaptureSession:
             "elements": len(self.profile) if self.profile else 0,
             "display_size": list(self.display_size),
             "fixed_camera": self.fixed_camera,
+            "calibrates_from": "screen content" if self.render is not None else "chessboard",
             "sampling_ratio": (
                 round(self.calibration.geometry.sampling_ratio(), 3)
                 if self.calibration else None
@@ -384,6 +391,8 @@ class CaptureSession:
                             when=datetime.now().isoformat(timespec="seconds"))
         self._store(rec.name, frame)
         undistorted = self._undistort(frame)
+        if self.render is not None:
+            return self._calibrate_from_content(undistorted, rec)
         # Prefer the board's own exported corners over reconstructing them.
         # The HMI writes exactly where it drew them, which sidesteps both
         # guessing the square size and the half-pixel between Qt's convention
@@ -440,6 +449,53 @@ class CaptureSession:
             )
         # The geometry has moved, so anything measured against the old one is
         # meaningless.  Drop it rather than let it be compared across.
+        self.reference = None
+        self.reference_camera = None
+        return rec
+
+    def _calibrate_from_content(
+        self, undistorted: np.ndarray, rec: CaptureRecord
+    ) -> CaptureRecord:
+        """Calibrate against the framebuffer, with no pattern on the screen."""
+        try:
+            geometry = homography_from_screen_content(
+                self.render, undistorted, display_size=self.display_size
+            )
+        except RuntimeError as exc:
+            rec.verdict = "FAILED"
+            rec.detail = (
+                f"{exc}. The frame is saved as {rec.name} -- open it and see what "
+                "it caught."
+            )
+            return rec
+
+        self.calibration = Calibration(
+            intrinsics=self.calibration.intrinsics if self.calibration else None,
+            geometry=geometry,
+            rig={"source": "phone capture, matched to the framebuffer"},
+            drift_alarm_px=self.drift_alarm_px,
+        )
+        self.calibration.save(self.out_dir / "calibration.json")
+        ratio = geometry.sampling_ratio()
+        rec.verdict = "OK"
+        rec.detail = (
+            f"matched the screen's own content -- no pattern needed. "
+            f"{getattr(geometry, 'inliers', 0)} of "
+            f"{getattr(geometry, 'matches', 0)} matches agreed, sampling ratio "
+            f"{ratio:.2f} camera px per display px"
+        )
+        if geometry.method == "screen_content(unrefined)":
+            rec.detail += (
+                ". The refinement step did not converge, so this is the feature "
+                "fit alone and is the looser of the two -- re-shoot squarer on, "
+                "or in better focus"
+            )
+        if ratio < 2.0:
+            rec.detail += (
+                ". Below 2 camera px per display px you cannot reliably resolve a "
+                "one-display-pixel shift -- move closer or zoom in before trusting "
+                "a tolerance"
+            )
         self.reference = None
         self.reference_camera = None
         return rec

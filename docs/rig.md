@@ -132,6 +132,45 @@ sub-pixel step deviate and those deviations propagate into the interpolated
 corners. You also need a one-time measurement of where the active area sits
 relative to the markers — do it once with method A and store it.
 
+**D. The screen's own content — no pattern at all.** If the framebuffer is
+available, and on the machine running the HMI it is, then the artwork already on
+screen is the calibration target. Match the photograph against the render: SIFT
+and RANSAC for the correspondence, then ECC in homography mode seeded from it.
+`homography_from_screen_content`.
+
+Both stages are needed, and `benchmarks/calibration_methods.py` is why. Scored
+by where elements land after rectifying, in display pixels:
+
+| condition | chessboard | content | + refined |
+|---|---|---|---|
+| baseline | 0.045 | 0.046 | 0.061 |
+| steep angle | 0.047 | 0.126 | 0.046 |
+| noisy (σ 8) | 0.055 | 0.060 | 0.060 |
+| soft focus | 0.091 | 0.309 | 0.115 |
+| under-sampled (1.0) | 0.043 | 0.708 | 0.063 |
+| well-sampled (3.0) | 0.054 | 0.637 | 0.056 |
+| heavy distortion | 0.049 | 0.086 | 0.062 |
+
+The feature fit alone ties the chessboard at matched scale and reaches 0.7 px
+when the render and the photograph differ in scale — scale-invariant keypoints
+localise less precisely across a large scale ratio, which is exactly the
+situation an under- or over-sampled rig is in. Refined, it stays within about
+0.02 px of the pattern everywhere.
+
+Two things make it more usable than it sounds. The content does **not** have to
+match: a different speed, a telltale that is off, a bar at another level all
+measure within 0.01 px of the matched case, because RANSAC discards whatever
+moved and the rest of the screen carries the fit. And it needs nothing of the
+build — no diagnostic mode, no pattern, no mode switch mid-test, which means the
+cluster never has to leave the screen under test.
+
+What it does need is a framebuffer to match against, and enough on screen to
+match on. A nearly blank screen is refused rather than solved.
+
+SIFT rather than ORB: ORB's seed is 1.16 px against 0.05, and while ECC pulls
+either to the same answer, a looser seed is likelier to converge to the wrong
+one. SIFT's patent expired in 2020 and it is Apache-2.0 in main OpenCV.
+
 **C. The display's own edges.** Show full white, threshold, fit lines to the four
 edges, intersect for corners. *Fit* lines — do not take corner points directly; a
 line fit averages over hundreds of edge pixels and lands well under a pixel where

@@ -628,5 +628,84 @@ def test_auto_inventory_can_be_turned_off(rig, tmp_path):
         srv.server_close()
 
 
+def test_the_whole_loop_with_no_chessboard_at_all(tmp_path):
+    """Calibrate against the framebuffer, so the cluster never leaves the
+    screen under test."""
+    bench = build_bench()
+    bench.reset()
+    session = CaptureSession(
+        tmp_path / "captures",
+        display_size=bench.display.size,
+        fixed_camera=True,
+        render=bench.display.render(),
+    )
+    srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = srv.server_address
+        url = f"http://{host}:{port}/upload?t={srv.token}"
+        assert get(f"http://{host}:{port}/status?t={srv.token}")["calibrates_from"] \
+            == "screen content"
+
+        # The cluster is showing its normal screen, not a pattern.
+        done = post(url, "calibrate", shoot(bench.rig))
+        assert done["verdict"] == "OK", done
+        assert "no pattern needed" in done["detail"]
+        assert session.calibration.geometry.method.startswith("screen_content")
+
+        assert post(url, "reference", shoot(bench.rig))["verdict"] == "OK"
+        clean = post(url, "validate", shoot(bench.rig))
+        assert clean["verdict"] in ("PASS", "REVIEW"), clean
+
+        bench.display.offsets["TELLTALE_ABS"] = (6.0, 0.0)
+        faulty = post(url, "validate", shoot(bench.rig))
+        assert faulty["verdict"] == "FAIL", faulty
+        assert any(r["verdict"] == "FAIL" for r in faulty["rows"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_content_calibration_survives_the_screen_having_moved_on(rig, tmp_path):
+    """The render need not be of the identical frame.
+
+    RANSAC discards whatever changed and the rest of the screen carries the fit,
+    which matters because the cluster is a live thing with a clock on it.
+    """
+    stale = rig.display.render()
+    rig.display.state.update({"SPEED": 180.0, "FUEL_LEVEL": 0.15})
+    try:
+        session = CaptureSession(tmp_path / "caps", display_size=rig.display.size,
+                                 render=stale)
+        srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+        try:
+            host, port = srv.server_address
+            done = post(f"http://{host}:{port}/upload?t={srv.token}",
+                        "calibrate", rig.read())
+            assert done["verdict"] == "OK", done
+        finally:
+            srv.shutdown()
+            srv.server_close()
+    finally:
+        rig.display.state.update(NOMINAL)
+
+
+def test_content_calibration_refuses_a_blank_screen(rig, tmp_path):
+    """Nothing to align on has to be said, not solved anyway."""
+    blank = np.zeros((rig.display.size[1], rig.display.size[0], 3), np.uint8)
+    session = CaptureSession(tmp_path / "caps", display_size=rig.display.size,
+                             render=blank)
+    srv = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = srv.server_address
+        done = post(f"http://{host}:{port}/upload?t={srv.token}",
+                    "calibrate", shoot(rig))
+        assert done["verdict"] == "FAILED"
+        assert "detail" in done and (
+            "too little detail" in done["detail"] or "matches" in done["detail"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_actions_are_a_closed_set():
     assert set(ACTIONS) == {"calibrate", "reference", "validate"}

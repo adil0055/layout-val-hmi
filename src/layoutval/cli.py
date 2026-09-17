@@ -350,6 +350,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         drift_alarm_px=args.drift_alarm_px,
         values=_read_json(args.values, "--values") if args.values else None,
         auto_profile=not args.no_auto_profile,
+        render=_read(_require(args.render, "--render")) if args.render else None,
     )
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
 
@@ -383,7 +384,11 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         print("  That measures against the reference, not against the design, and")
         print("  treats everything as fixed -- keep the cluster in one state.")
         print()
-    print("  1  Calibrate   cluster showing its chessboard, filling the frame")
+    if args.render:
+        print("  1  Calibrate   the screen under test -- no chessboard needed,")
+        print("                 it matches the framebuffer you supplied")
+    else:
+        print("  1  Calibrate   cluster showing its chessboard, filling the frame")
     print("  2  Reference   cluster showing the screen under test, correct")
     print("  3  Validate    the same screen, with whatever you are testing")
     print()
@@ -503,6 +508,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--profile", help="layout profile; without one, only calibrate and reference work")
     c.add_argument("--calibration", help="start from a stored rig calibration")
     c.add_argument("--intrinsics", help="camera intrinsics, if you have them")
+    c.add_argument("--render",
+                   help="the framebuffer as a display-space PNG (what the cluster "
+                        "is drawing). With this, Calibrate matches the screen's own "
+                        "content and no chessboard is needed at all")
     c.add_argument("--board",
                    help="the cluster's own board export (its --calibration-export). "
                         "Preferred: it carries the exact corners, so nothing has to "
