@@ -81,6 +81,78 @@ MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
 ACTIONS = ("calibrate", "reference", "validate")
 
+#: Alphabet the URL token is drawn from.
+#:
+#: No ``0``/``o``, ``1``/``l``/``i``, and no capitals. Somebody is going to read
+#: this off a laptop and type it into a phone, and every one of those pairs is a
+#: way for that to fail in a manner that looks like the server is broken. The
+#: token is also compared case-insensitively, because a phone keyboard will
+#: capitalise the first character given half a chance.
+TOKEN_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz"
+TOKEN_LENGTH = 10
+
+
+def make_token(length: int = TOKEN_LENGTH) -> str:
+    """A token that survives being read aloud and typed in."""
+    return "".join(secrets.choice(TOKEN_ALPHABET) for _ in range(length))
+
+
+def token_matches(given: str, expected: str) -> bool:
+    """Constant-time, case-insensitive, and safe on rubbish input."""
+    if not isinstance(given, str) or not given.isascii():
+        return False
+    return secrets.compare_digest(given.strip().lower(), expected.strip().lower())
+
+
+# --------------------------------------------------------------------------
+# getting the link onto the phone
+# --------------------------------------------------------------------------
+
+
+def qr_matrix(text: str, quiet: int = 4) -> np.ndarray:
+    """QR code for ``text`` as a boolean matrix, True where a module is dark.
+
+    Through OpenCV, which is already a dependency and both encodes and decodes,
+    so ``tests/test_server.py`` can check a rendered code by reading it back
+    rather than by trusting it.
+    """
+    encoded = cv2.QRCodeEncoder.create().encode(text)
+    # OpenCV writes 0 for a dark module and ships two modules of quiet zone;
+    # the specification asks for four, and a phone camera notices the
+    # difference on a busy terminal.
+    dark = np.asarray(encoded) == 0
+    return np.pad(dark, quiet, constant_values=False)
+
+
+def qr_terminal(text: str, *, quiet: int = 4) -> str:
+    """The QR as text, one character per module, two module rows per line.
+
+    Rendered with half blocks so the code comes out roughly square in a
+    terminal where characters are about twice as tall as they are wide, and
+    with explicit foreground and background colours so it scans on a light
+    terminal theme as well as a dark one -- a code that inverts with the user's
+    colour scheme is one a camera will refuse about half the time.
+    """
+    m = qr_matrix(text, quiet=quiet)
+    if m.shape[0] % 2:
+        m = np.vstack([m, np.zeros((1, m.shape[1]), bool)])
+    black_fg, white_fg = "\x1b[38;5;0m", "\x1b[38;5;15m"
+    black_bg, white_bg = "\x1b[48;5;0m", "\x1b[48;5;15m"
+    lines = []
+    for y in range(0, m.shape[0], 2):
+        row = []
+        for x in range(m.shape[1]):
+            top, bottom = m[y, x], m[y + 1, x]
+            row.append((black_fg if top else white_fg)
+                       + (black_bg if bottom else white_bg) + "\u2580")
+        lines.append("".join(row) + "\x1b[0m")
+    return "\n".join(lines)
+
+
+def qr_width(text: str, quiet: int = 4) -> int:
+    """How many terminal columns :func:`qr_terminal` will need."""
+    return int(qr_matrix(text, quiet=quiet).shape[1])
+
 
 # --------------------------------------------------------------------------
 # JPEG orientation
@@ -616,6 +688,43 @@ setInterval(refresh, 5000);
 """
 
 
+def _bad_token_page(given: str) -> str:
+    """Why the link did not work, on the device that is showing the problem.
+
+    The cause is nearly always one of three things and the person holding the
+    phone cannot see the terminal, so name all three and show what arrived.
+    """
+    shown = (given[:24] + "…") if len(given) > 24 else given
+    received = (f"<p>This link carried <code>{_escape(shown)}</code>.</p>"
+                if given else "<p>This link carried no token at all.</p>")
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark"><title>Link not accepted</title>
+<style>body{{margin:0;padding:24px;background:#0F1518;color:#E3EAE8;
+font:16px/1.6 system-ui,-apple-system,sans-serif}}
+h1{{font-size:19px;margin:0 0 12px}}code{{background:#1E272C;border:1px solid #2B373D;
+border-radius:5px;padding:2px 6px;font-size:14px;word-break:break-all}}
+li{{margin-bottom:8px}}p{{color:#9DADB5}}</style></head><body>
+<h1>This link was not accepted</h1>
+{received}
+<p>Three things cause that:</p>
+<ul>
+<li><b>It was mistyped.</b> Scan the square the laptop printed instead of typing
+    the address; that is what it is there for.</li>
+<li><b>The server was restarted.</b> The token changes every run, so an address
+    from an earlier one stops working. Use the one on screen now.</li>
+<li><b>Part of the address was lost.</b> It has to keep the
+    <code>?t=…</code> on the end.</li>
+</ul>
+</body></html>"""
+
+
+def _escape(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "layoutval"
     sys_version = ""
@@ -627,7 +736,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _authorised(self, query: dict[str, list[str]]) -> bool:
         given = (query.get("t") or [""])[0]
-        return secrets.compare_digest(given, self.server.token)  # type: ignore[attr-defined]
+        return token_matches(given, self.server.token)  # type: ignore[attr-defined]
 
     def _send(self, code: HTTPStatus, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -662,12 +771,13 @@ class _Handler(BaseHTTPRequestHandler):
         if url.path == "/" and not query.get("t"):
             # No token: say so rather than 404, because the usual cause is a
             # bookmarked URL from an earlier run, and the token changes.
-            self._send(HTTPStatus.UNAUTHORIZED,
-                       b"Open the link the laptop printed; it carries a one-run token.",
-                       "text/plain; charset=utf-8")
+            self._send(HTTPStatus.UNAUTHORIZED, _bad_token_page("").encode(),
+                       "text/html; charset=utf-8")
             return
         if not self._authorised(query):
-            self._send(HTTPStatus.FORBIDDEN, b"bad token", "text/plain; charset=utf-8")
+            self._send(HTTPStatus.FORBIDDEN,
+                       _bad_token_page((query.get("t") or [""])[0]).encode(),
+                       "text/html; charset=utf-8")
             return
         if url.path == "/":
             self._send(HTTPStatus.OK, PAGE.encode(), "text/html; charset=utf-8")
@@ -807,7 +917,7 @@ class CaptureServer(ThreadingHTTPServer):
                  *, token: str = "", quiet: bool = False) -> None:
         super().__init__((host, port), _Handler)
         self.session = session
-        self.token = token or secrets.token_urlsafe(9)
+        self.token = token or make_token()
         self.quiet = quiet
 
     @property

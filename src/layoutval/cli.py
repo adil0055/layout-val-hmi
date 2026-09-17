@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -300,7 +301,12 @@ def cmd_gate(args: argparse.Namespace) -> int:
 
 
 def cmd_capture_server(args: argparse.Namespace) -> int:
-    from layoutval.server import CaptureSession, CaptureServer
+    from layoutval.server import (
+        CaptureServer,
+        CaptureSession,
+        qr_terminal,
+        qr_width,
+    )
 
     pattern = tuple(args.pattern)
     display_points = None
@@ -347,9 +353,29 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
 
     print()
-    print("  Open this on the phone, on the same network:")
+    print("  Scan this with the phone's camera, on the same network:")
     print()
+    # Skipped when it would wrap, or when this is going into a log rather than
+    # to a person: a QR broken across lines is worse than no QR, because it
+    # looks like something that ought to work.
+    show_qr = not args.no_qr and sys.stdout.isatty()
+    if show_qr:
+        try:
+            width = qr_width(server.url)
+            columns = shutil.get_terminal_size((80, 24)).columns
+            if width <= columns:
+                print(qr_terminal(server.url))
+                print()
+            else:
+                print(f"  (terminal is {columns} columns; the code needs {width})")
+                print()
+        except cv2.error as exc:
+            print(f"  (could not draw the code: {exc})")
+            print()
     print(f"      {server.url}")
+    print()
+    print(f"  Typing it in is fine too — the token is {server.token} and it is not")
+    print("  case sensitive, with no letter O, letter l or letter i in it.")
     print()
     print("  1  Calibrate   cluster showing its chessboard, filling the frame")
     print("  2  Reference   cluster showing the screen under test, correct")
@@ -490,6 +516,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the camera is mounted: check its pose but do not re-solve it")
     c.add_argument("--drift-alarm-px", type=float, default=2.0)
     c.add_argument("--quiet", action="store_true")
+    c.add_argument("--no-qr", action="store_true",
+                   help="do not draw the scannable code")
     c.set_defaults(func=cmd_capture_server)
 
     c = sub.add_parser("demo", help="run the whole pipeline against the built-in simulator")

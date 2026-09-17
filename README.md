@@ -88,8 +88,16 @@ pixel-centre corners rather than Qt's, which differ by half a pixel — and that
 half pixel goes straight into the homography and from there into every
 measurement taken through it.
 
-It prints a URL carrying a one-run token. Open it on a phone on the same
-network and walk three steps:
+It prints a QR code and a URL, both carrying a one-run token. **Scan the code**
+— nobody should be hand-typing a token into a phone, and the first version of
+this made people do exactly that. If you do type it, the token is
+case-insensitive and drawn from an alphabet with no `0`/`O` and no `1`/`l`/`I`,
+because those are the characters that get mistyped.
+
+A link that is refused says why on the phone: mistyped, server restarted since
+(the token changes every run), or the `?t=…` lost off the end.
+
+Open it on a phone on the same network and walk three steps:
 
 1. **Calibrate** — the cluster shows its chessboard; this solves display-to-camera.
 2. **Reference** — the cluster shows the screen under test, correct.

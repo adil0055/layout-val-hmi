@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import urllib.error
 import urllib.request
 import uuid
@@ -21,12 +22,17 @@ import pytest
 from layoutval.server import (
     ACTIONS,
     MAX_UPLOAD_BYTES,
+    TOKEN_ALPHABET,
     CaptureSession,
     apply_orientation,
     decode_upload,
     exif_orientation,
     lan_address,
+    make_token,
+    qr_matrix,
+    qr_terminal,
     serve,
+    token_matches,
 )
 from layoutval.simulator import ClusterDisplay, SimulatedRig, VirtualCamera
 
@@ -145,6 +151,76 @@ def test_lan_address_is_a_v4_address():
 
 
 # --------------------------------------------------------------------------
+# getting the link onto the phone
+# --------------------------------------------------------------------------
+
+
+def test_the_token_avoids_characters_that_get_mistyped():
+    """Somebody reads this off a laptop and types it into a phone."""
+    for banned in "0O1lI":
+        assert banned not in TOKEN_ALPHABET
+    assert TOKEN_ALPHABET == TOKEN_ALPHABET.lower()
+    token = make_token()
+    assert len(token) >= 8
+    assert set(token) <= set(TOKEN_ALPHABET)
+
+
+def test_token_comparison_is_case_insensitive_and_safe():
+    """A phone keyboard capitalises the first character given half a chance."""
+    assert token_matches("abc7xy", "abc7xy")
+    assert token_matches("ABC7XY", "abc7xy")
+    assert token_matches("  abc7xy  ", "abc7xy")
+    assert not token_matches("abc7xz", "abc7xy")
+    assert not token_matches("", "abc7xy")
+    # Non-ASCII must be rejected, not raise: compare_digest refuses it, and an
+    # autocorrected smart character should be a 403 rather than a 500.
+    assert not token_matches("abc7x\u00e9", "abc7xy")
+    assert not token_matches(None, "abc7xy")  # type: ignore[arg-type]
+
+
+def _matrix_from_ansi(text: str) -> np.ndarray:
+    """Read a rendered code back into a module matrix.
+
+    The rendering is the thing under test, so this parses the escape codes
+    rather than re-deriving the matrix: a faithful render has to survive being
+    looked at by something that is not the code that wrote it.
+    """
+    rows: list[list[bool]] = []
+    for line in text.split("\n"):
+        top: list[bool] = []
+        bottom: list[bool] = []
+        for cell in re.finditer(r"\x1b\[38;5;(\d+)m\x1b\[48;5;(\d+)m\u2580", line):
+            top.append(cell.group(1) == "0")     # colour 0 is black, a dark module
+            bottom.append(cell.group(2) == "0")
+        if top:
+            rows.append(top)
+            rows.append(bottom)
+    return np.array(rows, dtype=bool)
+
+
+def test_the_rendered_code_still_scans():
+    """Rendered to text, read back, and decoded -- not merely produced."""
+    url = "http://192.168.1.50:8000/?t=" + make_token()
+    rendered = qr_terminal(url)
+    parsed = _matrix_from_ansi(rendered)
+    direct = qr_matrix(url)
+    assert parsed.shape[1] == direct.shape[1]
+    assert np.array_equal(parsed[: direct.shape[0]], direct)
+
+    # And it decodes, which is the only claim that matters to a phone camera.
+    image = (~parsed).astype(np.uint8) * 255
+    big = cv2.resize(image, None, fx=8, fy=8, interpolation=cv2.INTER_NEAREST)
+    assert cv2.QRCodeDetector().detectAndDecode(big)[0] == url
+
+
+def test_the_code_carries_a_quiet_zone():
+    """A code with no margin is one a camera refuses."""
+    m = qr_matrix("http://10.0.0.1:8000/?t=abcdefghij", quiet=4)
+    assert not m[:4].any() and not m[-4:].any()
+    assert not m[:, :4].any() and not m[:, -4:].any()
+
+
+# --------------------------------------------------------------------------
 # access control
 # --------------------------------------------------------------------------
 
@@ -158,6 +234,31 @@ def test_the_page_needs_the_token(server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(f"http://{host}:{port}/status?t=wrong", timeout=10)
     assert exc.value.code == 403
+
+
+def test_a_refused_link_explains_itself(server):
+    """The person holding the phone cannot see the terminal."""
+    host, port = server.server_address
+    for url in (f"http://{host}:{port}/", f"http://{host}:{port}/?t=mistyped"):
+        try:
+            urllib.request.urlopen(url, timeout=10)
+            raise AssertionError("expected a refusal")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode()
+        assert "not accepted" in body
+        assert "restarted" in body      # the token changes every run
+        assert "mistyped" in body
+        assert "?t=" in body            # and that the tail matters
+
+
+def test_a_mixed_case_token_is_accepted(server):
+    """Typed on a phone, the first character often arrives capitalised."""
+    host, port = server.server_address
+    shouty = server.token.upper()
+    with urllib.request.urlopen(
+        f"http://{host}:{port}/status?t={shouty}", timeout=10
+    ) as response:
+        assert json.loads(response.read())["captures"] == 0
 
 
 def test_uploads_need_the_token(server, rig):
