@@ -310,7 +310,20 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
 
     pattern = tuple(args.pattern)
     display_points = None
-    display_size = tuple(args.display_size)
+    render = _read(_require(args.render, "--render")) if args.render else None
+
+    # Resolve the display size from whatever actually knows it, rather than
+    # leaving a default that is right for one skin and quietly wrong for the
+    # other: the board export says, a render is the size it is, and only then
+    # does the flag apply.
+    if args.display_size:
+        display_size = tuple(args.display_size)
+    elif render is not None:
+        display_size = (render.shape[1], render.shape[0])
+        print(f"display size taken from --render: {display_size[0]}x{display_size[1]}")
+    else:
+        display_size = (1920, 720)
+
     if args.board:
         board = _read_json(args.board, "--board", BOARD_HINT)
         try:
@@ -318,7 +331,8 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
             # column x's centre at x, and Qt puts it at x + 0.5.
             display_points = np.array(board["corners_pixel_centre"], dtype=np.float64)
             pattern = tuple(board["pattern_size"])
-            display_size = tuple(board["canvas"])
+            if not args.display_size:
+                display_size = tuple(board["canvas"])
         except (KeyError, TypeError, ValueError) as exc:
             raise SystemExit(
                 f"error: {args.board} is not a board export ({exc}). It should be "
@@ -326,6 +340,14 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
             )
         print(f"board: {pattern[0]}x{pattern[1]} inner corners on a "
               f"{display_size[0]}x{display_size[1]} canvas, from {args.board}")
+
+    if render is not None and (render.shape[1], render.shape[0]) != display_size:
+        raise SystemExit(
+            f"error: --render is {render.shape[1]}x{render.shape[0]} but the display "
+            f"is {display_size[0]}x{display_size[1]}. The render has to be the "
+            "framebuffer at its own size -- from the cluster, "
+            f"tools/shoot.py out.png --width {display_size[0]}"
+        )
 
     profile = (LayoutProfile.load(_require(args.profile, "--profile"))
                if args.profile else None)
@@ -350,7 +372,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         drift_alarm_px=args.drift_alarm_px,
         values=_read_json(args.values, "--values") if args.values else None,
         auto_profile=not args.no_auto_profile,
-        render=_read(_require(args.render, "--render")) if args.render else None,
+        render=render,
     )
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
 
@@ -516,7 +538,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the cluster's own board export (its --calibration-export). "
                         "Preferred: it carries the exact corners, so nothing has to "
                         "be guessed or converted")
-    c.add_argument("--display-size", nargs=2, type=int, default=[1920, 720])
+    c.add_argument("--display-size", nargs=2, type=int, default=None,
+                   help="the framebuffer's size; taken from --board or --render "
+                        "when not given")
     c.add_argument("--pattern", nargs=2, type=int, default=[9, 6],
                    help="inner corners of the chessboard the cluster draws; "
                         "ignored when --board is given")
