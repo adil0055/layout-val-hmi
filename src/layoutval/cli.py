@@ -21,6 +21,7 @@ import numpy as np
 
 from layoutval.calibration import (
     Calibration,
+    DisplayGeometry,
     Intrinsics,
     Undistorter,
     calibrate_intrinsics,
@@ -258,6 +259,58 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0 if result.passed else 1
 
 
+def cmd_capture_server(args: argparse.Namespace) -> int:
+    from layoutval.server import CaptureSession, CaptureServer
+
+    profile = LayoutProfile.load(args.profile) if args.profile else None
+    calibration = Calibration.load(args.calibration) if args.calibration else None
+    if calibration is None and args.intrinsics:
+        calibration = Calibration(
+            intrinsics=Intrinsics.from_dict(json.loads(Path(args.intrinsics).read_text())),
+            geometry=DisplayGeometry(H=np.eye(3), display_size=tuple(args.display_size)),
+        )
+
+    session = CaptureSession(
+        Path(args.out),
+        profile=profile,
+        calibration=calibration,
+        pattern_size=tuple(args.pattern),
+        square_px=args.square_px,
+        pattern_origin=tuple(args.origin),
+        display_size=tuple(args.display_size),
+        fixed_camera=args.fixed_camera,
+        drift_alarm_px=args.drift_alarm_px,
+        values=json.loads(Path(args.values).read_text()) if args.values else None,
+    )
+    server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
+
+    print()
+    print("  Open this on the phone, on the same network:")
+    print()
+    print(f"      {server.url}")
+    print()
+    print("  1  Calibrate   cluster showing its chessboard, filling the frame")
+    print("  2  Reference   cluster showing the screen under test, correct")
+    print("  3  Validate    the same screen, with whatever you are testing")
+    print()
+    if not args.fixed_camera:
+        print("  Hand-held: each frame's pose is re-solved against the reference, so")
+        print("  a fault that moved every element together would be absorbed and not")
+        print("  reported. Clamp the phone and pass --fixed-camera to close that gap.")
+        print()
+    print(f"  Captures and reports go to {Path(args.out).resolve()}")
+    print("  This listens on the local network and accepts uploads. It is a bench")
+    print("  tool: stop it when you are done. Ctrl-C to stop.")
+    print()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        server.server_close()
+    return 0
+
+
 def cmd_demo(args: argparse.Namespace) -> int:
     from layoutval.demo import run_demo
 
@@ -348,6 +401,29 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--study", required=True)
     c.add_argument("--linearity", help="linearity study, so sub-pixel bias is in the floor")
     c.set_defaults(func=cmd_gate)
+
+    c = sub.add_parser(
+        "capture-server",
+        help="capture from a phone on the same network, measure here",
+    )
+    c.add_argument("--profile", help="layout profile; without one, only calibrate and reference work")
+    c.add_argument("--calibration", help="start from a stored rig calibration")
+    c.add_argument("--intrinsics", help="camera intrinsics, if you have them")
+    c.add_argument("--display-size", nargs=2, type=int, default=[1920, 720])
+    c.add_argument("--pattern", nargs=2, type=int, default=[9, 6],
+                   help="inner corners of the chessboard the cluster draws")
+    c.add_argument("--square-px", type=float, default=100.0)
+    c.add_argument("--origin", nargs=2, type=float, default=[0.0, 0.0],
+                   help="display coordinate of the board's first inner corner region")
+    c.add_argument("--host", default="0.0.0.0")
+    c.add_argument("--port", type=int, default=8000)
+    c.add_argument("--out", default="out/captures")
+    c.add_argument("--values", help="JSON of signal values for moving elements")
+    c.add_argument("--fixed-camera", action="store_true",
+                   help="the camera is mounted: check its pose but do not re-solve it")
+    c.add_argument("--drift-alarm-px", type=float, default=2.0)
+    c.add_argument("--quiet", action="store_true")
+    c.set_defaults(func=cmd_capture_server)
 
     c = sub.add_parser("demo", help="run the whole pipeline against the built-in simulator")
     c.add_argument("--out", default="out/demo")

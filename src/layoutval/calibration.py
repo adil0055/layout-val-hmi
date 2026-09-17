@@ -512,11 +512,28 @@ class DriftEstimate:
 
 
 class DriftTracker:
-    """Per-frame rigid drift correction against a region that never changes.
+    """Per-frame pose correction against a region that never changes.
 
     Rigs get bumped.  The correction itself is cheap; the important part is that
     it is **loud**.  Silent compensation is how a rig that someone knocked last
     Tuesday keeps producing green results for a month.
+
+    ``motion`` picks how much of a pose change is modelled:
+
+    ``cv2.MOTION_EUCLIDEAN`` (the default)
+        Rotation and translation.  Right for a mounted camera that has been
+        nudged: it cannot absorb much, so anything larger shows up as a failure
+        to converge rather than as a silent correction.
+    ``cv2.MOTION_HOMOGRAPHY``
+        The full pose.  What a hand-held camera needs, because moving it changes
+        perspective and not just position.
+
+    There is a real cost to the homography mode, and it is not a detail: a
+    correction that re-solves the whole pose will also absorb a defect in which
+    *everything* moved together, and report nothing.  Per-element faults still
+    show up, because the rest of the frame dominates the fit.  A whole-layout
+    shift does not.  Use Euclidean on a mounted rig, where that trade is not
+    needed.
     """
 
     def __init__(
@@ -528,10 +545,12 @@ class DriftTracker:
         max_iterations: int = 200,
         eps: float = 1e-6,
         gauss_filt_size: int = 5,
+        motion: int = cv2.MOTION_EUCLIDEAN,
     ) -> None:
         x, y, w, h = static_roi
         self.roi = (int(x), int(y), int(w), int(h))
         self.alarm_px = float(alarm_px)
+        self.motion = int(motion)
         self._criteria = (
             cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
             int(max_iterations),
@@ -546,13 +565,15 @@ class DriftTracker:
 
     def measure(self, live_camera_frame: np.ndarray) -> DriftEstimate:
         live = self._crop(live_camera_frame)
-        warp = np.eye(2, 3, dtype=np.float32)
+        homography = self.motion == cv2.MOTION_HOMOGRAPHY
+        warp = (np.eye(3, 3, dtype=np.float32) if homography
+                else np.eye(2, 3, dtype=np.float32))
         try:
             cc, warp = cv2.findTransformECC(
                 self.reference,
                 live,
                 warp,
-                cv2.MOTION_EUCLIDEAN,
+                self.motion,
                 self._criteria,
                 None,
                 self._gauss,
@@ -568,7 +589,8 @@ class DriftTracker:
         # a warp valid over the whole camera frame.
         x, y, _, _ = self.roi
         T = np.array([[1, 0, x], [0, 1, y], [0, 0, 1]], dtype=np.float64)
-        W_local = np.vstack([np.asarray(warp, np.float64), [0, 0, 1]])
+        warp = np.asarray(warp, np.float64)
+        W_local = warp if homography else np.vstack([warp, [0, 0, 1]])
         W_full = T @ W_local @ np.linalg.inv(T)
 
         est = DriftEstimate(

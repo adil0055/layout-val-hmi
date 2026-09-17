@@ -92,6 +92,25 @@ if est.exceeds:
 A non-converging ECC counts as exceeding: the static region no longer looks like
 the static region, which is itself the finding.
 
+## Before there is a rig at all
+
+`layoutval capture-server` lets a phone stand in for the camera while the mount
+is still being built — see the README. It is genuinely useful for shaking out
+the geometry and the profile, and it is not a measurement rig:
+
+- **The pose changes every shot.** Handled by re-solving each frame against the
+  reference, which works for per-element faults and silently absorbs a fault
+  where the whole layout moved. `--fixed-camera` turns the re-solve off once the
+  phone is clamped, and then the pose change is reported instead of corrected.
+- **Sampling ratio is usually poor.** A phone at arm's length covers a cluster
+  at close to 1:1, where the honest floor is about ±1 display pixel. The
+  calibrate step reports the ratio; believe it.
+- **Exposure and white balance are automatic**, which is the thing the rest of
+  this page says to turn off. Most phone cameras can be locked by holding on
+  the subject; do it, and re-calibrate afterwards.
+
+Everything below still applies to the rig you are heading towards.
+
 ## Getting the homography
 
 Three ways, in order of preference.

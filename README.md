@@ -47,6 +47,7 @@ FUEL_BAR              injected (+2.25,+0.00) px  measured (+2.02,-0.01) px  -> R
 | `layoutval linearity` | Per-element sub-pixel bias. **A static screen cannot show you this.** |
 | `layoutval gate` | Are these tolerances defensible on this rig? |
 | `layoutval run` | Validate captured frames; JSON, overlay, heatmap, JUnit. |
+| `layoutval capture-server` | Capture from a phone on the same network; measure here. |
 
 ## The parts
 
@@ -62,8 +63,50 @@ FUEL_BAR              injected (+2.25,+0.00) px  measured (+2.02,-0.01) px  -> R
 | `repeatability` | σ per element, and the week-2 gate. |
 | `linearity` | Sub-pixel bias per element. |
 | `report` | JSON, annotated overlays, JUnit. |
+| `server` | Phone capture over the local network, and the page it opens. |
 | `authoring` | Snap assistance and a segmentation-model hook — **authoring only**. |
 | `simulator` | Synthetic cluster and virtual camera, for tests and the demo. |
+
+## Capturing from a phone
+
+Before there is a mount and a lens, it is useful to point a phone at the screen
+and have the answer come back. Start the server on the machine that will do the
+measuring:
+
+```bash
+layoutval capture-server --profile profiles/main.yaml --pattern 14 5 --square-px 100
+```
+
+It prints a URL carrying a one-run token. Open it on a phone on the same
+network and walk three steps:
+
+1. **Calibrate** — the cluster shows its chessboard; this solves display-to-camera.
+2. **Reference** — the cluster shows the screen under test, correct.
+3. **Validate** — the same screen with whatever you are testing.
+
+The verdict, the failing elements and the annotated overlay come back to the
+phone. Captures, reports and overlays land in `--out`.
+
+**A phone in your hand is not a fixed camera, and this does not pretend
+otherwise.** Every number here rests on the camera not moving, and a hand-held
+frame is at a different *pose*, not just a different position. So each frame's
+pose is re-solved against the reference before measuring, and how far it had to
+go is reported. That buys back a usable measurement at a cost worth stating
+plainly: **a correction that re-solves the whole pose also absorbs a fault in
+which every element moved together.** Per-element faults survive it — the rest
+of the frame dominates the fit — but a whole-layout shift does not. Clamp the
+phone and pass `--fixed-camera`, and the pose is checked rather than re-solved.
+
+Two more things a phone brings with it. Its photos carry an EXIF orientation
+rather than rotated pixels, which is handled — a frame that came in on its side
+would calibrate and measure perfectly happily and be wrong about everything.
+And at arm's length a phone is often under-sampled; the calibrate step reports
+the sampling ratio and says so below 2.
+
+It binds to the local network and accepts uploads, so it is a bench tool: every
+URL carries a token minted at startup, uploads are capped and must decode as an
+image, and nothing from an upload is executed or used as a path. Stop it when
+you are done.
 
 ## Three things worth knowing before using it
 
