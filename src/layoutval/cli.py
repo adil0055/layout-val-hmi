@@ -664,11 +664,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "display coordinates; it cancels between reference and "
                         "validate")
     c.add_argument("--lens-board", metavar="SPEC",
-                   help="a printed ChArUco board used only to solve the phone's "
-                        "lens, as COLSxROWS[:SQUARE[:MARKER[:DICT]]]. It never "
-                        "goes near the cluster -- intrinsics are a property of "
-                        "the camera. Without this the Intrinsics step looks for "
-                        "the --pattern chessboard instead")
+                   help="a ChArUco board used only to solve the phone's lens, "
+                        "as COLSxROWS[:SQUARE[:MARKER[:DICT]]]. It never goes "
+                        "near the cluster -- intrinsics belong to the camera, "
+                        "so print it, or show it on any other screen. 9x6:30:22 "
+                        "measured best (k1 error 0.0009); shape matters less "
+                        "than filling the frame. Without this the Intrinsics "
+                        "step looks for the --pattern chessboard instead")
     c.add_argument("--charuco", metavar="SPEC",
                    help="a ChArUco board fixed to the bezel, as COLSxROWS[:SQUARE"
                         "[:MARKER[:DICT]]] (e.g. 16x3:30:22). For a cluster that "

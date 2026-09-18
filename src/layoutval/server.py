@@ -763,9 +763,20 @@ class CaptureSession:
             )
         except (RuntimeError, ValueError) as exc:
             rec.verdict = "FAILED"
+            if self.lens_spec is not None:
+                wanted = (f"the {self.lens_spec.squares_x}x"
+                          f"{self.lens_spec.squares_y} ChArUco board")
+            else:
+                wanted = (f"a {self.pattern_size[0]}x{self.pattern_size[1]} "
+                          "chessboard")
             rec.detail = (
-                f"{exc}. Not counted. Fill the frame with the board, keep it "
-                f"sharp, and avoid glare. The frame is saved as {rec.name}."
+                f"{exc}. Not counted. This step is looking for {wanted} -- "
+                "not the cluster. It is the camera's lens being measured here, "
+                "not the rig, so the target is a board you hold in front of the "
+                "phone and it never goes near the screen under test. No "
+                "printer? Open the board image full-screen on any monitor and "
+                "photograph that; a screen is as flat a target as paper. Fill "
+                f"the frame with it and keep it sharp. Saved as {rec.name}."
             )
             return rec
 

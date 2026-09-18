@@ -107,9 +107,16 @@ It needs `--intrinsics`, and needs them harder than any other route: it fits
 straight lines to the display's edges, and lens distortion bows exactly those
 lines. Measured, 0.04–0.06 px undistorted on any lens against 1.3 px on a mild
 one and 4–8 px on a normal phone lens. Solve them once from the phone — pick
-**Intrinsics** on the capture page and shoot 12 views of a printed board
+**Intrinsics** on the capture page and shoot 12 views of a board
 (`--lens-board`), which never goes near the cluster because it is the camera
-being measured.
+being measured: print it, or open the PNG on any other screen.
+
+`9x6:30:22` measured best (k1 error 0.0009 against a true −0.09), but the
+choice is not delicate — 7x5 and 16x3 both land inside 0.007, and what actually
+matters is filling the frame and varying the pose between shots. Eight views is
+already enough; the twelve it asks for are slack. A solve that goes wrong goes
+*visibly* wrong: the worst board tested reported 0.374 px reprojection error,
+above the 0.3 px this package gates on, so it is flagged rather than believed.
 
 It locates the physical opening, so display coordinates from it carry a
 constant offset against the active area behind the mask. That cancels exactly
