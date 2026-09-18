@@ -443,3 +443,123 @@ class SimulatedRig:
     def show(self, screen: str) -> None:
         """Switch between the normal screen and the diagnostic ones."""
         self._screen = screen
+
+
+# --------------------------------------------------------------------------
+# a cluster in its surround, with markers on the bezel
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class BezelPanel:
+    """The display set into a bezel that carries a ChArUco board.
+
+    The point of the arrangement is that the markers are part of the *rig*, not
+    of the software under test: they are stuck on once, they survive a power
+    cycle and a software load, and the cluster never has to draw anything for
+    the camera's benefit.  That is the only calibration route that works on a
+    production cluster, so it needs to be testable here.
+
+    Everything is in panel pixels.  The display occupies ``display_rect``, and
+    the board sits wherever ``board_origin`` puts it.
+    """
+
+    panel_size: tuple[int, int] = (2400, 1460)
+    display_rect: tuple[int, int, int, int] = (305, 165, 1790, 870)
+    squares: tuple[int, int] = (16, 3)
+    square_px: int = 99
+    #: Board units, as the board object is told them.  Only the ratio to
+    #: `square_px` matters: it is what the learned anchor absorbs.
+    square_length: float = 30.0
+    marker_ratio: float = 0.72
+    board_origin: tuple[int, int] = (405, 1090)
+    bezel_grey: int = 38
+
+    def __post_init__(self) -> None:
+        import cv2 as _cv2
+
+        self.dictionary = _cv2.aruco.getPredefinedDictionary(_cv2.aruco.DICT_4X4_100)
+        self.board = _cv2.aruco.CharucoBoard(
+            self.squares,
+            self.square_length,
+            self.square_length * self.marker_ratio,
+            self.dictionary,
+        )
+
+    @property
+    def board_size_px(self) -> tuple[int, int]:
+        return (self.squares[0] * self.square_px, self.squares[1] * self.square_px)
+
+    def display_from_board(self) -> np.ndarray:
+        """The true board-to-display transform, for a test to score against.
+
+        Board units scale to panel pixels by ``square_px / square_length``, then
+        the display's own origin is subtracted.
+        """
+        scale = self.square_px / self.square_length
+        ox, oy = self.board_origin
+        dx, dy = self.display_rect[0], self.display_rect[1]
+        return np.array([
+            [scale, 0.0, ox - dx],
+            [0.0, scale, oy - dy],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+    def render(self, display_img: np.ndarray) -> np.ndarray:
+        """The whole panel: bezel, markers, and the display set into it."""
+        w, h = self.panel_size
+        panel = np.full((h, w, 3), self.bezel_grey, np.uint8)
+
+        bw, bh = self.board_size_px
+        board_img = self.board.generateImage((bw, bh))
+        ox, oy = self.board_origin
+        panel[oy : oy + bh, ox : ox + bw] = cv2.cvtColor(board_img, cv2.COLOR_GRAY2BGR)
+
+        dx, dy, dw, dh = self.display_rect
+        fitted = display_img
+        if (display_img.shape[1], display_img.shape[0]) != (dw, dh):
+            fitted = cv2.resize(display_img, (dw, dh), interpolation=cv2.INTER_AREA)
+        panel[dy : dy + dh, dx : dx + dw] = fitted
+        return panel
+
+
+class BezelRig:
+    """A :class:`SimulatedRig` whose camera sees the bezel as well as the screen."""
+
+    def __init__(
+        self,
+        display: ClusterDisplay | None = None,
+        panel: BezelPanel | None = None,
+        camera: VirtualCamera | None = None,
+    ) -> None:
+        self.display = display or ClusterDisplay()
+        self.panel = panel or BezelPanel(
+            display_rect=(305, 165, self.display.size[0], self.display.size[1])
+        )
+        self.camera = camera or VirtualCamera(
+            display_size=self.panel.panel_size,
+            sensor_size=(2000, 1220),
+            sampling_ratio=0.78,
+        )
+        self._screen = "main"
+
+    def read(self) -> np.ndarray:
+        if self._screen == "checkerboard":
+            frame = self.display.render_checkerboard()
+        elif self._screen == "white":
+            frame = self.display.render_white()
+        else:
+            frame = self.display.render()
+        return self.camera.shoot(self.panel.render(frame))
+
+    def set(self, signal: str, value: Any) -> None:
+        self.display.state[signal] = value
+
+    def show(self, screen: str) -> None:
+        self._screen = screen
+
+    def true_display_to_camera(self) -> np.ndarray:
+        """Ground truth display-to-camera, for scoring a solved one."""
+        dx, dy = self.panel.display_rect[0], self.panel.display_rect[1]
+        offset = np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1]], dtype=np.float64)
+        return self.camera.H_true @ offset

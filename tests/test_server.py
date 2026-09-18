@@ -708,4 +708,4 @@ def test_content_calibration_refuses_a_blank_screen(rig, tmp_path):
 
 
 def test_actions_are_a_closed_set():
-    assert set(ACTIONS) == {"calibrate", "reference", "validate"}
+    assert set(ACTIONS) == {"calibrate", "rebind", "reference", "validate"}

@@ -376,22 +376,9 @@ def homography_from_charuco(
     display coordinates.  Measure it once with method A and store it -- the
     bezel does not move relative to the active area.
     """
-    params = cv2.aruco.DetectorParameters()
-    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE  # see docstring
-    detector = cv2.aruco.CharucoDetector(board, cv2.aruco.CharucoParameters(), params)
-
-    gray = to_gray(camera_img)
-    charuco_corners, charuco_ids, _, _ = detector.detectBoard(gray)
-    if charuco_corners is None or len(charuco_corners) < 6:
-        raise RuntimeError(
-            f"ChArUco: only {0 if charuco_corners is None else len(charuco_corners)} "
-            "interpolated corners found; need at least 6"
-        )
-
+    cam, ids = detect_charuco(camera_img, board)
     board_pts = np.asarray(board.getChessboardCorners(), dtype=np.float64)[:, :2]
-    ids = np.asarray(charuco_ids).ravel()
     src_board = board_pts[ids]
-    cam = np.asarray(charuco_corners, dtype=np.float64).reshape(-1, 2)
 
     disp = cv2.perspectiveTransform(
         src_board.reshape(-1, 1, 2), np.asarray(display_from_board, np.float64)
@@ -557,6 +544,135 @@ def _check_display_quad(
             f"the display maps to {area / frame_area:.3g} times the frame area, "
             "which is not a camera looking at a screen"
         )
+
+
+# --------------------------------------------------------------------------
+# ChArUco on the bezel
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class CharucoSpec:
+    """The board stuck to the bezel, described well enough to detect it.
+
+    ``square_length`` and ``marker_length`` are in whatever units the board was
+    printed in; only their ratio and the board's proportions matter here,
+    because the anchor below absorbs the scale.
+    """
+
+    squares_x: int
+    squares_y: int
+    square_length: float = 30.0
+    marker_length: float = 22.0
+    dictionary: str = "DICT_4X4_100"
+
+    def board(self) -> "cv2.aruco.CharucoBoard":
+        name = self.dictionary.upper()
+        if not hasattr(cv2.aruco, name):
+            raise ValueError(f"unknown ArUco dictionary {self.dictionary!r}")
+        return cv2.aruco.CharucoBoard(
+            (self.squares_x, self.squares_y),
+            float(self.square_length),
+            float(self.marker_length),
+            cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, name)),
+        )
+
+    @classmethod
+    def parse(cls, text: str) -> "CharucoSpec":
+        """``5x7``, ``5x7:30:22`` or ``5x7:30:22:DICT_4X4_100``."""
+        parts = [p.strip() for p in str(text).split(":")]
+        grid = parts[0].lower().replace("*", "x")
+        if "x" not in grid:
+            raise ValueError(f"expected COLSxROWS, got {parts[0]!r}")
+        cols, _, rows = grid.partition("x")
+        try:
+            spec = cls(int(cols), int(rows))
+        except ValueError as exc:
+            raise ValueError(f"board size must be whole squares: {parts[0]!r}") from exc
+        if spec.squares_x < 3 or spec.squares_y < 3:
+            # Two rows of squares leave one row of inner corners, and a
+            # homography cannot be fitted to collinear points.
+            raise ValueError(
+                f"a {spec.squares_x}x{spec.squares_y} board gives "
+                f"{max(spec.squares_x - 1, 0)}x{max(spec.squares_y - 1, 0)} inner "
+                "corners; at least 3x3 squares are needed for a usable one"
+            )
+        if len(parts) > 1 and parts[1]:
+            spec.square_length = float(parts[1])
+        if len(parts) > 2 and parts[2]:
+            spec.marker_length = float(parts[2])
+        else:
+            spec.marker_length = spec.square_length * 0.75
+        if len(parts) > 3 and parts[3]:
+            spec.dictionary = parts[3]
+        if not 0 < spec.marker_length < spec.square_length:
+            raise ValueError("the marker has to be smaller than its square")
+        return spec
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "squares_x": self.squares_x, "squares_y": self.squares_y,
+            "square_length": self.square_length, "marker_length": self.marker_length,
+            "dictionary": self.dictionary,
+        }
+
+
+def detect_charuco(
+    camera_img: np.ndarray, board: "cv2.aruco.CharucoBoard"
+) -> tuple[np.ndarray, np.ndarray]:
+    """Interpolated chessboard corners of the bezel board, and their board ids.
+
+    Marker corner refinement is **off**, straight from the OpenCV documentation:
+    when the result feeds a homography, the proximity of the chessboard squares
+    makes the sub-pixel step deviate, and those deviations propagate into the
+    interpolated corners.
+    """
+    params = cv2.aruco.DetectorParameters()
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+    detector = cv2.aruco.CharucoDetector(board, cv2.aruco.CharucoParameters(), params)
+    corners, ids, _, _ = detector.detectBoard(to_gray(camera_img))
+    if corners is None or ids is None or len(corners) < 6:
+        found = 0 if corners is None else len(corners)
+        raise RuntimeError(
+            f"only {found} board corners found. The board has to be fully in "
+            "frame, in focus, and not washed out by glare"
+        )
+    return (
+        np.asarray(corners, dtype=np.float64).reshape(-1, 2),
+        np.asarray(ids).ravel(),
+    )
+
+
+def homography_board_to_camera(
+    camera_img: np.ndarray, board: "cv2.aruco.CharucoBoard"
+) -> np.ndarray:
+    """Where the bezel board is, in the camera frame."""
+    corners, ids = detect_charuco(camera_img, board)
+    board_points = np.asarray(board.getChessboardCorners(), dtype=np.float64)[:, :2]
+    H, _ = cv2.findHomography(board_points[ids], corners, cv2.RANSAC, 2.0)
+    if H is None:
+        raise RuntimeError("could not fit a mapping to the board corners")
+    return H
+
+
+def charuco_anchor(
+    camera_img: np.ndarray,
+    board: "cv2.aruco.CharucoBoard",
+    geometry: DisplayGeometry,
+) -> np.ndarray:
+    """Learn where the active area sits relative to the bezel board.
+
+    This is the one-time measurement that makes markers usable, and it needs a
+    single frame in which *both* are visible: the board, and something that
+    gives display-to-camera on its own -- the cluster's calibration screen, or
+    its own content.  After this the markers alone are enough, for good, because
+    a sticker on the bezel does not move when the software is reloaded.
+
+    Returns the board-to-display transform, which is what
+    :func:`homography_from_charuco` takes.
+    """
+    H_board_camera = homography_board_to_camera(camera_img, board)
+    return np.linalg.inv(geometry.H) @ H_board_camera
 
 
 def _fit_line(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

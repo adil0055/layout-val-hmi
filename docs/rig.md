@@ -132,6 +132,51 @@ sub-pixel step deviate and those deviations propagate into the interpolated
 corners. You also need a one-time measurement of where the active area sits
 relative to the markers — do it once with method A and store it.
 
+This is the route wired into the capture server, because it is the only one a
+production cluster supports. `--charuco 16x3:30:22` turns it on. The first
+`Calibrate` **binds**: it needs the markers and the calibration screen in one
+frame, and from the two together it measures the board-to-display transform and
+saves it as `charuco-anchor.json`. Every `Calibrate` after that needs the markers
+only, so the screen can stay on the screen under test — which is the whole
+point. The anchor is kept across runs (a sticker outlives the process that
+measured it) and is only reused for the board it was measured against, because
+it is expressed in that board's units and the wrong one would rescale silently.
+
+Two measured things govern it (`benchmarks/bezel_anchor.py`, median over ten
+poses, against 0.05 px for a board on the screen):
+
+| | bezel markers |
+|---|---|
+| anchor re-bound in the pose it is used in | **0.09 px** |
+| anchor bound once, camera then moved | **0.25–0.32 px, 0.94 px at p95** |
+
+*The method is fine; reusing the anchor across a camera move is what costs.* An
+anchor is a fixed board-to-display transform, and it is exactly that only while
+the view it was measured from still holds — reused from elsewhere it stays
+plausible and gets about 5× worse, which is the failure mode this package exists
+to avoid. So the server compares the board's position in every frame against the
+binding frame and says when they have diverged; re-bind from where you are
+standing and the tighter figure comes back. There is a **Re-bind** button on the
+capture page for exactly that.
+
+**Undistortion is mandatory here, and the server refuses the route without
+intrinsics.** A homography cannot represent lens distortion, and unlike a board
+on the screen the markers are photographed in a *different part of the frame*
+from the active area — so the board fit and the display fit are each locally
+wrong in a different direction and the errors compound instead of cancelling.
+Measured: 0.10 px undistorted whatever the lens, against 0.6 px (mild lens) to
+5.7 px (very wide) with the distortion left in, and on the wider lenses elements
+stop matching at all. Since the penalty is a property of the lens rather than of
+the shot, a frame that looks fine on one camera says nothing about the next —
+which is why this refuses rather than warns. `layoutval calibrate-intrinsics`,
+once per camera and lens.
+
+One caveat the simulator cannot settle: in it the bezel and the active area are
+coplanar, because both are drawn on one flat panel. A real display is recessed
+behind glass, and a single homography anchor is exact only for a coplanar pair.
+Expect the real figure to be worse than the table above, and measure it on the
+bench rather than trusting these numbers to transfer.
+
 **D. The screen's own content — no pattern at all.** *Only available when you
 can get the framebuffer*, which in practice means a simulated or
 developer-controlled HMI on the same machine. A production cluster gives you a
@@ -204,9 +249,12 @@ So with a camera only, in order of what they cost:
 1. **A marker on the bezel.** ChArUco or AprilTag, stuck on once, outside the
    active area. Needs nothing whatever from the build, survives power cycles and
    software loads, and refines sub-pixel. This is what production rigs do and it
-   is method B above — `homography_from_charuco`. The one-time measurement of
-   where the active area sits relative to the markers is the only awkward part,
-   and a ruler and a white frame settle it once.
+   is method B above — `homography_from_charuco`, and it is wired into the
+   capture server as `--charuco`. The one-time measurement of where the active
+   area sits relative to the markers is the only awkward part, and the server's
+   first `Calibrate` does it for you from one frame showing both. Re-bind it if
+   the camera moves far: measured, reusing an anchor across a move costs about
+   5× (0.09 px → 0.25–0.32 px).
 2. **One bright frame, once.** Not a chessboard — just anything that lights the
    panel. If the build can be made to show white, a startup splash, or a
    full-screen theme even once at rig setup, method C gets the corners and you

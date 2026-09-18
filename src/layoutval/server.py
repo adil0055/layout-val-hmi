@@ -66,9 +66,13 @@ import numpy as np
 from layoutval.autoprofile import profile_from_reference
 from layoutval.calibration import (
     Calibration,
+    CharucoSpec,
     DriftTracker,
     Undistorter,
+    charuco_anchor,
     chessboard_display_points,
+    detect_charuco,
+    homography_from_charuco,
     homography_from_display_pattern,
     homography_from_screen_content,
 )
@@ -81,7 +85,15 @@ from layoutval.types import RunReport, Verdict
 #: order of magnitude past that is not a photograph.
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
-ACTIONS = ("calibrate", "reference", "validate")
+ACTIONS = ("calibrate", "rebind", "reference", "validate")
+
+#: How far the board is allowed to move in the frame before the anchor
+#: learned in the bind frame stops being the anchor for this one.  Measured,
+#: not guessed: with the anchor re-bound in the pose it is used in, bezel
+#: markers land at 0.09 px median against 0.05 px for a board on the screen;
+#: reused across a deliberate camera move they go to 0.25-0.32 px median and
+#: 0.56-0.94 px at p95.  That is the cost this threshold exists to flag.
+ANCHOR_POSE_TOLERANCE_PX = 25.0
 
 #: Alphabet the URL token is drawn from.
 #:
@@ -303,6 +315,7 @@ class CaptureSession:
         values: dict[str, float] | None = None,
         auto_profile: bool = True,
         render: np.ndarray | None = None,
+        charuco: CharucoSpec | None = None,
     ) -> None:
         self.lock = threading.Lock()
         self.out_dir = Path(out_dir)
@@ -325,6 +338,18 @@ class CaptureSession:
         #: matches the screen's own artwork instead of needing a pattern drawn
         #: for it, so the cluster never has to leave the screen under test.
         self.render = render
+        #: A board stuck to the bezel, when there is one.  This is the route for
+        #: a cluster you cannot ask to draw anything: the markers live outside
+        #: the active area, so the screen under test can stay on the screen
+        #: under test.  It costs one binding frame, once -- see
+        #: :meth:`_calibrate_charuco`.
+        self.charuco_spec = charuco
+        self.charuco_board = charuco.board() if charuco else None
+        self.charuco_anchor: np.ndarray | None = None
+        #: Where the board sat in the frame the anchor was bound from, by corner
+        #: id.  Compared against each later frame to catch the case the anchor
+        #: cannot survive: the camera having moved since.
+        self.charuco_bind_corners: dict[int, tuple[float, float]] = {}
         self.display_size = display_size or (
             calibration.geometry.display_size if calibration else (1920, 720)
         )
@@ -337,6 +362,9 @@ class CaptureSession:
                 self.reference = profile.reference()
             except RuntimeError:
                 self.reference = None
+
+        if self.charuco_spec is not None:
+            self._load_anchor()
 
     # -- helpers ------------------------------------------------------------
 
@@ -354,13 +382,23 @@ class CaptureSession:
             "elements": len(self.profile) if self.profile else 0,
             "display_size": list(self.display_size),
             "fixed_camera": self.fixed_camera,
-            "calibrates_from": "screen content" if self.render is not None else "chessboard",
+            "calibrates_from": self._calibrates_from(),
+            "charuco": self.charuco_spec.to_dict() if self.charuco_spec else None,
+            "anchor_bound": self.charuco_anchor is not None,
             "sampling_ratio": (
                 round(self.calibration.geometry.sampling_ratio(), 3)
                 if self.calibration else None
             ),
             "captures": len(self.history),
         }
+
+    def _calibrates_from(self) -> str:
+        if self.charuco_spec is not None:
+            return (
+                "bezel markers" if self.charuco_anchor is not None
+                else "bezel markers (needs binding first)"
+            )
+        return "screen content" if self.render is not None else "chessboard"
 
     def _store(self, name: str, img: np.ndarray) -> str:
         cv2.imwrite(str(self.out_dir / name), img)
@@ -378,19 +416,289 @@ class CaptureSession:
         stamp = datetime.now().strftime("%H%M%S")
         base = f"{stamp}-{action}"
         with self.lock:
-            if action == "calibrate":
-                return self._record(self._calibrate(frame, base))
+            if action in ("calibrate", "rebind"):
+                return self._record(self._calibrate(frame, base, rebind=action == "rebind"))
             if action == "reference":
                 return self._record(self._reference(frame, base))
             if action == "validate":
                 return self._record(self._validate(frame, base))
         raise ValueError(f"unknown action {action!r}")
 
-    def _calibrate(self, frame: np.ndarray, base: str) -> CaptureRecord:
-        rec = CaptureRecord(name=f"{base}.jpg", action="calibrate",
+    # -- the bezel board ----------------------------------------------------
+
+    @property
+    def _anchor_path(self) -> Path:
+        return self.out_dir / "charuco-anchor.json"
+
+    def _load_anchor(self) -> None:
+        """Pick up an anchor bound in an earlier run, if it is for this board.
+
+        A sticker on a bezel outlives the process that measured it, so the
+        binding is worth keeping on disk.  It is only reusable for the *same*
+        board though: the anchor is expressed in the board's own units, so
+        loading one measured against a different grid or square size would
+        silently rescale every measurement.  The spec is stored alongside it and
+        checked rather than assumed.
+        """
+        if not self._anchor_path.exists():
+            return
+        try:
+            saved = json.loads(self._anchor_path.read_text())
+            spec = saved["spec"]
+            anchor = np.asarray(saved["anchor"], dtype=np.float64).reshape(3, 3)
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        assert self.charuco_spec is not None
+        if spec != self.charuco_spec.to_dict():
+            return
+        if saved.get("display_size") != list(self.display_size):
+            return
+        self.charuco_anchor = anchor
+        self.charuco_bind_corners = {
+            int(k): (float(v[0]), float(v[1]))
+            for k, v in (saved.get("bind_corners") or {}).items()
+        }
+
+    def _save_anchor(self) -> None:
+        assert self.charuco_spec is not None and self.charuco_anchor is not None
+        self._anchor_path.write_text(json.dumps({
+            "spec": self.charuco_spec.to_dict(),
+            "anchor": self.charuco_anchor.tolist(),
+            "display_size": list(self.display_size),
+            "bind_corners": {
+                str(k): [v[0], v[1]] for k, v in self.charuco_bind_corners.items()
+            },
+            "bound_at": datetime.now().isoformat(timespec="seconds"),
+        }, indent=2))
+
+    def _board_pose_shift_px(self, undistorted: np.ndarray) -> float | None:
+        """How far the board has moved in the frame since the anchor was bound.
+
+        The anchor is a fixed board-to-display transform, and it is exactly that
+        only while the view it was measured from still holds.  Reused from a
+        different pose it stays *plausible* and gets worse, which is the failure
+        mode this package exists to avoid.  Comparing the board's own corners
+        between the two frames costs nothing and turns it into something the
+        record can say out loud.
+        """
+        if not self.charuco_bind_corners:
+            return None
+        try:
+            corners, ids = detect_charuco(undistorted, self.charuco_board)
+        except RuntimeError:
+            return None
+        shifts = [
+            float(np.hypot(*(corners[i] - self.charuco_bind_corners[int(cid)])))
+            for i, cid in enumerate(ids)
+            if int(cid) in self.charuco_bind_corners
+        ]
+        return float(np.median(shifts)) if shifts else None
+
+    def _geometry_for_bind(self, undistorted: np.ndarray) -> Any:
+        """Display-to-camera for the binding frame, by whatever route there is.
+
+        Binding needs the active area located *independently* of the markers --
+        that is the whole content of the measurement.  Anything that does it
+        will do, so this takes the same routes ``calibrate`` takes without the
+        board: the framebuffer when it was supplied, the cluster's chessboard
+        otherwise.
+        """
+        if self.render is not None:
+            return homography_from_screen_content(
+                self.render, undistorted, display_size=self.display_size
+            )
+        points = (
+            self.display_points if self.display_points is not None
+            else chessboard_display_points(
+                self.pattern_size, self.square_px, self.pattern_origin
+            )
+        )
+        return homography_from_display_pattern(
+            undistorted, self.pattern_size, points, display_size=self.display_size
+        )
+
+    def _calibrate_charuco(
+        self, frame: np.ndarray, undistorted: np.ndarray, rec: CaptureRecord,
+        *, rebind: bool,
+    ) -> CaptureRecord:
+        """Calibrate from a board fixed to the bezel.
+
+        Two different operations wear one button here, and which one runs
+        depends on whether the board has been tied to the active area yet.
+
+        **Binding**, the first time: the frame has to show the markers *and*
+        something that locates the active area on its own -- the cluster's
+        calibration screen, or its framebuffer via ``--render``.  From those two
+        together comes the board-to-display transform, and that is the only time
+        the cluster has to co-operate.
+
+        **Using it**, every time after: the markers alone are enough, and the
+        screen can show whatever is under test.  This is the point of the whole
+        exercise, because a real cluster will not draw a chessboard on request.
+        """
+        assert self.charuco_spec is not None
+        # Undistortion is not optional on this route, and that is measured
+        # rather than assumed.  A homography cannot represent lens distortion,
+        # and unlike a board on the screen the markers sit in a different part
+        # of the frame from the active area -- so the board fit and the display
+        # fit are each locally wrong in a different direction and the errors
+        # compound instead of cancelling.  Measured on the simulated bezel
+        # (benchmarks/bezel_anchor.py), median over five poses: undistorted the
+        # route holds 0.10 px whatever the lens, and with the distortion left in
+        # it runs 0.6 px on a mild lens to 5.7 px on a very wide one -- while
+        # elements start failing to match at all, up to every one of them.  So
+        # refuse: the failure is lens-dependent, so a frame that looks fine here
+        # says nothing about the next camera.
+        if not (self.calibration and self.calibration.intrinsics):
+            rec.verdict = "FAILED"
+            rec.detail = (
+                "the bezel-marker route needs camera intrinsics and none were "
+                "given. The markers are photographed away from the screen's own "
+                "part of the frame, so lens distortion does not cancel the way "
+                "it nearly does for a board on the screen: measured, this route "
+                "holds 0.10 px undistorted on any lens, and 0.6 px to 5.7 px "
+                "with the distortion left in -- losing elements from the match "
+                "entirely on the wider ones. Run "
+                "`layoutval calibrate-intrinsics` once for this camera and "
+                "lens, then restart with --intrinsics."
+            )
+            return rec
+
+        if rebind:
+            self.charuco_anchor = None
+            self.charuco_bind_corners = {}
+
+        if self.charuco_anchor is None:
+            return self._bind_charuco(frame, undistorted, rec)
+        return self._use_charuco(undistorted, rec)
+
+    def _bind_charuco(
+        self, frame: np.ndarray, undistorted: np.ndarray, rec: CaptureRecord
+    ) -> CaptureRecord:
+        try:
+            geometry = self._geometry_for_bind(undistorted)
+        except RuntimeError:
+            rec.verdict = "FAILED"
+            rec.detail = (
+                "the bezel board has not been tied to the active area yet, and "
+                "this frame cannot do it: " + self._why_no_board(frame, rec.name)
+                + " Binding is the one shot that needs both in view at once -- "
+                "the markers and the screen showing its calibration pattern. "
+                "After it, the markers alone are enough and the screen is free."
+            )
+            return rec
+        try:
+            anchor = charuco_anchor(undistorted, self.charuco_board, geometry)
+            corners, ids = detect_charuco(undistorted, self.charuco_board)
+        except RuntimeError as exc:
+            rec.verdict = "FAILED"
+            rec.detail = (
+                f"the screen was located but the bezel board was not: {exc}. "
+                f"The frame is saved as {rec.name} -- both have to be in this "
+                "one frame, in focus, for binding to mean anything."
+            )
+            return rec
+
+        self.charuco_anchor = anchor
+        self.charuco_bind_corners = {
+            int(cid): (float(corners[i][0]), float(corners[i][1]))
+            for i, cid in enumerate(ids)
+        }
+        self._save_anchor()
+        self._commit_geometry(geometry, "phone capture, binding the bezel board")
+        rec.verdict = "OK"
+        rec.detail = (
+            f"bound the bezel board to the active area from {len(ids)} board "
+            f"corners; the screen itself solved to {geometry.residual_px:.3f} "
+            f"camera px. From here on Calibrate needs only the markers, so the "
+            f"cluster can stay on the screen under test. Saved as "
+            f"{self._anchor_path.name}, so later runs pick it up. Re-bind if the "
+            "sticker is ever moved or reprinted"
+        )
+        self._note_sampling_ratio(rec, geometry)
+        return rec
+
+    def _use_charuco(self, undistorted: np.ndarray, rec: CaptureRecord) -> CaptureRecord:
+        try:
+            geometry = homography_from_charuco(
+                undistorted, self.charuco_board, self.charuco_anchor,
+                display_size=self.display_size,
+            )
+        except RuntimeError as exc:
+            rec.verdict = "FAILED"
+            rec.detail = (
+                f"{exc}. The frame is saved as {rec.name}. The whole board has "
+                "to be in view and readable -- this route never needs the screen "
+                "to show anything, but it does need the markers."
+            )
+            return rec
+        self._commit_geometry(geometry, "phone capture, bezel board")
+        rec.verdict = "OK"
+        rec.detail = (
+            f"solved from the bezel markers alone -- nothing was asked of the "
+            f"screen. Board fit residual {geometry.residual_px:.3f} camera px"
+        )
+        shift = self._board_pose_shift_px(undistorted)
+        if shift is not None:
+            rec.detail += f", board {shift:.0f} camera px from where it was bound"
+            if shift > ANCHOR_POSE_TOLERANCE_PX:
+                # Measured, on the simulated bezel: re-bound in the pose it is
+                # used in, this route matches a board on the screen (0.09 px
+                # median against 0.05 px).  Carried across a camera move it
+                # runs 0.25-0.32 px median and 0.56-0.94 px at p95.  It stays
+                # usable; it stops being sub-tenth-pixel, and a tolerance set
+                # from the first figure does not hold for the second.
+                rec.detail += (
+                    ". That is far enough that the anchor is being used from a "
+                    "different view than it was measured in, which costs "
+                    "accuracy: about 0.3 px typical and 0.9 px at the tail, "
+                    "against under 0.1 px when it is re-bound in the pose it is "
+                    "used in. Re-bind from here, or widen the tolerance to suit"
+                )
+        self._note_sampling_ratio(rec, geometry)
+        return rec
+
+    def _commit_geometry(self, geometry: Any, source: str) -> None:
+        """Adopt a new display-to-camera solve and drop what it invalidates."""
+        self.calibration = Calibration(
+            intrinsics=self.calibration.intrinsics if self.calibration else None,
+            geometry=geometry,
+            rig={"source": source},
+            drift_alarm_px=self.drift_alarm_px,
+        )
+        self.calibration.save(self.out_dir / "calibration.json")
+        # The geometry has moved, so anything measured against the old one is
+        # meaningless.  Drop it rather than let it be compared across.
+        self.reference = None
+        self.reference_camera = None
+
+    def _note_sampling_ratio(self, rec: CaptureRecord, geometry: Any) -> None:
+        ratio = geometry.sampling_ratio()
+        rec.detail += f", sampling ratio {ratio:.2f} camera px per display px"
+        if ratio < 2.0:
+            rec.detail += (
+                ". Below 2 you cannot reliably resolve a one-display-pixel "
+                "shift -- move closer or zoom in before trusting a tolerance"
+            )
+
+    def _calibrate(
+        self, frame: np.ndarray, base: str, *, rebind: bool = False
+    ) -> CaptureRecord:
+        rec = CaptureRecord(name=f"{base}.jpg",
+                            action="rebind" if rebind else "calibrate",
                             when=datetime.now().isoformat(timespec="seconds"))
         self._store(rec.name, frame)
         undistorted = self._undistort(frame)
+        if self.charuco_spec is not None:
+            return self._calibrate_charuco(frame, undistorted, rec, rebind=rebind)
+        if rebind:
+            rec.verdict = "FAILED"
+            rec.detail = (
+                "there is no bezel board to re-bind. Re-binding ties a board "
+                "fixed to the bezel back to the active area; start the server "
+                "with --charuco to use one."
+            )
+            return rec
         if self.render is not None:
             return self._calibrate_from_content(undistorted, rec)
         # Prefer the board's own exported corners over reconstructing them.
@@ -719,6 +1027,11 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
   <div class="step" data-a="validate"><b>3 Validate</b><span>screen under test</span></div>
 </div>
 
+<div class="steps" id="rebindRow" style="display:none;grid-template-columns:1fr">
+  <div class="step" data-a="rebind"><b>Re-bind the bezel board</b>
+    <span>only after the sticker moves</span></div>
+</div>
+
 <div class="card">
   <label class="shoot" id="shootLabel" for="shot">Take photo</label>
   <input id="shot" type="file" accept="image/*" capture="environment">
@@ -731,6 +1044,7 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
   <div class="stat"><span>Calibrated</span><b id="s-cal">—</b></div>
   <div class="stat"><span>Reference</span><b id="s-ref">—</b></div>
   <div class="stat"><span>Elements</span><b id="s-el">—</b></div>
+  <div class="stat"><span>Solves from</span><b id="s-from">—</b></div>
   <div class="stat"><span>Sampling ratio</span><b id="s-sr">—</b></div>
   <div class="stat"><span>Captures</span><b id="s-n">—</b></div>
 </div>
@@ -738,6 +1052,7 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
 <script>
 const TOKEN = new URLSearchParams(location.search).get("t") || "";
 let action = "calibrate";
+let BEZEL = false, ANCHORED = false;
 const $ = id => document.getElementById(id);
 
 document.querySelectorAll(".step").forEach(el => {
@@ -746,11 +1061,18 @@ document.querySelectorAll(".step").forEach(el => {
 function paintSteps() {
   document.querySelectorAll(".step").forEach(el =>
     el.classList.toggle("on", el.dataset.a === action));
-  $("hint").textContent = {
+  const hints = {
     calibrate: "Put the cluster on its chessboard pattern first. Fill the frame with it, square on.",
     reference: "Show the screen under test, correct. This becomes what later shots are compared against.",
-    validate: "Show the same screen with whatever you are testing. Keep the phone where it was."
-  }[action];
+    validate: "Show the same screen with whatever you are testing. Keep the phone where it was.",
+    rebind: "Only needed if the bezel sticker was moved or reprinted. Needs the markers and the calibration screen together again."
+  };
+  if (BEZEL) {
+    hints.calibrate = ANCHORED
+      ? "Get the whole bezel board in frame. The screen can show anything \u2014 the markers do the work."
+      : "First time only: the markers and the cluster's calibration screen, together in one frame.";
+  }
+  $("hint").textContent = hints[action];
 }
 
 async function refresh() {
@@ -764,6 +1086,13 @@ async function refresh() {
       : "after reference";
     $("s-sr").textContent = s.sampling_ratio ? s.sampling_ratio.toFixed(2) : "—";
     $("s-n").textContent = s.captures;
+    $("s-from").textContent = s.calibrates_from;
+    const was = BEZEL + "/" + ANCHORED;
+    BEZEL = !!s.charuco; ANCHORED = !!s.anchor_bound;
+    $("rebindRow").style.display = BEZEL ? "grid" : "none";
+    document.querySelector('[data-a="calibrate"] span').textContent =
+      BEZEL ? (ANCHORED ? "markers only" : "bind: markers + pattern") : "chessboard up";
+    if (was !== BEZEL + "/" + ANCHORED) paintSteps();
     document.querySelector('[data-a="calibrate"]').classList.toggle("done", s.calibrated);
     document.querySelector('[data-a="reference"]').classList.toggle("done", s.has_reference);
     if (s.calibrated && !s.has_reference && action === "calibrate") { action = "reference"; paintSteps(); }

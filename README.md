@@ -88,12 +88,32 @@ layoutval capture-server --board board.json --profile profiles/main.yaml
 calibrates by matching the screen's own content, so the cluster never has to
 leave the screen under test. **It needs the framebuffer, so it is for a
 simulated or developer-controlled HMI** — a production cluster gives you a
-camera and nothing else, and then the geometry has to come from a bezel marker,
-one bright frame, or marked corners; see
+camera and nothing else, and then the geometry has to come from a bezel marker
+(`--charuco`, below), one bright frame, or marked corners; see
 [What a real cluster leaves you](docs/rig.md#what-a-real-cluster-leaves-you). It measures within about 0.02 px of the chessboard
 across pose, focus, sampling ratio and lens distortion — see
 `benchmarks/calibration_methods.py` and [docs/rig.md](docs/rig.md). The content
 does not have to match the photograph exactly; RANSAC discards whatever moved.
+
+`--charuco 16x3:30:22` is the route for a cluster you cannot ask to draw
+anything: a ChArUco board stuck to the bezel, outside the active area.
+`layoutval charuco-board 16x3:30:22` draws the board to print (lengths are
+millimetres; print at 100%, and matt, because a glossy board under a cluster's
+own glass gives you two reflections to fight). The first
+Calibrate **binds** it — that one frame needs the markers *and* the calibration
+screen together — and every Calibrate after needs the markers only, so the
+screen stays on the screen under test. The binding is saved and picked up by
+later runs.
+
+It needs `--intrinsics` and refuses without them: the markers are photographed
+away from the screen's part of the frame, so lens distortion does not cancel the
+way it nearly does for a board on the screen. Measured, 0.10 px undistorted on
+any lens against 0.6–5.7 px with the distortion left in. Re-bind if the camera
+moves much — reusing an anchor across a move costs about 5× (0.09 px → 0.25–0.32
+px, 0.94 px at p95), and the server says when the board has drifted from where
+it was bound. `benchmarks/bezel_anchor.py` has the full table, and
+[docs/rig.md](docs/rig.md) the caveat about a recessed display that the
+simulator cannot settle.
 
 `--board` takes the file the cluster's own `--calibration-export` writes, which
 carries the exact corner coordinates. Prefer it over describing the board with

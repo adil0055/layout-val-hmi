@@ -1,5 +1,6 @@
 """Command line entry points.
 
+    layoutval charuco-board         ...   draw a bezel board to print
     layoutval calibrate-intrinsics  ...   stage 2, once per camera+lens
     layoutval calibrate-geometry    ...   stage 3, once per rig build
     layoutval import-design         ...   build a profile from a design export
@@ -23,6 +24,7 @@ import numpy as np
 
 from layoutval.calibration import (
     Calibration,
+    CharucoSpec,
     DisplayGeometry,
     Intrinsics,
     Undistorter,
@@ -300,6 +302,49 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0 if result.passed else 1
 
 
+def cmd_charuco_board(args: argparse.Namespace) -> int:
+    """Draw the board to print and stick on the bezel."""
+    try:
+        spec = CharucoSpec.parse(args.spec)
+    except ValueError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+    # Printed size is what makes the board usable, so work in millimetres and
+    # let the DPI decide the pixel count, rather than emitting some pixel image
+    # and leaving the scaling to whatever prints it.  The spec's lengths are
+    # already in the units the board was designed in; treat them as mm.
+    px_per_unit = args.dpi / 25.4
+    width = int(round(spec.squares_x * spec.square_length * px_per_unit))
+    height = int(round(spec.squares_y * spec.square_length * px_per_unit))
+    image = spec.board().generateImage(
+        (width, height), marginSize=int(round(args.margin_mm * px_per_unit))
+    )
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(out), image):
+        raise SystemExit(f"error: could not write {out}")
+
+    board_w = spec.squares_x * spec.square_length
+    board_h = spec.squares_y * spec.square_length
+    print(f"wrote {out}  ({width}x{height} px at {args.dpi} dpi)")
+    print(f"  {spec.squares_x}x{spec.squares_y} squares of "
+          f"{spec.square_length:g} mm, markers {spec.marker_length:g} mm, "
+          f"{spec.dictionary}")
+    print(f"  prints at {board_w:g} x {board_h:g} mm "
+          f"plus a {args.margin_mm:g} mm quiet margin")
+    print()
+    print("  Print it at 100% -- 'fit to page' rescales it and the printed size")
+    print("  is what the board's own units mean. Check one square with a ruler")
+    print("  before sticking it on. Matt paper or matt laminate: a glossy board")
+    print("  under a cluster's own glass gives you two reflections to fight.")
+    print()
+    print("  Stick it on the bezel, outside the active area, flat and in the")
+    print("  same plane as the screen as far as the bezel allows. Then:")
+    print(f"    layoutval capture-server --charuco {args.spec} \\")
+    print("        --intrinsics calibration/intrinsics.json")
+    return 0
+
+
 def cmd_capture_server(args: argparse.Namespace) -> int:
     from layoutval.server import (
         CaptureServer,
@@ -349,6 +394,34 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
             f"tools/shoot.py out.png --width {display_size[0]}"
         )
 
+    charuco = None
+    if args.charuco:
+        try:
+            charuco = CharucoSpec.parse(args.charuco)
+        except ValueError as exc:
+            raise SystemExit(f"error: --charuco: {exc}") from exc
+        if not (args.intrinsics or args.calibration):
+            # Refusing at startup rather than at the first capture: this route
+            # cannot produce a defensible number without undistortion, and
+            # finding that out after carrying a phone to the bench is worse than
+            # finding it out here.
+            raise SystemExit(
+                "error: --charuco needs camera intrinsics, so pass --intrinsics "
+                "(or a --calibration that carries them).\n"
+                "       The bezel markers are photographed away from the screen's "
+                "part of the frame, so lens distortion does not cancel the way it "
+                "nearly does for a board on the screen.\n"
+                "       Measured (benchmarks/bezel_anchor.py): undistorted this "
+                "route holds 0.10 px on any lens; with the distortion left in it "
+                "runs 0.6 px to 5.7 px depending on\n"
+                "       the lens, and elements start dropping out of the match "
+                "altogether. It is lens-dependent, so one good-looking frame "
+                "tells you nothing about the next camera.\n"
+                "       Solve them once for this camera and lens:\n"
+                "         layoutval calibrate-intrinsics --images 'shots/*.jpg' "
+                "--out calibration/intrinsics.json"
+            )
+
     profile = (LayoutProfile.load(_require(args.profile, "--profile"))
                if args.profile else None)
     calibration = (Calibration.load(_require(args.calibration, "--calibration"))
@@ -373,6 +446,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         values=_read_json(args.values, "--values") if args.values else None,
         auto_profile=not args.no_auto_profile,
         render=render,
+        charuco=charuco,
     )
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
 
@@ -524,6 +598,22 @@ def build_parser() -> argparse.ArgumentParser:
     c.set_defaults(func=cmd_gate)
 
     c = sub.add_parser(
+        "charuco-board",
+        help="draw a ChArUco board to print and stick on the bezel",
+    )
+    c.add_argument("spec", help="COLSxROWS[:SQUARE[:MARKER[:DICT]]], the same "
+                                "string capture-server's --charuco takes "
+                                "(e.g. 16x3:30:22). Lengths are millimetres")
+    c.add_argument("--out", default="calibration/charuco.png")
+    c.add_argument("--dpi", type=float, default=600.0,
+                   help="print resolution; the spec's lengths set the physical "
+                        "size and this sets the pixels (default 600)")
+    c.add_argument("--margin-mm", type=float, default=10.0,
+                   help="white quiet margin around the board, which the marker "
+                        "detector needs to find the outer squares (default 10)")
+    c.set_defaults(func=cmd_charuco_board)
+
+    c = sub.add_parser(
         "capture-server",
         help="capture from a phone on the same network, measure here",
     )
@@ -538,6 +628,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the cluster's own board export (its --calibration-export). "
                         "Preferred: it carries the exact corners, so nothing has to "
                         "be guessed or converted")
+    c.add_argument("--charuco", metavar="SPEC",
+                   help="a ChArUco board fixed to the bezel, as COLSxROWS[:SQUARE"
+                        "[:MARKER[:DICT]]] (e.g. 16x3:30:22). For a cluster that "
+                        "cannot be asked to draw anything: the first Calibrate "
+                        "binds the board to the active area and needs the "
+                        "calibration screen too, every one after needs only the "
+                        "markers. Requires --intrinsics")
     c.add_argument("--display-size", nargs=2, type=int, default=None,
                    help="the framebuffer's size; taken from --board or --render "
                         "when not given")
