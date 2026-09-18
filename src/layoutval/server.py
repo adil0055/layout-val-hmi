@@ -67,14 +67,18 @@ from layoutval.autoprofile import profile_from_reference
 from layoutval.calibration import (
     Calibration,
     CharucoSpec,
+    DisplayGeometry,
     DriftTracker,
     Undistorter,
     charuco_anchor,
     chessboard_display_points,
     detect_charuco,
     homography_from_charuco,
+    homography_from_display_aperture,
     homography_from_display_pattern,
     homography_from_screen_content,
+    board_points_for_intrinsics,
+    solve_intrinsics,
 )
 from layoutval.pipeline import Pipeline, PipelineOptions
 from layoutval.profile import LayoutProfile
@@ -85,7 +89,12 @@ from layoutval.types import RunReport, Verdict
 #: order of magnitude past that is not a photograph.
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
-ACTIONS = ("calibrate", "rebind", "reference", "validate")
+ACTIONS = ("intrinsics", "calibrate", "rebind", "reference", "validate")
+
+#: Views wanted before the intrinsics solve is attempted.  Eight is the same
+#: floor the offline command uses: a calibration solved from three
+#: near-identical views is worse than none, because it looks fine.
+INTRINSIC_VIEWS_WANTED = 12
 
 #: How far the board is allowed to move in the frame before the anchor
 #: learned in the bind frame stops being the anchor for this one.  Measured,
@@ -316,6 +325,8 @@ class CaptureSession:
         auto_profile: bool = True,
         render: np.ndarray | None = None,
         charuco: CharucoSpec | None = None,
+        aperture: bool = False,
+        display_inset_px: tuple[float, float] = (0.0, 0.0),
     ) -> None:
         self.lock = threading.Lock()
         self.out_dir = Path(out_dir)
@@ -343,6 +354,11 @@ class CaptureSession:
         #: the active area, so the screen under test can stay on the screen
         #: under test.  It costs one binding frame, once -- see
         #: :meth:`_calibrate_charuco`.
+        #: Calibrate from the display's own physical border. This is the only
+        #: route that asks the cluster for nothing at all -- not a pattern, not
+        #: a framebuffer, and not the one binding frame the bezel markers need.
+        self.aperture = aperture
+        self.display_inset_px = display_inset_px
         self.charuco_spec = charuco
         self.charuco_board = charuco.board() if charuco else None
         self.charuco_anchor: np.ndarray | None = None
@@ -350,6 +366,12 @@ class CaptureSession:
         #: id.  Compared against each later frame to catch the case the anchor
         #: cannot survive: the camera having moved since.
         self.charuco_bind_corners: dict[int, tuple[float, float]] = {}
+        #: Views accumulated for an intrinsics solve, as correspondences rather
+        #: than frames -- a phone photograph is tens of megabytes and its
+        #: correspondences are a few kilobytes, and twenty of the former does
+        #: not fit anywhere sensible.
+        self._intrinsic_views: list[tuple[np.ndarray, np.ndarray]] = []
+        self._intrinsic_frame_size: tuple[int, int] | None = None
         self.display_size = display_size or (
             calibration.geometry.display_size if calibration else (1920, 720)
         )
@@ -385,6 +407,13 @@ class CaptureSession:
             "calibrates_from": self._calibrates_from(),
             "charuco": self.charuco_spec.to_dict() if self.charuco_spec else None,
             "anchor_bound": self.charuco_anchor is not None,
+            "has_intrinsics": bool(
+                self.calibration and self.calibration.intrinsics),
+            "intrinsic_views": len(self._intrinsic_views),
+            "intrinsic_views_wanted": INTRINSIC_VIEWS_WANTED,
+            "needs_intrinsics": (
+                self.charuco_spec is not None
+                and not (self.calibration and self.calibration.intrinsics)),
             "sampling_ratio": (
                 round(self.calibration.geometry.sampling_ratio(), 3)
                 if self.calibration else None
@@ -393,6 +422,8 @@ class CaptureSession:
         }
 
     def _calibrates_from(self) -> str:
+        if self.aperture:
+            return "the display's own border"
         if self.charuco_spec is not None:
             return (
                 "bezel markers" if self.charuco_anchor is not None
@@ -416,6 +447,8 @@ class CaptureSession:
         stamp = datetime.now().strftime("%H%M%S")
         base = f"{stamp}-{action}"
         with self.lock:
+            if action == "intrinsics":
+                return self._record(self._collect_intrinsics(frame, base))
             if action in ("calibrate", "rebind"):
                 return self._record(self._calibrate(frame, base, rebind=action == "rebind"))
             if action == "reference":
@@ -681,6 +714,106 @@ class CaptureSession:
                 "shift -- move closer or zoom in before trusting a tolerance"
             )
 
+    def _collect_intrinsics(self, frame: np.ndarray, base: str) -> CaptureRecord:
+        """Accumulate one view towards a lens solve, from the phone.
+
+        Intrinsics are per camera and lens, and getting them has meant shooting
+        a set of board photographs and moving the files onto the laptop by hand
+        -- which is the step most likely to stop somebody before they start, and
+        an odd one to insist on when a phone is already uploading frames to this
+        process over the network.
+
+        The board can be a printed one or the cluster's own calibration screen:
+        what a lens solve needs is a *planar* target of known geometry seen from
+        many angles, and a flat panel showing a chessboard is exactly that.
+        """
+        rec = CaptureRecord(name=f"{base}.jpg", action="intrinsics",
+                            when=datetime.now().isoformat(timespec="seconds"))
+        self._store(rec.name, frame)
+        h, w = frame.shape[:2]
+
+        if self._intrinsic_frame_size is None:
+            self._intrinsic_frame_size = (w, h)
+        elif self._intrinsic_frame_size != (w, h):
+            # Intrinsics are in pixels, so they belong to one frame size. Mixing
+            # sizes silently produces a calibration that fits neither.
+            rec.verdict = "FAILED"
+            rec.detail = (
+                f"this frame is {w}x{h} but the others are "
+                f"{self._intrinsic_frame_size[0]}x{self._intrinsic_frame_size[1]}. "
+                "Intrinsics are measured in pixels, so every view has to come "
+                "from the same camera at the same resolution -- check the phone "
+                "is not switching lens between shots, and start again."
+            )
+            return rec
+
+        try:
+            obj, img = board_points_for_intrinsics(
+                frame,
+                board=self.charuco_board,
+                pattern_size=self.pattern_size,
+            )
+        except (RuntimeError, ValueError) as exc:
+            rec.verdict = "FAILED"
+            rec.detail = (
+                f"{exc}. Not counted. Fill the frame with the board, keep it "
+                f"sharp, and avoid glare. The frame is saved as {rec.name}."
+            )
+            return rec
+
+        self._intrinsic_views.append((obj, img))
+        got, want = len(self._intrinsic_views), INTRINSIC_VIEWS_WANTED
+        rec.verdict = "OK"
+        rec.detail = f"view {got} of {want} accepted, {len(img)} corners"
+
+        if got < want:
+            rec.detail += (
+                ". Move between shots: different angles, distances, and the "
+                "board in different corners of the frame. Views that all look "
+                "alike cannot separate the lens from the pose, and the solve "
+                "will look fine and be wrong"
+            )
+            return rec
+
+        try:
+            intrinsics = solve_intrinsics(
+                [o for o, _ in self._intrinsic_views],
+                [i for _, i in self._intrinsic_views],
+                self._intrinsic_frame_size,
+                min_views=want,
+            )
+        except (RuntimeError, cv2.error) as exc:
+            rec.verdict = "FAILED"
+            rec.detail = f"the solve did not converge: {exc}. Shoot more views."
+            return rec
+
+        self.calibration = Calibration(
+            intrinsics=intrinsics,
+            geometry=(self.calibration.geometry if self.calibration
+                      else DisplayGeometry(H=np.eye(3), display_size=self.display_size)),
+            rig={"source": "phone capture"},
+            drift_alarm_px=self.drift_alarm_px,
+        )
+        out = self.out_dir / "intrinsics.json"
+        out.write_text(json.dumps(intrinsics.to_dict(), indent=2))
+        rec.detail = (
+            f"solved the lens from {got} views: reprojection error "
+            f"{intrinsics.rms:.3f} camera px. Saved as {out.name}"
+        )
+        if intrinsics.rms > 0.3:
+            # Same gate the offline command applies. Above it the fit is not
+            # describing the lens well, and everything downstream inherits that.
+            rec.detail += (
+                ". That is above the 0.3 px this package gates on -- the fit is "
+                "not describing the lens well. Shoot a fresh set with the board "
+                "sharper, flatter and at more varied angles before relying on it"
+            )
+        else:
+            rec.detail += ". Calibrate is unblocked -- carry on"
+        self._intrinsic_views.clear()
+        self._intrinsic_frame_size = None
+        return rec
+
     def _calibrate(
         self, frame: np.ndarray, base: str, *, rebind: bool = False
     ) -> CaptureRecord:
@@ -689,6 +822,8 @@ class CaptureSession:
                             when=datetime.now().isoformat(timespec="seconds"))
         self._store(rec.name, frame)
         undistorted = self._undistort(frame)
+        if self.aperture and not rebind:
+            return self._calibrate_from_aperture(undistorted, rec)
         if self.charuco_spec is not None:
             return self._calibrate_charuco(frame, undistorted, rec, rebind=rebind)
         if rebind:
@@ -759,6 +894,50 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
+        return rec
+
+    def _calibrate_from_aperture(
+        self, undistorted: np.ndarray, rec: CaptureRecord
+    ) -> CaptureRecord:
+        """Calibrate from the display's own border, asking the cluster nothing.
+
+        Every other route wants something: a pattern drawn, a white frame, the
+        framebuffer, or -- for the bezel markers -- one binding frame with the
+        calibration screen up.  This one wants nothing at all, because the
+        aperture is hardware and is in every photograph whatever the software is
+        doing.
+        """
+        try:
+            geometry = homography_from_display_aperture(
+                undistorted, display_size=self.display_size,
+                inset_px=self.display_inset_px,
+            )
+        except RuntimeError as exc:
+            rec.verdict = "FAILED"
+            rec.detail = (
+                f"{exc}. The frame is saved as {rec.name} -- open it and see "
+                "what it caught."
+            )
+            return rec
+        self._commit_geometry(geometry, "phone capture, the display's own border")
+        diag = geometry.aperture
+        rec.verdict = "OK"
+        rec.detail = (
+            "solved from the display's own border -- nothing was asked of the "
+            f"cluster. Found as a {diag['polarity']} region at threshold "
+            f"{diag['threshold']}, stable over {diag['levels_stable']} levels, "
+            f"fills {diag['rectangularity']:.0%} of its own bounding box"
+        )
+        if self.display_inset_px == (0.0, 0.0):
+            rec.detail += (
+                ". Note: this locates the physical opening, and the active area "
+                "sits behind it by a mask width this cannot see, so display "
+                "coordinates here carry a constant offset. It cancels exactly "
+                "between reference and validate, so it does not affect a defect "
+                "measurement -- pass --display-inset only if you need absolute "
+                "coordinates to compare against a design"
+            )
+        self._note_sampling_ratio(rec, geometry)
         return rec
 
     def _calibrate_from_content(
@@ -1027,6 +1206,11 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
   <div class="step" data-a="validate"><b>3 Validate</b><span>screen under test</span></div>
 </div>
 
+<div class="steps" id="introw" style="display:none;grid-template-columns:1fr">
+  <div class="step" data-a="intrinsics"><b>0 Intrinsics</b>
+    <span id="intcount">the lens, once per phone</span></div>
+</div>
+
 <div class="steps" id="rebindRow" style="display:none;grid-template-columns:1fr">
   <div class="step" data-a="rebind"><b>Re-bind the bezel board</b>
     <span>only after the sticker moves</span></div>
@@ -1065,7 +1249,8 @@ function paintSteps() {
     calibrate: "Put the cluster on its chessboard pattern first. Fill the frame with it, square on.",
     reference: "Show the screen under test, correct. This becomes what later shots are compared against.",
     validate: "Show the same screen with whatever you are testing. Keep the phone where it was.",
-    rebind: "Only needed if the bezel sticker was moved or reprinted. Needs the markers and the calibration screen together again."
+    rebind: "Only needed if the bezel sticker was moved or reprinted. Needs the markers and the calibration screen together again.",
+    intrinsics: "Shoot the board from a different angle and distance each time \u2014 near, far, tilted, and in each corner of the frame. Shots that all look alike cannot separate the lens from the pose."
   };
   if (BEZEL) {
     hints.calibrate = ANCHORED
@@ -1089,7 +1274,17 @@ async function refresh() {
     $("s-from").textContent = s.calibrates_from;
     const was = BEZEL + "/" + ANCHORED;
     BEZEL = !!s.charuco; ANCHORED = !!s.anchor_bound;
-    $("rebindRow").style.display = BEZEL ? "grid" : "none";
+    $("rebindRow").style.display = (BEZEL && ANCHORED) ? "grid" : "none";
+    $("introw").style.display = (BEZEL && !s.has_intrinsics) ? "grid" : "none";
+    $("intcount").textContent = s.intrinsic_views
+      ? `${s.intrinsic_views} of ${s.intrinsic_views_wanted} views`
+      : "the lens, once per phone";
+    document.querySelector('[data-a="intrinsics"]').classList
+      .toggle("done", !!s.has_intrinsics);
+    // Nothing else can run until the lens is solved, so start there rather
+    // than letting Calibrate be picked and refused.
+    if (s.needs_intrinsics && action === "calibrate") { action = "intrinsics"; }
+    if (!s.needs_intrinsics && action === "intrinsics") { action = "calibrate"; }
     document.querySelector('[data-a="calibrate"] span').textContent =
       BEZEL ? (ANCHORED ? "markers only" : "bind: markers + pattern") : "chessboard up";
     if (was !== BEZEL + "/" + ANCHORED) paintSteps();

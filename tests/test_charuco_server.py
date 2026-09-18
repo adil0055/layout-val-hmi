@@ -281,3 +281,68 @@ def test_printed_size_follows_the_spec_not_the_dpi(tmp_path):
         # 9x6 squares of 20 mm is 180 x 120 mm, so the aspect is fixed at 1.5.
         assert w / h == pytest.approx(1.5, abs=0.01)
     assert sizes[120][0] == pytest.approx(2 * sizes[60][0], abs=2)
+
+
+def test_intrinsics_can_be_collected_from_the_phone(tmp_path):
+    """The lens solve is reachable from the bench, not only from a shell.
+
+    This is the whole reason the route no longer refuses at startup: the step
+    that used to mean shooting a set of photographs and moving files by hand is
+    the one most likely to stop somebody before they start.
+    """
+    display, panel, rig = make_rig()
+    session = CaptureSession(tmp_path, display_size=display.size,
+                             charuco=spec_for(panel))
+    assert session.status()["needs_intrinsics"] is True
+
+    # Calibrate refuses, and says what to do about it.
+    rig.show("checkerboard")
+    assert session.handle("calibrate", jpeg(rig.read())).verdict == "FAILED"
+
+    poses = [(2.0, 0.7), (9.0, -4.0), (-6.0, 5.0), (13.0, 2.0), (-11.0, -3.0),
+             (4.0, 9.0), (-2.0, -8.0), (7.0, 3.5), (-9.0, 1.0), (11.0, -6.0),
+             (0.5, 0.2), (-4.0, -2.0)]
+    last = None
+    for i, (tilt, roll) in enumerate(poses):
+        _, _, shot = make_rig(tilt_deg=tilt, roll_deg=roll, seed=i,
+                              sampling_ratio=0.9 + 0.02 * i)
+        shot.show("main")
+        last = session.handle("intrinsics", jpeg(shot.read()))
+        assert last.verdict == "OK", last.detail
+
+    assert "solved the lens" in last.detail
+    assert (tmp_path / "intrinsics.json").exists()
+    assert session.calibration.intrinsics is not None
+    assert session.status()["needs_intrinsics"] is False
+
+    # And the route it was blocking now runs.
+    rig.show("checkerboard")
+    rec = session.handle("calibrate", jpeg(rig.read()))
+    assert rec.verdict == "OK", rec.detail
+    assert "bound the bezel board" in rec.detail
+
+
+def test_intrinsic_views_must_share_a_frame_size(tmp_path):
+    """Intrinsics are in pixels, so mixing sizes fits neither."""
+    display, panel, rig = make_rig()
+    session = CaptureSession(tmp_path, display_size=display.size,
+                             charuco=spec_for(panel))
+    rig.show("main")
+    assert session.handle("intrinsics", jpeg(rig.read())).verdict == "OK"
+
+    _, _, other = make_rig(sensor_size=(1600, 1000))
+    other.show("main")
+    rec = session.handle("intrinsics", jpeg(other.read()))
+    assert rec.verdict == "FAILED"
+    assert "same camera at the same resolution" in rec.detail
+
+
+def test_a_view_without_the_board_is_not_counted(tmp_path):
+    display, panel, rig = make_rig()
+    session = CaptureSession(tmp_path, display_size=display.size,
+                             charuco=spec_for(panel))
+    blank = np.full((900, 1600, 3), 40, np.uint8)
+    rec = session.handle("intrinsics", jpeg(blank))
+    assert rec.verdict == "FAILED"
+    assert "Not counted" in rec.detail
+    assert session.status()["intrinsic_views"] == 0

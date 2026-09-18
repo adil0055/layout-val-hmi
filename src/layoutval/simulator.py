@@ -465,7 +465,10 @@ class BezelPanel:
     """
 
     panel_size: tuple[int, int] = (2400, 1460)
-    display_rect: tuple[int, int, int, int] = (305, 165, 1790, 870)
+    #: The opening's proportions match the framebuffer's, because a real module
+    #: cannot stretch its own pixels. Getting this wrong here makes any aperture
+    #: search look broken when it is the fixture that is impossible.
+    display_rect: tuple[int, int, int, int] = (305, 165, 1790, 671)
     squares: tuple[int, int] = (16, 3)
     square_px: int = 99
     #: Board units, as the board object is told them.  Only the ratio to

@@ -101,6 +101,66 @@ class Undistorter:
         return cv2.remap(img, self.map1, self.map2, cv2.INTER_CUBIC)
 
 
+def board_points_for_intrinsics(
+    image: np.ndarray,
+    *,
+    board: "cv2.aruco.CharucoBoard | None" = None,
+    pattern_size: tuple[int, int] | None = None,
+    square_size_mm: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """One view's (object points, image points), for accumulating a calibration.
+
+    Pulled out of :func:`calibrate_intrinsics` so that views can be collected
+    one at a time -- from a phone, over the network -- without holding every
+    full-resolution frame in memory.  A phone photograph is tens of megabytes
+    and a view's correspondences are a few kilobytes.
+
+    Raises :class:`RuntimeError` when the board is not readable in this view,
+    which is the common case and worth telling the person about while they are
+    still standing in front of the cluster.
+    """
+    if board is not None:
+        corners, ids = detect_charuco(image, board)
+        obj = np.asarray(board.getChessboardCorners(), np.float32)[ids]
+        return obj, corners.astype(np.float32)
+
+    if pattern_size is None:
+        raise ValueError("need either a ChArUco board or a chessboard pattern size")
+    ok, corners = cv2.findChessboardCornersSB(
+        to_gray(image), pattern_size,
+        flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY,
+    )
+    if not ok:
+        raise RuntimeError(
+            f"no {pattern_size[0]}x{pattern_size[1]} chessboard in this view"
+        )
+    obj = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
+    obj[:, :2] = np.mgrid[0 : pattern_size[0], 0 : pattern_size[1]].T.reshape(-1, 2)
+    obj *= square_size_mm
+    return obj, corners.reshape(-1, 2).astype(np.float32)
+
+
+def solve_intrinsics(
+    obj_points: Sequence[np.ndarray],
+    img_points: Sequence[np.ndarray],
+    image_size: tuple[int, int],
+    *,
+    min_views: int = 8,
+) -> Intrinsics:
+    """Solve K and distortion from views already reduced to correspondences."""
+    if len(obj_points) < min_views:
+        raise RuntimeError(
+            f"only {len(obj_points)} usable views; need at least {min_views} "
+            "spanning different poses and depths"
+        )
+    rms, K, dist, _, _ = cv2.calibrateCamera(
+        [o.reshape(-1, 1, 3) for o in obj_points],
+        [i.reshape(-1, 1, 2) for i in img_points],
+        image_size, None, None,
+    )
+    return Intrinsics(K=K, dist=dist, image_size=image_size, rms=float(rms))
+
+
 def calibrate_intrinsics(
     images: Sequence[np.ndarray],
     pattern_size: tuple[int, int],
@@ -691,6 +751,398 @@ def _intersect(p1: np.ndarray, d1: np.ndarray, p2: np.ndarray, d2: np.ndarray) -
     return p1 + t[0] * d1
 
 
+def refine_edges_subpixel(
+    gray: np.ndarray,
+    corners: np.ndarray,
+    *,
+    samples_per_edge: int = 120,
+    half_width: float = 12.0,
+) -> np.ndarray:
+    """Pull a quadrilateral's edges onto the real intensity step.
+
+    A threshold puts the boundary wherever the level happens to cut the blurred
+    edge, which is a *consistent* place and therefore a bias rather than noise:
+    on the simulated bezel it cost 0.86 px absolute while the scatter about it
+    was only 0.31 px.  A bias that size is worth removing, and it is removable
+    without knowing anything new -- the edge's true position is where the
+    intensity is halfway between the two plateaus it separates, and that can be
+    read off the profile to a fraction of a pixel.
+
+    For each edge, intensity is sampled along the normal at many points, the
+    half-height crossing is located by linear interpolation between the
+    bracketing samples, and a line is fitted through those crossings.  Corners
+    come from intersecting the refined lines, as before.
+    """
+    gray = gray.astype(np.float32)
+    h, w = gray.shape[:2]
+    refined_lines = []
+    for i in range(4):
+        a, b = corners[i], corners[(i + 1) % 4]
+        along = b - a
+        length = float(np.linalg.norm(along))
+        if length < 4:
+            raise RuntimeError("aperture edge too short to refine")
+        along = along / length
+        normal = np.array([-along[1], along[0]], np.float64)
+
+        crossings = []
+        for t in np.linspace(0.08, 0.92, samples_per_edge):
+            centre = a + along * (length * t)
+            offsets = np.arange(-half_width, half_width + 1.0, 1.0)
+            pts = centre[None, :] + normal[None, :] * offsets[:, None]
+            if (pts[:, 0].min() < 1 or pts[:, 0].max() > w - 2
+                    or pts[:, 1].min() < 1 or pts[:, 1].max() > h - 2):
+                continue
+            profile = cv2.remap(
+                gray, pts[:, 0].astype(np.float32).reshape(-1, 1),
+                pts[:, 1].astype(np.float32).reshape(-1, 1),
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            ).ravel()
+            # The plateaus are the ends of the profile; the step is between.
+            near = float(np.median(profile[:4]))
+            far = float(np.median(profile[-4:]))
+            if abs(far - near) < 8.0:
+                continue  # no real step here -- glare, or the edge is occluded
+            half = 0.5 * (near + far)
+            rising = far > near
+            signed = profile - half
+            if rising:
+                idx = np.where((signed[:-1] < 0) & (signed[1:] >= 0))[0]
+            else:
+                idx = np.where((signed[:-1] > 0) & (signed[1:] <= 0))[0]
+            if len(idx) != 1:
+                continue  # ambiguous: more than one step along this normal
+            k = int(idx[0])
+            denom = profile[k + 1] - profile[k]
+            frac = 0.0 if abs(denom) < 1e-6 else (half - profile[k]) / denom
+            crossings.append(centre + normal * (offsets[k] + frac))
+
+        if len(crossings) < 12:
+            raise RuntimeError(
+                f"aperture edge {i} gave only {len(crossings)} usable profiles; "
+                "the boundary is not a clean step here -- check for glare, a "
+                "reflection lying across it, or the trim and panel being the "
+                "same brightness"
+            )
+        refined_lines.append(_fit_line(np.array(crossings)))
+
+    # Edge i runs from corner i to corner i+1, so line i crossed with line i+1
+    # is corner *i+1*. Roll by one to put each corner back at its own index --
+    # the input order is already top-left first and must be preserved, since a
+    # rotated quadrilateral fits a homography that is confidently wrong.
+    crossed = np.array(
+        [_intersect(*refined_lines[i], *refined_lines[(i + 1) % 4]) for i in range(4)],
+        dtype=np.float64,
+    )
+    return np.roll(crossed, 1, axis=0)
+
+
+def find_display_aperture(
+    frame: np.ndarray,
+    *,
+    display_size: tuple[int, int],
+    aspect_tolerance: float = 0.25,
+    min_area_fraction: float = 0.02,
+    max_area_fraction: float = 0.92,
+    min_rectangularity: float = 0.80,
+    search_width: int = 800,
+    refine: bool = True,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Find the display's physical opening in the bezel, whatever it is showing.
+
+    This is the route for a cluster that will never draw anything for you.  It
+    does not look for lit pixels, so it does not care what the HMI is showing:
+    it looks for the *aperture* -- the boundary between the panel and the trim
+    around it, which is a property of the hardware and is in every frame.
+
+    **Why not just threshold.**  The obvious implementation is Otsu and take the
+    big rectangle, and it does not work.  Otsu is a two-class split, and a
+    photograph of a cluster has at least three populations in it: the dark
+    screen, the mid-grey trim, and something bright -- a marker, a reflection, a
+    lit telltale.  Measured on the simulated bezel, Otsu put its threshold at
+    123, between the bright things and everything else, merging the screen and
+    the trim into one blob covering 99.9% of the frame.  The display/bezel step
+    was a clean 13-to-38 and the split went nowhere near it.
+
+    So the threshold is *swept* instead.  At every level, both polarities are
+    examined -- a dark screen in light trim and a lit screen in dark trim are
+    both ordinary -- and every region that could be a display is scored.  The
+    aperture is the region that stays the right shape across the widest range of
+    levels, which is what makes it findable without knowing the brightnesses in
+    advance.
+
+    Contours are retrieved with ``RETR_LIST`` rather than ``RETR_EXTERNAL``,
+    and that is not incidental: the aperture is a *hole*.  The trim surrounds
+    it, so under any threshold that separates them the display is an interior
+    boundary of the trim region, which ``RETR_EXTERNAL`` discards by definition
+    -- and taken the other way round the dark screen merges with whatever dark
+    scene surrounds the cluster and becomes one shapeless component.  Measured
+    on the simulated bezel, that one flag was the difference between finding the
+    aperture in every pose and finding it in none.
+
+    Scoring uses the one thing known for free: the active area's **aspect
+    ratio**.  A cluster frame is full of rectangles -- vents, trim, a binnacle,
+    the reflection of a window -- and the display's is the one whose proportions
+    match the framebuffer's.
+
+    Returns the four sub-pixel corners and a dict of diagnostics, because when
+    this picks the wrong rectangle you want to see why rather than guess.
+    """
+    gray = to_gray(frame)
+    full_h, full_w = gray.shape[:2]
+    want_aspect = display_size[0] / float(display_size[1])
+
+    # Search small and fit big: the sweep is a shape search and does not need
+    # the pixels, while the line fit that follows very much does.
+    scale = min(1.0, search_width / float(full_w))
+    small = cv2.GaussianBlur(
+        cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        if scale < 1.0 else gray, (5, 5), 0)
+    sh, sw = small.shape[:2]
+    small_area = float(sh * sw)
+    kernel = np.ones((5, 5), np.uint8)
+
+    #: (level, polarity) -> the candidate's centre and size, so that a region
+    #: surviving many consecutive levels can be recognised as the stable one.
+    hits: list[dict[str, Any]] = []
+    for level in range(8, 248, 3):
+        _, binary = cv2.threshold(small, level, 255, cv2.THRESH_BINARY)
+        for polarity, mask in (("bright", binary), ("dark", cv2.bitwise_not(binary))):
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if not (min_area_fraction * small_area <= area
+                        <= max_area_fraction * small_area):
+                    continue
+                (cx, cy), (rw, rh), _ = cv2.minAreaRect(contour.astype(np.float32))
+                if rw < 2 or rh < 2 or area / (rw * rh) < min_rectangularity:
+                    continue
+                aspect = max(rw, rh) / min(rw, rh)
+                if want_aspect < 1.0:
+                    aspect = 1.0 / aspect
+                err = abs(aspect - want_aspect) / want_aspect
+                if err > aspect_tolerance:
+                    continue
+                hits.append({"level": level, "polarity": polarity, "centre": (cx, cy),
+                             "size": (rw, rh), "aspect_error": err,
+                             "rectangularity": area / (rw * rh),
+                             "area_fraction": area / small_area})
+
+    if not hits:
+        raise RuntimeError(
+            "no region in this frame has the display's proportions at any "
+            f"threshold. The framebuffer is {display_size[0]}x{display_size[1]} "
+            f"({want_aspect:.2f}:1), so that is what was looked for. The "
+            "aperture has to be a visible boundary: get some light on the "
+            "cluster so the trim and the panel do not read as one black shape, "
+            "keep the whole display and a margin of bezel in frame, and watch "
+            "for a reflection large enough to swallow an edge"
+        )
+
+    # Group hits that are the same region seen at different levels, then take
+    # the group that survived the most levels -- stability is the signal. Ties
+    # go to the better aspect match.
+    groups: list[list[dict[str, Any]]] = []
+    for hit in sorted(hits, key=lambda h: h["level"]):
+        for group in groups:
+            ref = group[-1]
+            if (group[0]["polarity"] == hit["polarity"]
+                    and abs(ref["centre"][0] - hit["centre"][0]) < 0.05 * sw
+                    and abs(ref["centre"][1] - hit["centre"][1]) < 0.05 * sh
+                    and abs(ref["area_fraction"] - hit["area_fraction"]) < 0.10):
+                group.append(hit)
+                break
+        else:
+            groups.append([hit])
+    # Stability is the strongest signal, but it cannot stand alone: the bezel's
+    # own outline is just as stable as the aperture inside it, and on a cluster
+    # whose trim has roughly the display's proportions it also passes the aspect
+    # test. Measured at a sampling ratio of 3, the panel outline (aspect 2.30,
+    # 60% of frame) was selected over the true aperture (aspect 2.65, 29%).
+    # Rectangularity separates them -- an aperture fills its bounding rectangle
+    # and a trim outline with a display cut out of it does not -- so score on
+    # all three rather than on stability and aspect alone.
+    def group_score(group: list[dict[str, Any]]) -> tuple[float, float]:
+        levels = min(len(group) / 8.0, 1.0)
+        rect = float(np.median([h["rectangularity"] for h in group]))
+        aspect = 1.0 - min(float(np.median([h["aspect_error"] for h in group])) /
+                           max(aspect_tolerance, 1e-6), 1.0)
+        return (0.30 * levels + 0.40 * rect + 0.30 * aspect, rect)
+
+    best = max(groups, key=group_score)
+    pick = min(best, key=lambda h: h["aspect_error"])
+
+    # Now re-threshold at full resolution, at the level in the middle of the
+    # stable range, and fit the edges there.
+    levels = [h["level"] for h in best]
+    level = int(round(float(np.median(levels))))
+    _, binary = cv2.threshold(
+        cv2.GaussianBlur(gray, (5, 5), 0), level, 255, cv2.THRESH_BINARY)
+    mask = binary if pick["polarity"] == "bright" else cv2.bitwise_not(binary)
+    big = np.ones((9, 9), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, big)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, big)
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    target = np.array(pick["centre"], np.float64) / max(scale, 1e-9)
+    usable = [c for c in contours
+              if cv2.contourArea(c) >= min_area_fraction * full_h * full_w]
+    if not usable:
+        raise RuntimeError(
+            f"the aperture was found while searching but vanished at full "
+            f"resolution (threshold {level}); this frame is probably too noisy "
+            "or too unevenly lit for a single threshold to hold across it"
+        )
+    contour = min(
+        usable,
+        key=lambda c: float(np.linalg.norm(
+            np.array(cv2.minAreaRect(c.astype(np.float32))[0]) - target)),
+    )
+    corners = corners_from_contour(contour.reshape(-1, 2).astype(np.float64))
+    # An aperture running off the edge of the frame is the one failure worth
+    # refusing outright. The visible part still fits a plausible rectangle, so
+    # the homography comes back confident and wrong -- measured, a clipped
+    # aperture at a sampling ratio of 2 gave 3.06 px while reporting nothing
+    # unusual, against 0.05 px for the same shot uncropped. Every other failure
+    # here raises; this one has to as well, or it is the only way this route
+    # lies to you.
+    margin = max(4.0, 0.004 * max(full_w, full_h))
+    if (corners[:, 0].min() < margin or corners[:, 1].min() < margin
+            or corners[:, 0].max() > full_w - 1 - margin
+            or corners[:, 1].max() > full_h - 1 - margin):
+        raise RuntimeError(
+            "the display's boundary runs off the edge of the frame. The whole "
+            "aperture and a margin of trim around it have to be visible, "
+            "because the part in frame still fits a plausible rectangle and "
+            "would be answered confidently. Stand back, or turn the camera"
+        )
+    refined = False
+    if refine:
+        # No silent fallback to the threshold corners. That fallback was written
+        # first, on the reasoning that they are worth about a pixel and a
+        # usable answer beats none -- and it was measured to be exactly wrong.
+        # Whenever refinement failed, the coarse answer was 1.7 to 3.1 px out
+        # while every refined one was inside 0.05 px, and nothing in the result
+        # distinguished them. Refusing turns the one silent failure mode this
+        # route had into a message.
+        corners = refine_edges_subpixel(gray, corners)
+        refined = True
+    diagnostics = {
+        "refined": refined,
+        "threshold": level,
+        "polarity": pick["polarity"],
+        "levels_stable": len(best),
+        "aspect_error": pick["aspect_error"],
+        "rectangularity": pick["rectangularity"],
+        "score": group_score(best)[0],
+        "area_fraction": pick["area_fraction"],
+        "candidates": len(groups),
+    }
+    return corners, diagnostics
+
+
+def homography_from_display_aperture(
+    frame: np.ndarray,
+    *,
+    display_size: tuple[int, int],
+    inset_px: tuple[float, float] = (0.0, 0.0),
+) -> DisplayGeometry:
+    """Method E -- the display's own physical border, with no cooperation at all.
+
+    Methods A to D all ask the cluster for something: a pattern, a white frame,
+    its framebuffer.  Even the bezel markers of method B need the active area
+    located once, which means one calibration screen once.  This asks for
+    nothing.  The aperture is hardware, it is in every frame, and it does not
+    care what the software is doing.
+
+    **What it costs, and why it is usually not a problem.**  The aperture is the
+    physical opening; the active area is inset behind it by a mask whose width
+    is a property of the module and is not visible from outside.  So this solves
+    a frame that is offset and very slightly scaled against true display
+    coordinates, by an amount this function cannot know.
+
+    That constant does not matter for the measurement this package actually
+    makes.  Reference and validate are both rectified through the *same*
+    homography, so a fixed offset cancels exactly and a 6 px defect reads as
+    6 px either way.  It matters only for comparing against a design in
+    absolute display coordinates -- and there, ``inset_px`` takes the module's
+    mask width if the datasheet or a ruler gives it to you.
+    """
+    corners_cam, diagnostics = find_display_aperture(
+        frame, display_size=display_size)
+    w, h = display_size
+    ix, iy = float(inset_px[0]), float(inset_px[1])
+    # Display coordinates of the aperture's corners: the active area grown by
+    # the mask, since the opening is outside the pixels.
+    # Half-pixel convention, and it is worth a measured 0.70 px if you get it
+    # wrong. The aperture is the *outer* boundary of the edge pixels, and pixel
+    # 0's outer boundary is at -0.5, not 0 -- so the opening spans -0.5 to
+    # w-0.5, not 0 to w. Putting it at 0 to w offsets everything by half a pixel
+    # on each axis, which is exactly the 0.707 px that showed up as a stubborn
+    # constant bias before this line was written the right way round.
+    corners_disp = np.array([
+        [-0.5 - ix, -0.5 - iy],
+        [w - 0.5 + ix, -0.5 - iy],
+        [w - 0.5 + ix, h - 0.5 + iy],
+        [-0.5 - ix, h - 0.5 + iy],
+    ], dtype=np.float64)
+    H, _ = cv2.findHomography(corners_disp, corners_cam, method=0)
+    if H is None:
+        raise RuntimeError("homography solve failed")
+    geometry = DisplayGeometry(
+        H=H,
+        display_size=display_size,
+        method="display_aperture",
+        residual_px=_homography_residual(corners_disp, corners_cam, H),
+    )
+    geometry.aperture = diagnostics
+    return geometry
+
+
+def corners_from_contour(
+    contour: np.ndarray, *, min_edge_pixels: int = 20
+) -> np.ndarray:
+    """Four sub-pixel corners of a quadrilateral region, by fitting its edges.
+
+    Lines are *fitted* to the edge pixels rather than corners being detected
+    directly: a line fit averages over hundreds of edge pixels and lands well
+    under a pixel, where a corner detector lands at about one.  Returned
+    ordered top-left, top-right, bottom-right, bottom-left.
+    """
+    contour = np.asarray(contour, dtype=np.float64).reshape(-1, 2)
+    quad = cv2.boxPoints(cv2.minAreaRect(contour.astype(np.float32))).astype(np.float64)
+    # Assign every contour pixel to its nearest quad edge, then fit each edge
+    # over all of its pixels.
+    edges: list[list[np.ndarray]] = [[] for _ in range(4)]
+    for pt in contour:
+        best, best_d = 0, float("inf")
+        for i in range(4):
+            a, b = quad[i], quad[(i + 1) % 4]
+            ab = b - a
+            t = np.clip(np.dot(pt - a, ab) / max(np.dot(ab, ab), 1e-9), 0.0, 1.0)
+            d = np.linalg.norm(pt - (a + t * ab))
+            if d < best_d:
+                best, best_d = i, d
+        edges[best].append(pt)
+
+    fits = []
+    for i, pts in enumerate(edges):
+        if len(pts) < min_edge_pixels:
+            raise RuntimeError(f"display edge {i} had only {len(pts)} pixels to fit")
+        fits.append(_fit_line(np.array(pts)))
+
+    corners = np.array(
+        [_intersect(*fits[i], *fits[(i + 1) % 4]) for i in range(4)], dtype=np.float64
+    )
+    centre = corners.mean(axis=0)
+    order = np.argsort(np.arctan2(*(corners - centre).T[::-1]))
+    corners = corners[order]
+    start = int(np.argmin(np.sum((corners - centre) * [[1, 1]], axis=1)))
+    return np.roll(corners, -start, axis=0)
+
+
 def homography_from_display_edges(
     white_frame: np.ndarray,
     *,
@@ -715,36 +1167,7 @@ def homography_from_display_edges(
         raise RuntimeError("no lit region found in the full-white frame")
     contour = max(contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
 
-    quad = cv2.boxPoints(cv2.minAreaRect(contour.astype(np.float32))).astype(np.float64)
-    # Assign every contour pixel to its nearest quad edge, then fit each edge
-    # over all of its pixels.
-    edges: list[list[np.ndarray]] = [[] for _ in range(4)]
-    for pt in contour:
-        best, best_d = 0, float("inf")
-        for i in range(4):
-            a, b = quad[i], quad[(i + 1) % 4]
-            ab = b - a
-            t = np.clip(np.dot(pt - a, ab) / max(np.dot(ab, ab), 1e-9), 0.0, 1.0)
-            d = np.linalg.norm(pt - (a + t * ab))
-            if d < best_d:
-                best, best_d = i, d
-        edges[best].append(pt)
-
-    fits = []
-    for i, pts in enumerate(edges):
-        if len(pts) < 20:
-            raise RuntimeError(f"display edge {i} had only {len(pts)} pixels to fit")
-        fits.append(_fit_line(np.array(pts)))
-
-    corners_cam = np.array(
-        [_intersect(*fits[i], *fits[(i + 1) % 4]) for i in range(4)], dtype=np.float64
-    )
-    # Order: top-left, top-right, bottom-right, bottom-left.
-    centre = corners_cam.mean(axis=0)
-    order = np.argsort(np.arctan2(*(corners_cam - centre).T[::-1]))
-    corners_cam = corners_cam[order]
-    start = int(np.argmin(np.sum((corners_cam - centre) * [[1, 1]], axis=1)))
-    corners_cam = np.roll(corners_cam, -start, axis=0)
+    corners_cam = corners_from_contour(contour)
 
     w, h = display_size
     corners_disp = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)

@@ -401,26 +401,24 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         except ValueError as exc:
             raise SystemExit(f"error: --charuco: {exc}") from exc
         if not (args.intrinsics or args.calibration):
-            # Refusing at startup rather than at the first capture: this route
-            # cannot produce a defensible number without undistortion, and
-            # finding that out after carrying a phone to the bench is worse than
-            # finding it out here.
-            raise SystemExit(
-                "error: --charuco needs camera intrinsics, so pass --intrinsics "
-                "(or a --calibration that carries them).\n"
-                "       The bezel markers are photographed away from the screen's "
-                "part of the frame, so lens distortion does not cancel the way it "
-                "nearly does for a board on the screen.\n"
-                "       Measured (benchmarks/bezel_anchor.py): undistorted this "
-                "route holds 0.10 px on any lens; with the distortion left in it "
-                "runs 0.6 px to 5.7 px depending on\n"
-                "       the lens, and elements start dropping out of the match "
-                "altogether. It is lens-dependent, so one good-looking frame "
-                "tells you nothing about the next camera.\n"
-                "       Solve them once for this camera and lens:\n"
-                "         layoutval calibrate-intrinsics shots/*.jpg "
-                "--out calibration/intrinsics.json"
-            )
+            # Not a hard stop any more: the capture page can collect the views
+            # and solve them in-session, so the fix is available at the bench
+            # rather than only back at a shell. Calibrate still refuses until
+            # they exist -- the route cannot produce a defensible number without
+            # undistortion -- but that refusal now names something you can do
+            # standing in front of the cluster.
+            print("note: --charuco has no intrinsics yet, so Calibrate will "
+                  "refuse until it does.")
+            print("      Lens distortion does not cancel for markers the way it "
+                  "nearly does for a board on the screen: measured, this route "
+                  "holds 0.10 px")
+            print("      undistorted on any lens, and 0.6-5.7 px with the "
+                  "distortion left in, losing elements from the match entirely "
+                  "on the wider lenses.")
+            print("      Fix it from the phone: pick Intrinsics on the capture "
+                  "page and shoot 12 views of the board from varied angles. It "
+                  "solves and unblocks itself.")
+            print()
 
     profile = (LayoutProfile.load(_require(args.profile, "--profile"))
                if args.profile else None)
@@ -447,6 +445,8 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         auto_profile=not args.no_auto_profile,
         render=render,
         charuco=charuco,
+        aperture=args.aperture,
+        display_inset_px=tuple(args.display_inset),
     )
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
 
@@ -628,6 +628,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the cluster's own board export (its --calibration-export). "
                         "Preferred: it carries the exact corners, so nothing has to "
                         "be guessed or converted")
+    c.add_argument("--aperture", action="store_true",
+                   help="calibrate from the display's own physical border. The "
+                        "only route that asks the cluster for nothing at all -- "
+                        "no pattern, no framebuffer, not even the one binding "
+                        "frame --charuco needs. Needs the whole display and a "
+                        "margin of trim in frame, and enough light to tell the "
+                        "panel from the trim")
+    c.add_argument("--display-inset", nargs=2, type=float, default=[0.0, 0.0],
+                   metavar=("X", "Y"),
+                   help="mask width between the physical opening and the first "
+                        "lit pixel, if you know it. Only needed for absolute "
+                        "display coordinates; it cancels between reference and "
+                        "validate")
     c.add_argument("--charuco", metavar="SPEC",
                    help="a ChArUco board fixed to the bezel, as COLSxROWS[:SQUARE"
                         "[:MARKER[:DICT]]] (e.g. 16x3:30:22). For a cluster that "

@@ -95,6 +95,22 @@ across pose, focus, sampling ratio and lens distortion — see
 `benchmarks/calibration_methods.py` and [docs/rig.md](docs/rig.md). The content
 does not have to match the photograph exactly; RANSAC discards whatever moved.
 
+`--aperture` calibrates from the display's own physical border and asks the
+cluster for **nothing at all** — no pattern, no framebuffer, not even the one
+binding frame `--charuco` needs. It is the route for a real cluster, and it is
+not a fallback: measured over ten poses it lands at 0.052 px against the
+on-screen chessboard's 0.072 px, because fitting four lines over the whole
+display boundary averages thousands of edge pixels where a chessboard localises
+each corner on its own.
+
+It locates the physical opening, so display coordinates from it carry a
+constant offset against the active area behind the mask. That cancels exactly
+between reference and validate, so defect measurements are unaffected; pass
+`--display-inset X Y` only if you need absolute coordinates. It needs the whole
+display plus a margin of trim in frame, and enough light to tell panel from
+trim — below about ten grey levels of contrast it refuses rather than guesses.
+See `benchmarks/aperture_calibration.py` and [docs/rig.md](docs/rig.md).
+
 `--charuco 16x3:30:22` is the route for a cluster you cannot ask to draw
 anything: a ChArUco board stuck to the bezel, outside the active area.
 `layoutval charuco-board 16x3:30:22` draws the board to print (lengths are

@@ -244,8 +244,45 @@ the lamps are sparse, so the frame is no more lit than normal and the panel's
 edge is still invisible to a threshold. On a dark cluster the active area
 boundary is not recoverable from brightness at all.
 
+**F. The display's own border — nothing asked of the cluster at all.**
+`homography_from_display_aperture`, and `--aperture` on the capture server.
+This is the answer to "calibrate it without the HMI showing anything but
+itself", and it turns out not to be a fallback: measured over ten poses it is
+**0.052 px** against the on-screen chessboard's 0.072 px, because a four-line
+fit over the whole display boundary averages thousands of edge pixels where a
+chessboard localises each corner independently. The border is simply more
+constraint. `benchmarks/aperture_calibration.py` has the table.
+
+It finds the *physical opening* in the trim, which is hardware and is in every
+frame whatever the software is doing. What it cannot see is the mask between
+that opening and the first lit pixel, so display coordinates from it carry a
+**constant offset**. That offset cancels exactly between reference and validate
+— both rectify through the same homography — so it does not touch a defect
+measurement at all. It matters only for comparing against a design in absolute
+coordinates, and `--display-inset` takes the mask width if you have it.
+
+Its real limits, measured:
+
+| | |
+|---|---|
+| panel-to-trim contrast | needs ~10 grey levels; refuses below (a black screen in black trim has no border to find) |
+| sampling ratio | 0.5–1.3 comfortably; above ~2 the panel stops fitting in frame |
+| framing | the whole display **and a margin of trim** must be in shot |
+| focus, noise, night theme | no meaningful effect (0.05–0.10 px throughout) |
+
+Three mistakes are recorded in that benchmark's docstring because each looked
+right and measured wrong: Otsu cannot find the border (it splits between the
+bright things and everything else), the aperture is a *hole* and
+`RETR_EXTERNAL` discards holes, and falling back to threshold corners when
+sub-pixel refinement fails produces 1.7–3.1 px errors that nothing in the
+result distinguishes from the good ones. It refuses now instead.
+
 So with a camera only, in order of what they cost:
 
+0. **The display's own border.** Method F above — `--aperture`. Nothing to
+   stick on, nothing to print, nothing asked of the build, and it measures at
+   least as well as a board on the screen. Needs light enough to tell panel
+   from trim, and the whole display in frame. Try this first.
 1. **A marker on the bezel.** ChArUco or AprilTag, stuck on once, outside the
    active area. Needs nothing whatever from the build, survives power cycles and
    software loads, and refines sub-pixel. This is what production rigs do and it
