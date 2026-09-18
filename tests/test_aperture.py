@@ -252,3 +252,77 @@ def test_lens_board_is_independent_of_how_geometry_is_solved(tmp_path):
     rec = session.handle("calibrate", jpeg(rig.read()))
     assert rec.verdict == "OK", rec.detail
     assert "nothing was asked of the cluster" in rec.detail
+
+
+def test_a_lens_solve_is_judged_on_generalisation_not_on_fit():
+    """rms is the wrong gate, and that is measured rather than argued.
+
+    A set of near-identical views is fitted beautifully and is wrong
+    everywhere else -- it reported 0.051 px reprojection error and left
+    1.276 px of real error behind, where a good set reported 0.052 px and left
+    0.093 px. Nothing in the rms told them apart. Angle spread did.
+    """
+    from layoutval.calibration import (
+        CharucoSpec, board_points_for_intrinsics, check_intrinsics)
+    from layoutval.simulator import VirtualCamera
+
+    sensor = (2400, 1500)
+    poses = [(2.0, 0.7), (9.0, -4.0), (-6.0, 5.0), (13.0, 2.0), (-11.0, -3.0),
+             (4.0, 9.0), (-2.0, -8.0), (7.0, 3.5), (-9.0, 1.0), (11.0, -6.0),
+             (0.5, 0.2), (-4.0, -2.0)]
+    board = CharucoSpec.parse("9x6:30:22").board()
+    target = cv2.cvtColor(
+        board.generateImage((9 * 90, 6 * 90), marginSize=45), cv2.COLOR_GRAY2BGR)
+    th, tw = target.shape[:2]
+    base = min(0.75 * sensor[0] / tw, 0.75 * sensor[1] / th)
+
+    def collect(spread):
+        objs, imgs = [], []
+        for i, (tilt, roll) in enumerate(poses):
+            cam = VirtualCamera(
+                display_size=(tw, th), sensor_size=sensor,
+                sampling_ratio=base * (0.88 + 0.06 * (i % 5) * spread),
+                tilt_deg=tilt * spread, roll_deg=roll * spread, seed=i,
+                k1=-0.09, k2=0.02)
+            try:
+                o, p = board_points_for_intrinsics(cam.shoot(target), board=board)
+            except RuntimeError:
+                continue
+            objs.append(o)
+            imgs.append(p)
+        return objs, imgs
+
+    varied = check_intrinsics(*collect(1.0), sensor)
+    alike = check_intrinsics(*collect(0.25), sensor)
+
+    # The trap: the bad set's rms is no worse than the good set's.
+    assert alike.rms <= varied.rms * 1.5
+    # What actually separates them.
+    assert varied.tilt_spread_deg > 3 * alike.tilt_spread_deg
+    assert varied.complaint() is None
+    assert alike.complaint() is not None
+    assert "same angle" in alike.complaint()
+
+
+def test_a_lens_that_does_not_generalise_is_not_adopted(tmp_path):
+    """Worse than none: it beat skipping undistortion in exactly one direction."""
+    from layoutval.calibration import CharucoSpec
+
+    display, panel, rig = rig_for()
+    spec = CharucoSpec(panel.squares[0], panel.squares[1], panel.square_length,
+                       panel.square_length * panel.marker_ratio)
+    session = CaptureSession(tmp_path, display_size=display.size,
+                             aperture=True, lens_board=spec)
+    # Twelve views from almost the same place: the failure rms cannot see.
+    last = None
+    for i in range(12):
+        _, _, shot_rig = rig_for(tilt_deg=2.0 + 0.1 * i, roll_deg=0.7,
+                                 seed=i, sampling_ratio=0.95)
+        shot_rig.show("main")
+        last = session.handle("intrinsics", jpeg(shot_rig.read()))
+    assert last.verdict == "FAILED", last.detail
+    assert "Not used" in last.detail
+    assert session.status()["needs_intrinsics"] is True
+    assert not (tmp_path / "intrinsics.json").exists()
+    # The work is not thrown away.
+    assert session.status()["intrinsic_views"] == 12

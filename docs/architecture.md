@@ -346,6 +346,14 @@ Design notes worth knowing:
 
 - **Intrinsics are collected as correspondences, not frames.** A phone
   photograph is tens of megabytes; its correspondences are a few kilobytes.
+- **The lens solve is gated on generalisation, not on fit.** Reprojection error
+  measures how well the model fits the views it was given; a set of
+  near-identical views is fitted beautifully and is wrong everywhere else, and
+  reports a *lower* rms for doing so. Measured, a solve at 0.051 px rms left
+  1.276 px of real error behind, and one that would have passed a 0.3 px gate
+  was worse than skipping undistortion altogether. `LensCheck` therefore scores
+  held-out reprojection and the spread of board angles, and a solve that fails
+  is not adopted.
 - **The lens board is independent of the calibration route** (`--lens-board`).
   Intrinsics belong to the *camera*, so tying them to a rig route would mean the
   one route that asks the cluster for nothing could only get undistortion by

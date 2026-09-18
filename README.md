@@ -112,11 +112,24 @@ one and 4–8 px on a normal phone lens. Solve them once from the phone — pick
 being measured: print it, or open the PNG on any other screen.
 
 `9x6:30:22` measured best (k1 error 0.0009 against a true −0.09), but the
-choice is not delicate — 7x5 and 16x3 both land inside 0.007, and what actually
-matters is filling the frame and varying the pose between shots. Eight views is
-already enough; the twelve it asks for are slack. A solve that goes wrong goes
-*visibly* wrong: the worst board tested reported 0.374 px reprojection error,
-above the 0.3 px this package gates on, so it is flagged rather than believed.
+choice is not delicate — 7x5 and 16x3 both land inside 0.007. **What actually
+matters is varying the angle between shots**, and that is not a style
+preference: a set of near-identical views is the one failure reprojection error
+cannot see.
+
+| how the lens was shot | rms | real error |
+|---|---|---|
+| clean, varied poses | 0.052 | 0.093 px |
+| poses too similar | **0.051** | **1.276 px** |
+| noisy + soft + similar | 0.269 | 5.614 px |
+| *(no undistortion at all)* | — | 4.059 px |
+
+A solve reporting 0.051 px left 1.3 px of real error behind, and one that would
+have passed a 0.3 px rms gate was worse than not undistorting at all. So the
+solve is scored on whether it **generalises** — fit on most of the views,
+measured on the ones held back — plus how much the board's angle actually
+varied. A lens model that does not pass is not adopted; the views are kept so
+the set can be extended.
 
 It locates the physical opening, so display coordinates from it carry a
 constant offset against the active area behind the mask. That cancels exactly

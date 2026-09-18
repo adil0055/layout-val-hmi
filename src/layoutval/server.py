@@ -71,6 +71,7 @@ from layoutval.calibration import (
     DriftTracker,
     Undistorter,
     charuco_anchor,
+    check_intrinsics,
     chessboard_display_points,
     detect_charuco,
     homography_from_charuco,
@@ -806,31 +807,48 @@ class CaptureSession:
             rec.detail = f"the solve did not converge: {exc}. Shoot more views."
             return rec
 
-        self.calibration = Calibration(
-            intrinsics=intrinsics,
-            geometry=(self.calibration.geometry if self.calibration
-                      else DisplayGeometry(H=np.eye(3), display_size=self.display_size)),
-            rig={"source": "phone capture"},
-            drift_alarm_px=self.drift_alarm_px,
+        # Scored on whether it generalises, not on how well it fits. A solve
+        # can report 0.05 px reprojection error and leave 1.3 px of real error
+        # behind, because reprojection only measures the fit to the views it
+        # was handed -- and a set of near-identical views is fitted beautifully
+        # and is wrong everywhere else. See LensCheck.
+        check = check_intrinsics(
+            [o for o, _ in self._intrinsic_views],
+            [i for _, i in self._intrinsic_views],
+            self._intrinsic_frame_size,
         )
-        out = self.out_dir / "intrinsics.json"
-        out.write_text(json.dumps(intrinsics.to_dict(), indent=2))
+        complaint = check.complaint()
         rec.detail = (
-            f"solved the lens from {got} views: reprojection error "
-            f"{intrinsics.rms:.3f} camera px. Saved as {out.name}"
+            f"solved the lens from {got} views: {check.holdout_px:.3f} px on "
+            f"views it had not seen ({check.rms:.3f} px on the ones it fitted), "
+            f"{check.tilt_spread_deg:.0f} degrees of angle spread"
         )
-        if intrinsics.rms > 0.3:
-            # Same gate the offline command applies. Above it the fit is not
-            # describing the lens well, and everything downstream inherits that.
-            rec.detail += (
-                ". That is above the 0.3 px this package gates on -- the fit is "
-                "not describing the lens well. Shoot a fresh set with the board "
-                "sharper, flatter and at more varied angles before relying on it"
+        if complaint is None:
+            self.calibration = Calibration(
+                intrinsics=intrinsics,
+                geometry=(self.calibration.geometry if self.calibration
+                          else DisplayGeometry(H=np.eye(3),
+                                               display_size=self.display_size)),
+                rig={"source": "phone capture"},
+                drift_alarm_px=self.drift_alarm_px,
             )
-        else:
-            rec.detail += ". Calibrate is unblocked -- carry on"
-        self._intrinsic_views.clear()
-        self._intrinsic_frame_size = None
+            out = self.out_dir / "intrinsics.json"
+            out.write_text(json.dumps(intrinsics.to_dict(), indent=2))
+            rec.detail += f". Saved as {out.name}. Calibrate is unblocked"
+            self._intrinsic_views.clear()
+            self._intrinsic_frame_size = None
+            return rec
+
+        # Not adopted. A lens model this loose is worse than none -- measured,
+        # one that passed the old rms gate left more error behind than skipping
+        # undistortion altogether -- so the views are kept and the set can be
+        # extended rather than silently accepted.
+        rec.verdict = "FAILED"
+        rec.detail += f". Not used: {complaint}."
+        rec.detail += (
+            f" The {got} views are kept -- keep shooting and it re-solves as "
+            "they improve, or restart the server to drop them."
+        )
         return rec
 
     def _calibrate(

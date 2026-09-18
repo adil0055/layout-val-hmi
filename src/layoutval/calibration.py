@@ -140,6 +140,153 @@ def board_points_for_intrinsics(
     return obj, corners.reshape(-1, 2).astype(np.float32)
 
 
+@dataclass
+class LensCheck:
+    """Whether a lens solve can be trusted, which is not what rms tells you.
+
+    Reprojection error measures how well the model fits the views it was given.
+    Give it twelve similar views and it fits them beautifully and is wrong
+    everywhere else -- and reports a *lower* rms for doing so.  Measured against
+    the simulated bezel:
+
+        how the lens was shot        rms     element error
+        clean, varied poses        0.052          0.107 px
+        soft focus                 0.227          0.520 px
+        poses too similar          0.051          1.256 px
+        similar + soft             0.205          2.977 px
+        noisy + soft + similar     0.269          5.614 px
+        (no undistortion at all)       -          4.059 px
+
+    The last row is the one that matters: a solve passing a 0.3 px rms gate was
+    worse than not undistorting at all, and nothing in its rms said so.  So
+    ``rms`` is reported but not gated on.  Two things are:
+
+    ``holdout_px``
+        Fit on most of the views, measure reprojection on the ones held back.
+        This asks whether the model *generalises* rather than whether it fits,
+        which is exactly the question rms cannot answer.
+    ``tilt_spread_deg``
+        How much the board's orientation actually varied.  Views that all look
+        alike cannot separate the lens from the pose, and this is the cause
+        behind most of the bad rows above.
+    """
+
+    rms: float
+    holdout_px: float
+    tilt_spread_deg: float
+    depth_spread: float
+    views: int
+
+    #: Below this the views did not really differ, and the solve is
+    #: unconstrained however tight its rms looks. Measured: good sets ran 10
+    #: degrees of spread and every bad one 2.1-2.6.
+    MIN_TILT_SPREAD_DEG = 6.0
+
+    #: Held-out reprojection above this means the views themselves were poor --
+    #: soft, noisy, or shot through a screen. Measured, a set at 0.24 left 0.50
+    #: px of real error where a set at 0.05 left 0.11.
+    MAX_HOLDOUT_PX = 0.20
+
+    def complaint(self) -> str | None:
+        """What is wrong with this solve, in words, or None if nothing is.
+
+        Two different failures, and neither is visible in rms alone: a solve
+        that is unconstrained because the views were all alike, and a solve
+        whose views were individually poor.
+        """
+        if self.tilt_spread_deg < self.MIN_TILT_SPREAD_DEG:
+            return (
+                f"the views were all shot from about the same angle "
+                f"({self.tilt_spread_deg:.0f} degrees of spread). A lens cannot "
+                "be separated from the pose that way, and the solve will look "
+                "tight and be wrong -- measured, a set like this reported 0.05 "
+                "px reprojection error and left 1.3 px of real error behind. "
+                "Re-shoot with the board steeply angled in several directions"
+            )
+        if self.holdout_px > 3.0 * max(self.rms, 0.05) and self.holdout_px > 0.3:
+            return (
+                f"the solve fits the views it was given ({self.rms:.2f} px) far "
+                f"better than views it was not ({self.holdout_px:.2f} px), which "
+                "means it is describing these particular photographs rather "
+                "than the lens. More varied angles and distances"
+            )
+        if self.holdout_px > self.MAX_HOLDOUT_PX:
+            return (
+                f"the lens model is {self.holdout_px:.2f} px out on views it did "
+                "not see, against the "
+                f"{self.MAX_HOLDOUT_PX:.2f} px worth trusting. The views "
+                "themselves were poor -- soft, noisy, or shot off a screen, "
+                "where the display's own pixel grid beats against the sensor's "
+                "and moves every corner. Print the board if you can, fill the "
+                "frame with it, and keep it sharp"
+            )
+        return None
+
+
+def _reprojection_px(obj, img, K, dist, rvec, tvec) -> float:
+    projected, _ = cv2.projectPoints(obj.reshape(-1, 1, 3), rvec, tvec, K, dist)
+    return float(np.sqrt(np.mean(np.sum(
+        (projected.reshape(-1, 2) - img.reshape(-1, 2)) ** 2, axis=1))))
+
+
+def check_intrinsics(
+    obj_points: Sequence[np.ndarray],
+    img_points: Sequence[np.ndarray],
+    image_size: tuple[int, int],
+    *,
+    folds: int = 4,
+) -> LensCheck:
+    """Fit on most of the views and score the ones held back.
+
+    The held-out number is the honest one: it says how far the lens model is
+    from views it has never seen, which is what undistorting a new photograph
+    actually asks of it.
+    """
+    n = len(obj_points)
+    objs = [o.reshape(-1, 1, 3) for o in obj_points]
+    imgs = [i.reshape(-1, 1, 2) for i in img_points]
+
+    rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+        objs, imgs, image_size, None, None)
+
+    # How much the board's orientation varied. The rotation vector's magnitude
+    # is the angle the board is turned through, so the spread of those is a
+    # direct measure of how different the views really were.
+    angles = [float(np.degrees(np.linalg.norm(r))) for r in rvecs]
+    depths = [float(abs(t.ravel()[2])) for t in tvecs]
+    tilt_spread = float(np.percentile(angles, 90) - np.percentile(angles, 10))
+    depth_spread = (float(np.ptp(depths) / max(np.median(depths), 1e-9))
+                    if depths else 0.0)
+
+    held: list[float] = []
+    for fold in range(folds):
+        test = list(range(fold, n, folds))
+        train = [i for i in range(n) if i not in test]
+        if len(train) < 6 or not test:
+            continue
+        try:
+            _, Kf, distf, _, _ = cv2.calibrateCamera(
+                [objs[i] for i in train], [imgs[i] for i in train],
+                image_size, None, None)
+            for i in test:
+                # Pose is re-solved per held-out view: we are scoring the lens,
+                # not our ability to guess where the board was.
+                ok, rvec, tvec = cv2.solvePnP(objs[i], imgs[i], Kf, distf)
+                if ok:
+                    held.append(_reprojection_px(
+                        obj_points[i], img_points[i], Kf, distf, rvec, tvec))
+        except cv2.error:
+            continue
+
+    return LensCheck(
+        rms=float(rms),
+        holdout_px=float(np.median(held)) if held else float("nan"),
+        tilt_spread_deg=tilt_spread,
+        depth_spread=depth_spread,
+        views=n,
+    )
+
+
 def solve_intrinsics(
     obj_points: Sequence[np.ndarray],
     img_points: Sequence[np.ndarray],
