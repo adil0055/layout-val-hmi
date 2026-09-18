@@ -177,6 +177,12 @@ wrong, each measured:
   sub-pixel refinement fails produced 1.7–3.1 px errors while every refined
   frame was inside 0.05 px — and nothing in the result distinguished them. It
   refuses now.
+- **Nested rectangles are refused, not resolved.** An HMI in a window inside a
+  monitor presents two rectangles of the same proportions. "Innermost wins" is
+  correct in principle and was measured insufficient (5 of 14 arrangements),
+  with the other nine silently wrong. Detecting the ambiguity and refusing took
+  it to zero silently wrong, and the ambiguity is trivially removable by
+  whoever is holding the camera.
 
 Route E also carries a **constant offset**: it finds the physical opening, and
 the active area sits behind a mask it cannot see. That offset *cancels exactly*

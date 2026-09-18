@@ -984,6 +984,66 @@ def refine_edges_subpixel(
     return np.roll(crossed, 1, axis=0)
 
 
+def content_fills_aperture(
+    frame: np.ndarray, corners: np.ndarray
+) -> tuple[float, float, float]:
+    """How much of a candidate aperture the screen's own content actually spans.
+
+    The aspect-ratio test that finds the aperture cannot tell a display from
+    anything else with the same proportions -- a laptop's own screen bezel
+    around a windowed HMI, a reflection, a panel of trim.  When it picks the
+    wrong one the homography is confidently wrong, the rectified frame is mostly
+    empty, and the cluster ends up squeezed into a corner of display space.
+
+    A display is showing something, and that something spans most of it.
+    Measured on the simulated cluster: content spans 76% x 68% of the true
+    active area, and of an aperture 1.6x too big only 48% x 42%, 2.5x too big
+    31% x 27%.  So the span is a direct read on whether the rectangle found is
+    the right size.
+
+    Returns ``(width_span, height_span, lit_fraction)`` as fractions of the
+    candidate.
+    """
+    w = int(round(max(np.linalg.norm(corners[1] - corners[0]),
+                      np.linalg.norm(corners[2] - corners[3]))))
+    h = int(round(max(np.linalg.norm(corners[3] - corners[0]),
+                      np.linalg.norm(corners[2] - corners[1]))))
+    if w < 8 or h < 8:
+        return (0.0, 0.0, 0.0)
+    dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float64)
+    H, _ = cv2.findHomography(corners, dst, method=0)
+    if H is None:
+        return (0.0, 0.0, 0.0)
+    flat = cv2.warpPerspective(to_gray(frame), H, (w, h))
+
+    # Content is what stands out from the screen's own background, whatever
+    # that background happens to be -- a night theme is dark, a map screen is
+    # not, so the threshold comes from the frame rather than from a constant.
+    threshold = max(float(np.median(flat)) + 12.0, 40.0)
+    ys, xs = np.where(flat > threshold)
+    if len(xs) < 32:
+        return (0.0, 0.0, 0.0)
+    return (float(xs.max() - xs.min()) / w,
+            float(ys.max() - ys.min()) / h,
+            float(len(xs)) / flat.size)
+
+
+def draw_aperture(frame: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    """The frame with the detected border drawn on it, for looking at.
+
+    When this route picks the wrong rectangle the number it produces is
+    plausible, so the fastest way to see what happened is to see what it found.
+    """
+    out = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    pts = np.round(corners).astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(out, [pts], True, (0, 230, 255), 3, cv2.LINE_AA)
+    for i, (x, y) in enumerate(np.round(corners).astype(int)):
+        cv2.circle(out, (int(x), int(y)), 9, (0, 230, 255), -1)
+        cv2.putText(out, "TL TR BR BL".split()[i], (int(x) + 12, int(y) - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 230, 255), 2, cv2.LINE_AA)
+    return out
+
+
 def find_display_aperture(
     frame: np.ndarray,
     *,
@@ -1096,22 +1156,28 @@ def find_display_aperture(
     for hit in sorted(hits, key=lambda h: h["level"]):
         for group in groups:
             ref = group[-1]
+            # Size is compared *relative to the candidate*, not as a fraction
+            # of the frame. Absolute area fractions merged a display into the
+            # screen around it -- 0.073 against 0.122 of frame is a difference
+            # of 0.049, under any sane absolute tolerance, while being a
+            # rectangle 30% wider. They then formed one group and the inner one
+            # was never a separate candidate to prefer.
+            ref_w = max(ref["size"])
             if (group[0]["polarity"] == hit["polarity"]
                     and abs(ref["centre"][0] - hit["centre"][0]) < 0.05 * sw
                     and abs(ref["centre"][1] - hit["centre"][1]) < 0.05 * sh
-                    and abs(ref["area_fraction"] - hit["area_fraction"]) < 0.10):
+                    and abs(ref_w - max(hit["size"])) < 0.08 * ref_w):
                 group.append(hit)
                 break
         else:
             groups.append([hit])
-    # Stability is the strongest signal, but it cannot stand alone: the bezel's
+    # Stability is the strongest signal, but it cannot stand alone: the trim's
     # own outline is just as stable as the aperture inside it, and on a cluster
     # whose trim has roughly the display's proportions it also passes the aspect
     # test. Measured at a sampling ratio of 3, the panel outline (aspect 2.30,
     # 60% of frame) was selected over the true aperture (aspect 2.65, 29%).
     # Rectangularity separates them -- an aperture fills its bounding rectangle
-    # and a trim outline with a display cut out of it does not -- so score on
-    # all three rather than on stability and aspect alone.
+    # and a trim outline with a display cut out of it does not.
     def group_score(group: list[dict[str, Any]]) -> tuple[float, float]:
         levels = min(len(group) / 8.0, 1.0)
         rect = float(np.median([h["rectangularity"] for h in group]))
@@ -1119,7 +1185,56 @@ def find_display_aperture(
                            max(aspect_tolerance, 1e-6), 1.0)
         return (0.30 * levels + 0.40 * rect + 0.30 * aspect, rect)
 
-    best = max(groups, key=group_score)
+    def group_width(group: list[dict[str, Any]]) -> float:
+        return float(np.median([max(h["size"]) for h in group]))
+
+    # Among the candidates that are credible on their own merits, take the
+    # SMALLEST. Trim surrounds a display; a display never surrounds its trim, so
+    # when several same-shaped rectangles are nested -- an HMI windowed on a
+    # monitor, a display inside a binnacle inside a dash -- the innermost is the
+    # active area and everything outside it is furniture.
+    #
+    # Picking the best-scoring one and then looking for something nested inside
+    # it does not work: the outer rectangle scores at least as well as the inner
+    # one on every term, so the search starts from the wrong place and the
+    # nesting test has to be right about concentricity and relative size to
+    # recover. Starting from the smallest credible candidate needs neither.
+    scored = sorted(
+        (g for g in groups if group_score(g)[0] >= 0.55 and len(g) >= 3),
+        key=group_width,
+    )
+    if not scored:
+        scored = [max(groups, key=group_score)]
+    best = scored[0]
+    if len(scored) > 1:
+        # Only genuinely smaller candidates count as nested; near-duplicates of
+        # the same rectangle are the same thing found twice.
+        inner = group_width(best)
+        nested = [g for g in scored[1:] if group_width(g) > 1.08 * inner]
+        if nested:
+            # Two credible rectangles of the display's shape, one inside the
+            # other, and no reliable way to tell which is the active area.
+            # "Innermost wins" is the right principle and it was not enough: on
+            # a display windowed inside a screen of the same proportions it
+            # picked correctly in 5 of 14 arrangements, and the other 9 were
+            # silently wrong rather than refused -- a homography fitted to the
+            # outer rectangle puts the whole cluster in a corner of display
+            # space and every element then fails to match, which is what this
+            # looked like in the field.
+            #
+            # Refusing is not a lesser answer here. The ambiguity is real, and
+            # it is trivially removable by whoever is holding the camera.
+            outer = group_width(nested[0])
+            raise RuntimeError(
+                f"two rectangles here have the display's proportions -- one "
+                f"{inner:.0f} px wide and one {outer:.0f} px, one inside the "
+                "other -- and which of them is the active area cannot be "
+                "decided from the picture. That is usually an HMI running in a "
+                "window, where the monitor's own border is the outer one. Run "
+                "it full-screen (and pass that screen's resolution as the "
+                "display size), or move in until the display and a thin margin "
+                "of its surround fill the frame"
+            )
     pick = min(best, key=lambda h: h["aspect_error"])
 
     # Now re-threshold at full resolution, at the level in the middle of the
@@ -1165,6 +1280,22 @@ def find_display_aperture(
             "because the part in frame still fits a plausible rectangle and "
             "would be answered confidently. Stand back, or turn the camera"
         )
+    # Is this rectangle the right *size*, not just the right shape? The aspect
+    # test cannot tell the display from a laptop's own screen bezel around a
+    # windowed HMI, or from any other rectangle of the same proportions, and
+    # picking the wrong one produces a confident homography that puts the whole
+    # cluster in a corner of display space.
+    span_w, span_h, lit = content_fills_aperture(frame, corners)
+    if lit > 0.0 and (span_w < 0.30 or span_h < 0.30):
+        raise RuntimeError(
+            f"found a {want_aspect:.2f}:1 rectangle, but what is lit inside it "
+            f"spans only {span_w:.0%} by {span_h:.0%} of it -- so this is "
+            "something larger than the active area, not the active area. The "
+            "usual causes are the display size being wrong (its aspect ratio is "
+            "what is searched for, so check --display-size against what the HMI "
+            "is really running at) and, on a desk, the monitor's own bezel "
+            "around a windowed HMI. A saved -aperture.jpg shows what was found"
+        )
     refined = False
     if refine:
         # No silent fallback to the threshold corners. That fallback was written
@@ -1178,6 +1309,8 @@ def find_display_aperture(
         refined = True
     diagnostics = {
         "refined": refined,
+        "content_span": (round(span_w, 3), round(span_h, 3)),
+        "lit_fraction": round(lit, 4),
         "threshold": level,
         "polarity": pick["polarity"],
         "levels_stable": len(best),

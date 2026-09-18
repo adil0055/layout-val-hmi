@@ -18,6 +18,7 @@ from layoutval.calibration import (
     DisplayGeometry,
     Intrinsics,
     Undistorter,
+    content_fills_aperture,
     find_display_aperture,
     homography_from_display_aperture,
 )
@@ -326,3 +327,140 @@ def test_a_lens_that_does_not_generalise_is_not_adopted(tmp_path):
     assert not (tmp_path / "intrinsics.json").exists()
     # The work is not thrown away.
     assert session.status()["intrinsic_views"] == 12
+
+
+def _windowed(display, outer_scale, bezel=70):
+    """The HMI as a window inside a larger screen -- a laptop, in other words.
+
+    The outer screen has the same proportions as the HMI, so the aspect test
+    cannot tell them apart. That is the point: this is the case where the
+    aperture route picks a plausible wrong rectangle.
+    """
+    inner = display.render()
+    h, w = inner.shape[:2]
+    ow, oh = int(w * outer_scale), int(h * outer_scale)
+    outer = np.full((oh, ow, 3), bezel, np.uint8)
+    x, y = (ow - w) // 2, (oh - h) // 2
+    outer[y:y + h, x:x + w] = inner
+    return outer
+
+
+def test_a_windowed_hmi_is_answered_correctly_or_refused_never_guessed():
+    """The failure that put the whole cluster in a corner of the overlay.
+
+    An HMI running in a window inside a monitor gives two rectangles with the
+    same proportions, one inside the other, and nothing in the picture says
+    which is the active area. Preferring the innermost is the right principle
+    and measured insufficient: across fourteen arrangements it chose correctly
+    in five, and the rest were *silently* wrong -- a homography fitted to the
+    outer rectangle rectifies the cluster into a corner and every element then
+    fails to match, while the calibration itself reports success.
+
+    So the property under test is not accuracy, it is that a wrong answer is
+    never returned: every arrangement either measures correctly or raises.
+    """
+    display = ClusterDisplay()
+    display.state.update(NOMINAL)
+    truth = display.render()
+    probe = profile_from_reference(truth, screen="b", display_size=display.size)
+
+    refused = correct = 0
+    for scale in (1.0, 1.3, 1.6, 2.0, 2.5):
+        for trim in (70, 130):
+            h, w = truth.shape[:2]
+            ow, oh = int(w * scale), int(h * scale)
+            outer = np.full((oh, ow, 3), trim, np.uint8)
+            x, y = (ow - w) // 2, (oh - h) // 2
+            outer[y:y + h, x:x + w] = truth
+
+            cam = VirtualCamera(display_size=(ow, oh), sensor_size=(2400, 1500),
+                                sampling_ratio=0.9)
+            live = Undistorter(Intrinsics(
+                K=cam.K, dist=cam.dist,
+                image_size=cam.sensor_size))(cam.shoot(outer))
+            try:
+                geometry = homography_from_display_aperture(
+                    live, display_size=display.size)
+            except RuntimeError:
+                refused += 1
+                continue
+
+            rect = DisplayGeometry(
+                H=geometry.H, display_size=display.size).rectify(live)
+            errors = [
+                float(np.hypot(m.dx, m.dy))
+                for spec in probe
+                for m in [measure_translation(truth, rect, spec)]
+                if m.dx is not None and m.zncc and m.zncc > 0.5
+            ]
+            rms = (float(np.sqrt(np.mean(np.square(errors))))
+                   if errors else float("inf"))
+            assert rms < 0.3, (
+                f"scale {scale}, trim {trim}: answered {rms:.3f} px instead of "
+                "refusing -- this is the silently-wrong case"
+            )
+            correct += 1
+
+    assert correct >= 2, "refusing everything would also pass the assert above"
+    assert refused >= 1
+
+
+def test_the_bezel_fixture_still_measures_after_the_nesting_rules():
+    """The rules that refuse an ambiguous nest must not refuse a real cluster."""
+    display = ClusterDisplay()
+    display.state.update(NOMINAL)
+    truth = display.render()
+    probe = profile_from_reference(truth, screen="b", display_size=display.size)
+    for i, (tilt, roll) in enumerate([(2.0, 0.7), (6.0, -3.0), (11.0, 2.5),
+                                      (-4.0, 5.0), (8.0, -8.0)]):
+        _, _, rig = rig_for(tilt_deg=tilt, roll_deg=roll, seed=i)
+        live = shot(rig)
+        geometry = homography_from_display_aperture(
+            live, display_size=display.size)
+        rect = DisplayGeometry(
+            H=geometry.H, display_size=display.size).rectify(live)
+        errors = [float(np.hypot(m.dx, m.dy))
+                  for spec in probe
+                  for m in [measure_translation(truth, rect, spec)]
+                  if m.dx is not None and m.zncc and m.zncc > 0.5]
+        assert errors
+        assert float(np.sqrt(np.mean(np.square(errors)))) < 0.3
+
+
+def test_content_span_separates_right_sized_from_oversized():
+    display = ClusterDisplay()
+    display.state.update(NOMINAL)
+    truth = display.render()
+
+    w, h = display.size
+    exact = np.array([[0, 0], [w, 0], [w, h], [0, h]], np.float64)
+    span_w, span_h, lit = content_fills_aperture(truth, exact)
+    assert span_w > 0.6 and span_h > 0.6
+    assert 0.0 < lit < 0.2  # a cluster is mostly dark; that is expected
+
+    big = _windowed(display, 2.5)
+    bw, bh = big.shape[1], big.shape[0]
+    whole = np.array([[0, 0], [bw, 0], [bw, bh], [0, bh]], np.float64)
+    span_w2, span_h2, _ = content_fills_aperture(big, whole)
+    assert span_w2 < 0.45 and span_h2 < 0.45
+
+
+def test_the_calibration_frame_is_saved_with_the_border_drawn_on_it(tmp_path):
+    """When it picks the wrong rectangle, looking at it is the fast diagnosis."""
+    display, _, rig = rig_for()
+    session = CaptureSession(
+        tmp_path,
+        calibration=Calibration(
+            intrinsics=Intrinsics(K=rig.camera.K, dist=rig.camera.dist,
+                                  image_size=rig.camera.sensor_size),
+            geometry=DisplayGeometry(H=np.eye(3), display_size=display.size)),
+        display_size=display.size, aperture=True)
+    rig.show("main")
+    rec = session.handle("calibrate", jpeg(rig.read()))
+    assert rec.verdict == "OK", rec.detail
+
+    drawn = list(tmp_path.glob("*-aperture.jpg"))
+    assert len(drawn) == 1
+    assert cv2.imread(str(drawn[0])) is not None
+    assert "-aperture.jpg" in rec.detail
+    assert "spans" in rec.detail

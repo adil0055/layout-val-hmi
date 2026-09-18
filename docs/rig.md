@@ -269,10 +269,19 @@ Its real limits, measured:
 | panel-to-trim contrast | needs ~10 grey levels; refuses below (a black screen in black trim has no border to find) |
 | sampling ratio | 0.5–1.3 comfortably; above ~2 the panel stops fitting in frame |
 | framing | the whole display **and a margin of trim** must be in shot |
+| a windowed HMI | **refused, not guessed.** A display running in a window inside a monitor gives two rectangles of the same proportions, one inside the other, and the picture does not say which is the active area. Run it full-screen, or move in until the display and a thin margin fill the frame |
 | focus, noise, night theme | no meaningful effect (0.05–0.10 px throughout) |
 
-Three mistakes are recorded in that benchmark's docstring because each looked
-right and measured wrong: Otsu cannot find the border (it splits between the
+A fourth was found in the field: pointed at an HMI running in a window, it
+locked onto the *monitor's* border instead, rectified the cluster into a corner
+of display space, and reported the calibration as successful while every element
+failed to match. Preferring the innermost rectangle is the right principle and
+measured insufficient — 5 of 14 arrangements — so the ambiguity is now detected
+and refused rather than resolved by guesswork. Zero silently wrong across those
+fourteen, against nine before.
+
+Three more mistakes are recorded in that benchmark's docstring because each
+looked right and measured wrong: Otsu cannot find the border (it splits between the
 bright things and everything else), the aperture is a *hole* and
 `RETR_EXTERNAL` discards holes, and falling back to threshold corners when
 sub-pixel refinement fails produces 1.7–3.1 px errors that nothing in the

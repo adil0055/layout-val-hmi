@@ -72,6 +72,8 @@ from layoutval.calibration import (
     Undistorter,
     charuco_anchor,
     check_intrinsics,
+    draw_aperture,
+    find_display_aperture,
     chessboard_display_points,
     detect_charuco,
     homography_from_charuco,
@@ -970,6 +972,16 @@ class CaptureSession:
                 "what it caught."
             )
             return rec
+        # Always leave a picture of what was found. This route fails by picking
+        # a plausible wrong rectangle, and no number describes that as well as
+        # looking at it does.
+        try:
+            corners, _ = find_display_aperture(
+                undistorted, display_size=self.display_size)
+            self._store(rec.name.replace(".jpg", "-aperture.jpg"),
+                        draw_aperture(undistorted, corners))
+        except RuntimeError:
+            pass
         self._commit_geometry(geometry, "phone capture, the display's own border")
         diag = geometry.aperture
         rec.verdict = "OK"
@@ -977,7 +989,10 @@ class CaptureSession:
             "solved from the display's own border -- nothing was asked of the "
             f"cluster. Found as a {diag['polarity']} region at threshold "
             f"{diag['threshold']}, stable over {diag['levels_stable']} levels, "
-            f"fills {diag['rectangularity']:.0%} of its own bounding box"
+            f"fills {diag['rectangularity']:.0%} of its own bounding box. "
+            f"What is lit inside spans {diag['content_span'][0]:.0%} by "
+            f"{diag['content_span'][1]:.0%} of it. See "
+            f"{rec.name.replace('.jpg', '-aperture.jpg')} for what was found"
         )
         if self.display_inset_px == (0.0, 0.0):
             rec.detail += (
