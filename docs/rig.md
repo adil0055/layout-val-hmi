@@ -244,7 +244,7 @@ the lamps are sparse, so the frame is no more lit than normal and the panel's
 edge is still invisible to a threshold. On a dark cluster the active area
 boundary is not recoverable from brightness at all.
 
-**F. The display's own border — nothing asked of the cluster at all.**
+**E. The display's own border — nothing asked of the cluster at all.**
 `homography_from_display_aperture`, and `--aperture` on the capture server.
 This is the answer to "calibrate it without the HMI showing anything but
 itself", and it turns out not to be a fallback: measured over ten poses it is
@@ -280,7 +280,7 @@ result distinguishes from the good ones. It refuses now instead.
 
 So with a camera only, in order of what they cost:
 
-0. **The display's own border.** Method F above — `--aperture`. Nothing to
+0. **The display's own border.** Method E above — `--aperture`. Nothing to
    stick on, nothing to print, nothing asked of the build, and it measures at
    least as well as a board on the screen. Needs light enough to tell panel
    from trim, and the whole display in frame. Try this first.

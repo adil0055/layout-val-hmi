@@ -273,6 +273,8 @@ Both departures are measured, not asserted. See
 
 ## Documentation
 
+- [docs/architecture.md](docs/architecture.md) — how the whole thing fits
+  together, and why
 - [docs/rig.md](docs/rig.md) — stage 0: optics, PWM banding, moiré, mounting
 - [docs/method.md](docs/method.md) — what was measured, and how to re-run it
 - [docs/traps.md](docs/traps.md) — animations, themes, needles, z-order, drift
