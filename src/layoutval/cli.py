@@ -418,7 +418,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
                 "altogether. It is lens-dependent, so one good-looking frame "
                 "tells you nothing about the next camera.\n"
                 "       Solve them once for this camera and lens:\n"
-                "         layoutval calibrate-intrinsics --images 'shots/*.jpg' "
+                "         layoutval calibrate-intrinsics shots/*.jpg "
                 "--out calibration/intrinsics.json"
             )
 

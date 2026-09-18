@@ -559,8 +559,8 @@ class CaptureSession:
                 "holds 0.10 px undistorted on any lens, and 0.6 px to 5.7 px "
                 "with the distortion left in -- losing elements from the match "
                 "entirely on the wider ones. Run "
-                "`layoutval calibrate-intrinsics` once for this camera and "
-                "lens, then restart with --intrinsics."
+                "`layoutval calibrate-intrinsics shots/*.jpg` once for this "
+                "camera and lens, then restart with --intrinsics."
             )
             return rec
 
