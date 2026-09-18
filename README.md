@@ -86,7 +86,11 @@ layoutval capture-server --board board.json --profile profiles/main.yaml
 
 `--render` takes a display-space image of what the cluster is drawing and
 calibrates by matching the screen's own content, so the cluster never has to
-leave the screen under test. It measures within about 0.02 px of the chessboard
+leave the screen under test. **It needs the framebuffer, so it is for a
+simulated or developer-controlled HMI** — a production cluster gives you a
+camera and nothing else, and then the geometry has to come from a bezel marker,
+one bright frame, or marked corners; see
+[What a real cluster leaves you](docs/rig.md#what-a-real-cluster-leaves-you). It measures within about 0.02 px of the chessboard
 across pose, focus, sampling ratio and lens distortion — see
 `benchmarks/calibration_methods.py` and [docs/rig.md](docs/rig.md). The content
 does not have to match the photograph exactly; RANSAC discards whatever moved.

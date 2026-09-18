@@ -132,9 +132,12 @@ sub-pixel step deviate and those deviations propagate into the interpolated
 corners. You also need a one-time measurement of where the active area sits
 relative to the markers — do it once with method A and store it.
 
-**D. The screen's own content — no pattern at all.** If the framebuffer is
-available, and on the machine running the HMI it is, then the artwork already on
-screen is the calibration target. Match the photograph against the render: SIFT
+**D. The screen's own content — no pattern at all.** *Only available when you
+can get the framebuffer*, which in practice means a simulated or
+developer-controlled HMI on the same machine. A production cluster gives you a
+camera and nothing else, and then this method does not apply — see
+[What a real cluster leaves you](#what-a-real-cluster-leaves-you) below. Where
+it does apply, the artwork already on screen is the calibration target. Match the photograph against the render: SIFT
 and RANSAC for the correspondence, then ECC in homography mode seeded from it.
 `homography_from_screen_content`.
 
@@ -176,6 +179,47 @@ edges, intersect for corners. *Fit* lines — do not take corner points directly
 line fit averages over hundreds of edge pixels and lands well under a pixel where
 a corner detector lands at about one. `homography_from_display_edges`. Workable,
 least stable, because it re-derives the geometry from content.
+
+## What a real cluster leaves you
+
+Methods A and D both need something from the build: a diagnostic screen, or the
+framebuffer. A production cluster on a bench gives you a camera pointed at
+glass, and nothing else. What is left, measured:
+
+| what the camera sees | frame lit | panel boundary found |
+|---|---|---|
+| normal dark cluster | 1.2 % | no |
+| bulb check, every lamp lit | 1.2 % | no |
+| full white screen | 59.7 % | yes, 0.703 px |
+
+The middle row is worth the ink because it is the obvious idea and it does not
+work. Every cluster runs a bulb check at ignition-on, which lights every
+telltale, and it is tempting to treat that as a free bright frame. It is not:
+the lamps are sparse, so the frame is no more lit than normal and the panel's
+edge is still invisible to a threshold. On a dark cluster the active area
+boundary is not recoverable from brightness at all.
+
+So with a camera only, in order of what they cost:
+
+1. **A marker on the bezel.** ChArUco or AprilTag, stuck on once, outside the
+   active area. Needs nothing whatever from the build, survives power cycles and
+   software loads, and refines sub-pixel. This is what production rigs do and it
+   is method B above — `homography_from_charuco`. The one-time measurement of
+   where the active area sits relative to the markers is the only awkward part,
+   and a ruler and a white frame settle it once.
+2. **One bright frame, once.** Not a chessboard — just anything that lights the
+   panel. If the build can be made to show white, a startup splash, or a
+   full-screen theme even once at rig setup, method C gets the corners and you
+   never need it again.
+3. **Mark the corners by hand, once.** Four clicks on a captured frame, then fit
+   lines along each edge in their neighbourhood to pull them sub-pixel. Costs
+   nothing, needs nothing, and is a minute of somebody's time per rig build.
+4. **Do without display coordinates.** This is the one people miss: the per-run
+   measurement is reference-relative and does not need a display mapping at all.
+   Without one you still detect that an element moved, and by how much — you
+   just report it in camera pixels rather than display pixels, and you cannot
+   compare against a design. The geometry step buys **units and traceability**,
+   not detection.
 
 ## Half-pixel conventions
 
