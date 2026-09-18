@@ -103,6 +103,14 @@ on-screen chessboard's 0.072 px, because fitting four lines over the whole
 display boundary averages thousands of edge pixels where a chessboard localises
 each corner on its own.
 
+It needs `--intrinsics`, and needs them harder than any other route: it fits
+straight lines to the display's edges, and lens distortion bows exactly those
+lines. Measured, 0.04–0.06 px undistorted on any lens against 1.3 px on a mild
+one and 4–8 px on a normal phone lens. Solve them once from the phone — pick
+**Intrinsics** on the capture page and shoot 12 views of a printed board
+(`--lens-board`), which never goes near the cluster because it is the camera
+being measured.
+
 It locates the physical opening, so display coordinates from it carry a
 constant offset against the active area behind the mask. That cancels exactly
 between reference and validate, so defect measurements are unaffected; pass

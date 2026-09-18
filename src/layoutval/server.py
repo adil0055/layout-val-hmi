@@ -325,6 +325,7 @@ class CaptureSession:
         auto_profile: bool = True,
         render: np.ndarray | None = None,
         charuco: CharucoSpec | None = None,
+        lens_board: CharucoSpec | None = None,
         aperture: bool = False,
         display_inset_px: tuple[float, float] = (0.0, 0.0),
     ) -> None:
@@ -361,6 +362,13 @@ class CaptureSession:
         self.display_inset_px = display_inset_px
         self.charuco_spec = charuco
         self.charuco_board = charuco.board() if charuco else None
+        #: The board used to solve the *lens*, which has nothing to do with how
+        #: this rig solves display space: intrinsics are a property of the
+        #: camera. Keeping them separate is what lets the border route -- which
+        #: asks the cluster for nothing -- still get its undistortion, from a
+        #: printed board held in your hand that never goes near the screen.
+        self.lens_spec = lens_board or charuco
+        self.lens_board = self.lens_spec.board() if self.lens_spec else None
         self.charuco_anchor: np.ndarray | None = None
         #: Where the board sat in the frame the anchor was bound from, by corner
         #: id.  Compared against each later frame to catch the case the anchor
@@ -412,7 +420,7 @@ class CaptureSession:
             "intrinsic_views": len(self._intrinsic_views),
             "intrinsic_views_wanted": INTRINSIC_VIEWS_WANTED,
             "needs_intrinsics": (
-                self.charuco_spec is not None
+                (self.charuco_spec is not None or self.aperture)
                 and not (self.calibration and self.calibration.intrinsics)),
             "sampling_ratio": (
                 round(self.calibration.geometry.sampling_ratio(), 3)
@@ -750,7 +758,7 @@ class CaptureSession:
         try:
             obj, img = board_points_for_intrinsics(
                 frame,
-                board=self.charuco_board,
+                board=self.lens_board,
                 pattern_size=self.pattern_size,
             )
         except (RuntimeError, ValueError) as exc:
@@ -907,6 +915,20 @@ class CaptureSession:
         aperture is hardware and is in every photograph whatever the software is
         doing.
         """
+        if not (self.calibration and self.calibration.intrinsics):
+            rec.verdict = "FAILED"
+            rec.detail = (
+                "the border route needs camera intrinsics and none were given. "
+                "It fits straight lines to the display's edges, and lens "
+                "distortion bows exactly those lines -- so this is the route "
+                "that needs undistortion most, not least. Measured: 0.04-0.06 "
+                "px undistorted on any lens, against 1.3 px on a mild lens and "
+                "4-8 px on a normal phone one. Collect them here: pick "
+                "Intrinsics and shoot 12 views of a printed board from varied "
+                "angles. It is the phone's lens being measured, not the "
+                "cluster, so the board never goes near the screen."
+            )
+            return rec
         try:
             geometry = homography_from_display_aperture(
                 undistorted, display_size=self.display_size,
@@ -1275,7 +1297,7 @@ async function refresh() {
     const was = BEZEL + "/" + ANCHORED;
     BEZEL = !!s.charuco; ANCHORED = !!s.anchor_bound;
     $("rebindRow").style.display = (BEZEL && ANCHORED) ? "grid" : "none";
-    $("introw").style.display = (BEZEL && !s.has_intrinsics) ? "grid" : "none";
+    $("introw").style.display = s.needs_intrinsics ? "grid" : "none";
     $("intcount").textContent = s.intrinsic_views
       ? `${s.intrinsic_views} of ${s.intrinsic_views_wanted} views`
       : "the lens, once per phone";

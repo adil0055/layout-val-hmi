@@ -394,6 +394,13 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
             f"tools/shoot.py out.png --width {display_size[0]}"
         )
 
+    lens_board = None
+    if args.lens_board:
+        try:
+            lens_board = CharucoSpec.parse(args.lens_board)
+        except ValueError as exc:
+            raise SystemExit(f"error: --lens-board: {exc}") from exc
+
     charuco = None
     if args.charuco:
         try:
@@ -419,6 +426,20 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
                   "page and shoot 12 views of the board from varied angles. It "
                   "solves and unblocks itself.")
             print()
+
+    if args.aperture and not (args.intrinsics or args.calibration):
+        print("note: --aperture has no intrinsics yet, so Calibrate will refuse "
+              "until it does.")
+        print("      This route fits straight lines to the display's edges and "
+              "lens distortion bows exactly those lines, so it needs "
+              "undistortion more than any other:")
+        print("      measured, 0.04-0.06 px undistorted on any lens against 1.3 "
+              "px on a mild one and 4-8 px on a normal phone lens.")
+        print("      Fix it from the phone: pick Intrinsics and shoot 12 views "
+              "of a printed board from varied angles. It is the phone's lens "
+              "being measured, so")
+        print("      the board never goes near the cluster.")
+        print()
 
     profile = (LayoutProfile.load(_require(args.profile, "--profile"))
                if args.profile else None)
@@ -446,6 +467,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         render=render,
         charuco=charuco,
         aperture=args.aperture,
+        lens_board=lens_board,
         display_inset_px=tuple(args.display_inset),
     )
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
@@ -641,6 +663,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "lit pixel, if you know it. Only needed for absolute "
                         "display coordinates; it cancels between reference and "
                         "validate")
+    c.add_argument("--lens-board", metavar="SPEC",
+                   help="a printed ChArUco board used only to solve the phone's "
+                        "lens, as COLSxROWS[:SQUARE[:MARKER[:DICT]]]. It never "
+                        "goes near the cluster -- intrinsics are a property of "
+                        "the camera. Without this the Intrinsics step looks for "
+                        "the --pattern chessboard instead")
     c.add_argument("--charuco", metavar="SPEC",
                    help="a ChArUco board fixed to the bezel, as COLSxROWS[:SQUARE"
                         "[:MARKER[:DICT]]] (e.g. 16x3:30:22). For a cluster that "

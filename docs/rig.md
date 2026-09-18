@@ -265,6 +265,7 @@ Its real limits, measured:
 
 | | |
 |---|---|
+| undistortion | **mandatory**, and more so than any other route — it fits straight lines to edges distortion bows. 0.04–0.06 px undistorted on any lens; 1.3 px mild, 4–8 px on a phone lens. Refuses without intrinsics |
 | panel-to-trim contrast | needs ~10 grey levels; refuses below (a black screen in black trim has no border to find) |
 | sampling ratio | 0.5–1.3 comfortably; above ~2 the panel stops fitting in frame |
 | framing | the whole display **and a margin of trim** must be in shot |

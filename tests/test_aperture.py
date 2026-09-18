@@ -195,3 +195,60 @@ def test_through_the_capture_server_end_to_end(tmp_path):
 
     assert session.handle("reference", jpeg(raw)).verdict == "OK"
     assert session.handle("validate", jpeg(raw)).verdict in ("PASS", "REVIEW")
+
+
+def test_border_route_refuses_without_intrinsics(tmp_path):
+    """It fits straight lines to edges that lens distortion bows.
+
+    Measured: 0.04-0.06 px undistorted on any lens, against 1.3 px on a mild
+    one and 4-8 px on a normal phone lens. This is the route that needs
+    undistortion most, which is the opposite of what it looks like.
+    """
+    display, _, rig = rig_for()
+    session = CaptureSession(tmp_path, display_size=display.size, aperture=True)
+    assert session.status()["needs_intrinsics"] is True
+
+    rig.show("main")
+    rec = session.handle("calibrate", jpeg(rig.read()))
+    assert rec.verdict == "FAILED"
+    assert "intrinsics" in rec.detail
+    assert "Intrinsics" in rec.detail  # names the step that fixes it
+
+
+def test_lens_board_is_independent_of_how_geometry_is_solved(tmp_path):
+    """Intrinsics belong to the camera, not to the rig's calibration route.
+
+    Keeping them separate is what lets the border route -- which asks the
+    cluster for nothing -- still get undistortion, from a printed board held in
+    your hand that never goes near the screen.
+    """
+    from layoutval.calibration import CharucoSpec
+
+    display, panel, rig = rig_for()
+    spec = CharucoSpec(panel.squares[0], panel.squares[1], panel.square_length,
+                       panel.square_length * panel.marker_ratio)
+    session = CaptureSession(tmp_path, display_size=display.size,
+                             aperture=True, lens_board=spec)
+    # Geometry still comes from the border, not from the board.
+    assert session.status()["calibrates_from"] == "the display's own border"
+    assert session.lens_board is not None
+    assert session.charuco_spec is None
+
+    poses = [(2.0, 0.7), (9.0, -4.0), (-6.0, 5.0), (13.0, 2.0), (-11.0, -3.0),
+             (4.0, 9.0), (-2.0, -8.0), (7.0, 3.5), (-9.0, 1.0), (11.0, -6.0),
+             (0.5, 0.2), (-4.0, -2.0)]
+    last = None
+    for i, (tilt, roll) in enumerate(poses):
+        _, _, shot_rig = rig_for(tilt_deg=tilt, roll_deg=roll, seed=i,
+                                 sampling_ratio=0.9 + 0.02 * i)
+        shot_rig.show("main")
+        last = session.handle("intrinsics", jpeg(shot_rig.read()))
+        assert last.verdict == "OK", last.detail
+    assert "solved the lens" in last.detail
+    assert session.status()["needs_intrinsics"] is False
+
+    # And now the border route runs.
+    rig.show("main")
+    rec = session.handle("calibrate", jpeg(rig.read()))
+    assert rec.verdict == "OK", rec.detail
+    assert "nothing was asked of the cluster" in rec.detail
