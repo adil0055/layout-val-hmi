@@ -20,12 +20,19 @@ capture ──▶ undistort ──▶ rectify ──▶ locate ──▶ score �
 ## Quick start
 
 ```bash
-layoutval go
+layoutval go                          # a real cluster: reads its own border
+layoutval go --board board.json       # a bench HMI that can draw a chessboard
 ```
 
-Run the HMI full-screen, scan the QR with a phone on the same network, and
-follow the steps on the page. It detects the screen size, calibrates from the
-display's own border and reuses the lens solve once it has one.
+Scan the QR with a phone on the same network and follow the steps on the page:
+**Intrinsics → Calibrate → Reference → Validate**.
+
+Which to use is about what the cluster can be asked to do, not which is better
+in the abstract. `--board` is the more reliable of the two on a desk, because a
+room is full of rectangles and the border route has to pick the display out of
+them; it is also slightly more accurate and needs no lens solve at all. Without
+a board, the border route asks the cluster for nothing, which is the only thing
+that is true of a production cluster.
 
 ## Quick start (the parts, spelled out)
 

@@ -379,12 +379,17 @@ def detect_screen_size() -> tuple[int, int] | None:
 def cmd_go(args: argparse.Namespace) -> int:
     """Start capturing, working the rest out rather than asking for it."""
     out = Path(args.out)
-    size = tuple(args.display_size) if args.display_size else detect_screen_size()
-    if size is None:
-        raise SystemExit(
-            "error: could not work out the screen size. Pass it:\n"
-            "         layoutval go --display-size WIDTH HEIGHT"
-        )
+    using_board = bool(args.board)
+    size = tuple(args.display_size) if args.display_size else None
+    if not using_board:
+        # Only the border route needs this: it searches for a rectangle with
+        # the framebuffer's aspect ratio. A board carries its own canvas size.
+        size = size or detect_screen_size()
+        if size is None:
+            raise SystemExit(
+                "error: could not work out the screen size. Pass it:\n"
+                "         layoutval go --display-size WIDTH HEIGHT"
+            )
 
     intrinsics = args.intrinsics
     reused = False
@@ -394,13 +399,16 @@ def cmd_go(args: argparse.Namespace) -> int:
             intrinsics = str(found)
             reused = True
 
-    args.aperture = True
-    args.display_size = list(size)
+    # The border route is for a cluster that cannot be asked to draw anything.
+    # On a bench where it can -- a dev HMI with a calibration screen -- the
+    # board is both more reliable and slightly more accurate (0.072 px against
+    # 0.052, and no argument about which rectangle in the room is the display).
+    args.aperture = not using_board
+    args.display_size = list(size) if size else None
     args.intrinsics = intrinsics
     args.lens_board = args.lens_board or "9x6:30:22"
     args.charuco = None
     args.render = None
-    args.board = None
     args.profile = None
     args.calibration = None
     args.values = None
@@ -421,10 +429,15 @@ def cmd_go(args: argparse.Namespace) -> int:
             raise
         except Exception:
             lens = intrinsics
-    print(f"screen {size[0]}x{size[1]}   lens: {lens}")
-    if reused:
-        print("Tap Intrinsics on the phone to re-shoot it.")
-    print("Run the HMI full-screen, then shoot from the phone.")
+    if using_board:
+        print(f"calibrating from the board in {args.board}")
+    else:
+        print(f"screen {size[0]}x{size[1]}   lens: {lens}")
+        if reused:
+            print("Tap Intrinsics on the phone to re-shoot it.")
+    print("Put the HMI on its calibration screen for step 1."
+          if using_board else
+          "Run the HMI full-screen, then shoot from the phone.")
     print()
     return cmd_capture_server(args)
 
@@ -696,6 +709,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the screen the HMI fills; detected when not given")
     c.add_argument("--intrinsics", help="reused from --out automatically once solved")
     c.add_argument("--lens-board", default=None, help="default 9x6:30:22")
+    c.add_argument("--board",
+                   help="the cluster's own board export. With this, Calibrate "
+                        "uses the chessboard the HMI draws instead of its "
+                        "border -- more reliable on a desk, where the room is "
+                        "full of rectangles, and it needs no lens solve")
     c.add_argument("--fresh-lens", action="store_true",
                    help="ignore a saved lens solve and shoot a new one")
     c.add_argument("--out", default="out/captures")
