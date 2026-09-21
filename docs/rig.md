@@ -287,12 +287,32 @@ bright things and everything else), the aperture is a *hole* and
 sub-pixel refinement fails produces 1.7–3.1 px errors that nothing in the
 result distinguishes from the good ones. It refuses now instead.
 
+**F. Four corners, marked by hand.** `homography_from_marked_corners`, and the
+default for `layoutval go`. Somebody taps the display's corners on a photograph
+once; the taps are then snapped to the real panel edge sub-pixel, so a tap ten
+pixels out costs nothing. It asks the cluster for nothing and works in **any**
+scene, which automatic detection does not — measured on a real bench
+photograph, method E picked a 2107×1537 region that was neither the display,
+the window inside it, nor the screen around it.
+
+Two rules make the snapping safe rather than clever. The search band widens
+only as far as it must (12, then 20, then 32 px), and a boundary further from
+the tap than the band that found it is rejected as a *different* edge. Opened
+to 5% of the display's width instead, the fit jumped 80 px onto a laptop's own
+bezel and tap sets 40 px apart landed 93 px apart — worse than not refining,
+because raw taps at least stay where they were put. Where there is no step to
+find at all (a black cluster behind dark chrome in a black bezel), it keeps the
+taps and says so in `method`.
+
 So with a camera only, in order of what they cost:
 
 0. **The display's own border.** Method E above — `--aperture`. Nothing to
    stick on, nothing to print, nothing asked of the build, and it measures at
    least as well as a board on the screen. Needs light enough to tell panel
    from trim, and the whole display in frame. Try this first.
+0b. **Four corners, marked by hand.** Method F above — the default. One tap
+   per corner, once per camera position, and nothing asked of the cluster.
+   Where method E needs a clean scene, this needs none.
 1. **A marker on the bezel.** ChArUco or AprilTag, stuck on once, outside the
    active area. Needs nothing whatever from the build, survives power cycles and
    software loads, and refines sub-pixel. This is what production rigs do and it

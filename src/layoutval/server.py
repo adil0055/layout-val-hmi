@@ -80,6 +80,7 @@ from layoutval.calibration import (
     homography_from_charuco,
     homography_from_display_aperture,
     homography_from_display_pattern,
+    homography_from_marked_corners,
     homography_from_screen_content,
     board_points_for_intrinsics,
     solve_intrinsics,
@@ -93,7 +94,8 @@ from layoutval.types import RunReport, Verdict
 #: order of magnitude past that is not a photograph.
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
-ACTIONS = ("intrinsics", "calibrate", "rebind", "reference", "validate")
+ACTIONS = ("intrinsics", "calibrate", "corners", "rebind", "reference",
+           "validate")
 
 #: Views wanted before the intrinsics solve is attempted.  Eight is the same
 #: floor the offline command uses: a calibration solved from three
@@ -331,6 +333,7 @@ class CaptureSession:
         charuco: CharucoSpec | None = None,
         lens_board: CharucoSpec | None = None,
         aperture: bool = False,
+        mark_corners: bool = False,
         display_inset_px: tuple[float, float] = (0.0, 0.0),
     ) -> None:
         self.lock = threading.Lock()
@@ -363,6 +366,11 @@ class CaptureSession:
         #: route that asks the cluster for nothing at all -- not a pattern, not
         #: a framebuffer, and not the one binding frame the bezel markers need.
         self.aperture = aperture
+        #: Somebody points at the four corners of the display, once. The only
+        #: route that works in any scene, because the part that is hard to
+        #: automate -- which rectangle in the picture is the display -- is the
+        #: part a person does instantly.
+        self.mark_corners = mark_corners
         self.display_inset_px = display_inset_px
         self.charuco_spec = charuco
         self.charuco_board = charuco.board() if charuco else None
@@ -423,9 +431,11 @@ class CaptureSession:
                 self.calibration and self.calibration.intrinsics),
             "intrinsic_views": len(self._intrinsic_views),
             "intrinsic_views_wanted": INTRINSIC_VIEWS_WANTED,
-            "uses_intrinsics": self.charuco_spec is not None or self.aperture,
+            "uses_intrinsics": (self.charuco_spec is not None or self.aperture
+                                or self.mark_corners),
             "needs_intrinsics": (
-                (self.charuco_spec is not None or self.aperture)
+                (self.charuco_spec is not None or self.aperture
+                 or self.mark_corners)
                 and not (self.calibration and self.calibration.intrinsics)),
             "intrinsics_rms": (
                 round(self.calibration.intrinsics.rms, 3)
@@ -452,6 +462,8 @@ class CaptureSession:
                 and self.calibration.geometry.method != UNSOLVED)
 
     def _calibrates_from(self) -> str:
+        if self.mark_corners:
+            return "corners you mark"
         if self.aperture:
             return "the display's own border"
         if self.charuco_spec is not None:
@@ -472,11 +484,14 @@ class CaptureSession:
 
     # -- actions ------------------------------------------------------------
 
-    def handle(self, action: str, data: bytes) -> CaptureRecord:
+    def handle(self, action: str, data: bytes,
+               corners: list[list[float]] | None = None) -> CaptureRecord:
         frame = decode_upload(data)
         stamp = datetime.now().strftime("%H%M%S")
         base = f"{stamp}-{action}"
         with self.lock:
+            if action == "corners":
+                return self._record(self._calibrate_corners(frame, base, corners))
             if action == "intrinsics":
                 return self._record(self._collect_intrinsics(frame, base))
             if action in ("calibrate", "rebind"):
@@ -954,6 +969,62 @@ class CaptureSession:
         self.reference_camera = None
         return rec
 
+    def _calibrate_corners(
+        self, frame: np.ndarray, base: str,
+        corners: list[list[float]] | None,
+    ) -> CaptureRecord:
+        """Calibrate from four corners somebody pointed at.
+
+        The one route that always works, because the hard part -- deciding
+        which rectangle in the picture is the display -- is done by a person,
+        instantly, and the part people are bad at is done here: the taps are
+        only a guide, and the edges are fitted to the real intensity step.
+        """
+        rec = CaptureRecord(name=f"{base}.jpg", action="corners",
+                            when=datetime.now().isoformat(timespec="seconds"))
+        self._store(rec.name, frame)
+        if not corners or len(corners) != 4:
+            rec.verdict = "FAILED"
+            rec.detail = "tap all four corners of the display, then shoot."
+            return rec
+
+        undistorted = self._undistort(frame)
+        points = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+        if self.calibration and self.calibration.intrinsics:
+            # The taps are on the frame as photographed; the measurement runs
+            # on the undistorted one, so the points have to make the same trip.
+            undistorter = Undistorter(self.calibration.intrinsics)
+            points = cv2.undistortPoints(
+                points.reshape(-1, 1, 2), self.calibration.intrinsics.K,
+                self.calibration.intrinsics.dist, P=undistorter.new_K,
+            ).reshape(-1, 2)
+
+        try:
+            geometry = homography_from_marked_corners(
+                undistorted, points, display_size=self.display_size,
+                inset_px=self.display_inset_px,
+            )
+        except RuntimeError as exc:
+            rec.verdict = "FAILED"
+            rec.detail = f"{str(exc).split('.')[0]}."
+            return rec
+
+        self._store(rec.name.replace(".jpg", "-corners.jpg"),
+                    draw_aperture(undistorted, geometry.corners))
+        self._commit_geometry(geometry, "phone capture, corners marked by hand")
+        rec.verdict = "OK"
+        rec.detail = "display located from your four corners. Next: Reference."
+        if geometry.method.endswith("(unrefined)"):
+            rec.detail += (
+                " The edges could not be snapped to the panel boundary, so this "
+                "is only as good as the taps were -- check "
+                + rec.name.replace(".jpg", "-corners.jpg")
+            )
+        ratio = geometry.sampling_ratio()
+        if ratio < 2.0:
+            rec.detail += f" (sampling {ratio:.1f} -- move closer for finer work)"
+        return rec
+
     def _calibrate_from_aperture(
         self, undistorted: np.ndarray, rec: CaptureRecord
     ) -> CaptureRecord:
@@ -1251,6 +1322,10 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
       padding:9px 11px;font-size:12.5px;margin-top:10px}
 .stat{display:flex;justify-content:space-between;font-size:13px;color:#9DADB5;padding:3px 0}
 .stat b{color:#E3EAE8;font-weight:600;font-variant-numeric:tabular-nums}
+button.ghost{flex:1;background:#1E272C;color:#E3EAE8;border:1px solid #2B373D;
+             border-radius:9px;padding:13px;font-size:15px;font-weight:600}
+button.ghost:disabled{color:#5C6B73}
+button.ghost#marksend:not(:disabled){background:#2F7D57;border-color:#2F7D57}
 </style>
 </head>
 <body>
@@ -1258,7 +1333,8 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
 <p class="sub">Point at the cluster and shoot. Measuring happens on the laptop.</p>
 
 <div class="steps" id="steps">
-  <div class="step" data-a="calibrate"><b>1 Calibrate</b><span>chessboard up</span></div>
+  <div class="step" data-a="corners"><b>1 Corners</b><span>tap the display</span></div>
+  <div class="step" data-a="calibrate" style="display:none"><b>1 Calibrate</b><span>chessboard up</span></div>
   <div class="step" data-a="reference"><b>2 Reference</b><span>correct screen</span></div>
   <div class="step" data-a="validate"><b>3 Validate</b><span>screen under test</span></div>
 </div>
@@ -1277,6 +1353,19 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
   <label class="shoot" id="shootLabel" for="shot">Take photo</label>
   <input id="shot" type="file" accept="image/*" capture="environment">
   <div class="hint" id="hint"></div>
+</div>
+
+<div class="card" id="marker" style="display:none">
+  <b>Tap the four corners of the display</b>
+  <div class="hint" id="markhint">corner 1 of 4</div>
+  <div style="position:relative;margin-top:10px">
+    <img id="markimg" class="shot" style="margin:0">
+    <canvas id="markcv" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas>
+  </div>
+  <div style="display:flex;gap:8px;margin-top:10px">
+    <button id="markundo" class="ghost">Undo</button>
+    <button id="marksend" class="ghost" disabled>Use these corners</button>
+  </div>
 </div>
 
 <div class="card" id="result" style="display:none"></div>
@@ -1307,6 +1396,7 @@ function paintSteps() {
     reference: "Show the screen under test, correct. This becomes what later shots are compared against.",
     validate: "Show the same screen with whatever you are testing. Keep the phone where it was.",
     rebind: "Only needed if the bezel sticker was moved or reprinted. Needs the markers and the calibration screen together again.",
+    corners: "Shoot the cluster, then tap its four corners on the photo. Rough taps are fine \u2014 the edges get snapped to the panel. Once per camera position.",
     intrinsics: "Shoot the board from a different angle and distance each time \u2014 near, far, tilted, and in each corner of the frame. Shots that all look alike cannot separate the lens from the pose."
   };
   if (BEZEL) {
@@ -1333,6 +1423,12 @@ async function refresh() {
     BEZEL = !!s.charuco; ANCHORED = !!s.anchor_bound;
     $("rebindRow").style.display = (BEZEL && ANCHORED) ? "grid" : "none";
     $("introw").style.display = s.uses_intrinsics ? "grid" : "none";
+    const byHand = s.calibrates_from === "corners you mark";
+    document.querySelector('[data-a="corners"]').style.display = byHand ? "" : "none";
+    document.querySelector('[data-a="calibrate"]').style.display = byHand ? "none" : "";
+    document.querySelector('[data-a="corners"]').classList.toggle("done", s.calibrated);
+    if (byHand && action === "calibrate") { action = "corners"; paintSteps(); }
+    if (!byHand && action === "corners") { action = "calibrate"; paintSteps(); }
     $("intcount").textContent = s.intrinsic_views
       ? `${s.intrinsic_views} of ${s.intrinsic_views_wanted} views`
       : (s.has_intrinsics ? "solved \u2014 tap to redo" : "the lens, once per phone");
@@ -1351,9 +1447,76 @@ async function refresh() {
   } catch (e) { /* the laptop went away; the next poll will say so */ }
 }
 
+// --- marking the display's corners by hand -------------------------------
+let taps = [], pending = null;
+
+function paintTaps() {
+  const cv = $("markcv"), img = $("markimg");
+  cv.width = img.clientWidth; cv.height = img.clientHeight;
+  const g = cv.getContext("2d");
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.strokeStyle = "#4FB584"; g.fillStyle = "#4FB584"; g.lineWidth = 2;
+  taps.forEach((t, i) => {
+    const x = t[0] * cv.width, y = t[1] * cv.height;
+    g.beginPath(); g.arc(x, y, 9, 0, 7); g.fill();
+    g.fillStyle = "#0F1518"; g.font = "bold 12px system-ui";
+    g.fillText(String(i + 1), x - 3, y + 4); g.fillStyle = "#4FB584";
+  });
+  if (taps.length > 1) {
+    g.beginPath();
+    taps.forEach((t, i) => {
+      const x = t[0] * cv.width, y = t[1] * cv.height;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    if (taps.length === 4) g.closePath();
+    g.stroke();
+  }
+  $("markhint").textContent = taps.length < 4
+    ? `corner ${taps.length + 1} of 4 \u2014 go round the display, any direction`
+    : "four corners marked. A rough tap is fine \u2014 the edges get snapped to the panel.";
+  $("marksend").disabled = taps.length !== 4;
+}
+
+$("markcv").onclick = ev => {
+  if (taps.length >= 4) return;
+  const r = ev.target.getBoundingClientRect();
+  taps.push([(ev.clientX - r.left) / r.width, (ev.clientY - r.top) / r.height]);
+  paintTaps();
+};
+$("markundo").onclick = () => { taps.pop(); paintTaps(); };
+$("marksend").onclick = async () => {
+  const body = new FormData();
+  body.append("action", "corners");
+  body.append("image", pending, pending.name || "capture.jpg");
+  body.append("corners", JSON.stringify(taps));
+  $("marksend").disabled = true;
+  $("marksend").textContent = "Solving\u2026";
+  try {
+    const r = await fetch(`/upload?t=${TOKEN}`, { method: "POST", body });
+    show(await r.json());
+  } catch (e) {
+    show({ verdict: "FAILED", detail: "could not reach the laptop: " + e });
+  }
+  $("marksend").textContent = "Use these corners";
+  $("marker").style.display = "none";
+  taps = []; pending = null;
+  refresh();
+};
+
 $("shot").onchange = async ev => {
   const file = ev.target.files[0];
   if (!file) return;
+  if (action === "corners") {
+    // Nothing is uploaded until the corners are marked, so the photograph is
+    // shown here and held until then.
+    pending = file; taps = [];
+    $("markimg").onload = paintTaps;
+    $("markimg").src = URL.createObjectURL(file);
+    $("marker").style.display = "block";
+    $("result").style.display = "none";
+    ev.target.value = "";
+    return;
+  }
   const label = $("shootLabel");
   label.textContent = "Measuring…";
   label.classList.add("busy");
@@ -1527,7 +1690,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            action, image = _parse_multipart(
+            action, image, corners = _parse_multipart(
                 self.rfile.read(length), self.headers.get("Content-Type", "")
             )
         except ValueError as exc:
@@ -1540,7 +1703,13 @@ class _Handler(BaseHTTPRequestHandler):
 
         started = time.monotonic()
         try:
-            record = self.session.handle(action, image)
+            pixels = None
+            if corners:
+                # Fractions of the image, so they survive whatever size the
+                # phone displayed the photograph at.
+                shape = decode_upload(image).shape
+                pixels = [[x * shape[1], y * shape[0]] for x, y in corners]
+            record = self.session.handle(action, image, corners=pixels)
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"verdict": "FAILED", "detail": str(exc)})
             return
@@ -1592,7 +1761,9 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
     return out
 
 
-def _parse_multipart(body: bytes, content_type: str) -> tuple[str, bytes]:
+def _parse_multipart(
+    body: bytes, content_type: str
+) -> tuple[str, bytes, list[list[float]] | None]:
     """Pull the action and the image out of a browser form post.
 
     Through :mod:`email` rather than by hand: multipart boundaries inside
@@ -1604,7 +1775,7 @@ def _parse_multipart(body: bytes, content_type: str) -> tuple[str, bytes]:
     message = BytesParser(policy=default_policy).parsebytes(
         b"Content-Type: " + content_type.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
     )
-    action, image = "", b""
+    action, image, corners = "", b"", None
     for part in message.iter_parts():
         name = part.get_param("name", header="content-disposition")
         payload = part.get_payload(decode=True) or b""
@@ -1612,9 +1783,19 @@ def _parse_multipart(body: bytes, content_type: str) -> tuple[str, bytes]:
             action = payload.decode("utf-8", "replace").strip()
         elif name == "image":
             image = payload
+        elif name == "corners":
+            # Four tapped points, as fractions of the image. Fractions rather
+            # than pixels because the phone scales the photograph to fit its
+            # screen before anybody taps it.
+            try:
+                raw = json.loads(payload.decode("utf-8", "replace"))
+                pts = [[float(x), float(y)] for x, y in raw][:4]
+                corners = pts if len(pts) == 4 else None
+            except (ValueError, TypeError):
+                corners = None
     if not image:
         raise ValueError("no image in the upload")
-    return action, image
+    return action, image, corners
 
 
 class CaptureServer(ThreadingHTTPServer):

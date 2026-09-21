@@ -1366,6 +1366,103 @@ def find_display_aperture(
     return corners, diagnostics
 
 
+def homography_from_marked_corners(
+    frame: np.ndarray,
+    corners: np.ndarray,
+    *,
+    display_size: tuple[int, int],
+    refine: bool = True,
+    inset_px: tuple[float, float] = (0.0, 0.0),
+) -> DisplayGeometry:
+    """Method F -- somebody points at the four corners of the display, once.
+
+    Finding a display automatically in an arbitrary photograph is not reliable,
+    and stacking heuristics does not make it so: a bench photograph contains the
+    screen, a window inside it, a bezel, a laptop body and a room, several of
+    which are rectangles of about the right shape.  Measured on a real bench
+    photograph, the search picked a 2107x1537 region that was none of them.
+
+    A person identifies the display instantly.  So they do that part, and the
+    code does the part people are bad at: each tapped corner is only a rough
+    guide, and the edges are then fitted to the actual intensity step between
+    panel and trim, which lands well under a pixel.  A tap that is ten pixels
+    out costs nothing.
+
+    This asks the cluster for nothing at all -- no pattern, no framebuffer, no
+    calibration screen -- which is the only thing that is true of a production
+    cluster.  For a mounted camera it is done once and never again.
+
+    ``corners`` are four (x, y) points in this frame, in any order that goes
+    round the display rather than across it.
+    """
+    corners = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+    if len(corners) != 4:
+        raise RuntimeError(f"need exactly 4 corners, got {len(corners)}")
+
+    # Order them: top-left, top-right, bottom-right, bottom-left. Taps arrive
+    # in whatever order somebody's thumb went round.
+    centre = corners.mean(axis=0)
+    order = np.argsort(np.arctan2(*(corners - centre).T[::-1]))
+    corners = corners[order]
+    start = int(np.argmin(np.sum(corners - centre, axis=1)))
+    corners = np.roll(corners, -start, axis=0)
+
+    area = cv2.contourArea(corners.astype(np.float32))
+    h, w = frame.shape[:2]
+    if area < 0.01 * w * h:
+        raise RuntimeError(
+            "those four points enclose almost nothing. Tap the corners of the "
+            "display itself, going round it"
+        )
+
+    if refine:
+        # Widen the search only as far as it has to go, and never accept an
+        # edge further away than the band that found it.
+        #
+        # A single wide band does not work. Opened to 5% of the display's width
+        # on a real bench photograph, the fit jumped 80 px to the laptop's own
+        # bezel, and tap sets differing by 40 px landed 93 px apart -- worse
+        # than not refining, because raw taps at least stay where they were put.
+        # A boundary further from the tap than the band used is, by definition,
+        # not the boundary that was pointed at.
+        gray = to_gray(frame)
+        tapped = corners.copy()
+        refine = False
+        for half in (12.0, 20.0, 32.0):
+            try:
+                candidate = refine_edges_subpixel(gray, tapped, half_width=half)
+            except RuntimeError:
+                continue  # no clean step in this band; try a wider one
+            if float(np.abs(candidate - tapped).max()) <= half:
+                corners = candidate
+                refine = True
+                break
+        # Falling through leaves the tapped corners, which are worth about how
+        # accurately they were tapped. The method string says which was used.
+
+    dw, dh = display_size
+    ix, iy = float(inset_px[0]), float(inset_px[1])
+    # Same half-pixel convention as the aperture route: the boundary somebody
+    # taps is the outer edge of the edge pixels, which is at -0.5, not 0.
+    corners_disp = np.array([
+        [-0.5 - ix, -0.5 - iy],
+        [dw - 0.5 + ix, -0.5 - iy],
+        [dw - 0.5 + ix, dh - 0.5 + iy],
+        [-0.5 - ix, dh - 0.5 + iy],
+    ], dtype=np.float64)
+    H, _ = cv2.findHomography(corners_disp, corners, method=0)
+    if H is None:
+        raise RuntimeError("homography solve failed")
+    geometry = DisplayGeometry(
+        H=H,
+        display_size=display_size,
+        method="marked_corners" if refine else "marked_corners(unrefined)",
+        residual_px=_homography_residual(corners_disp, corners, H),
+    )
+    geometry.corners = corners
+    return geometry
+
+
 def homography_from_display_aperture(
     frame: np.ndarray,
     *,

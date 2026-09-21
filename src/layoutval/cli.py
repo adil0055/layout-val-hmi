@@ -403,7 +403,10 @@ def cmd_go(args: argparse.Namespace) -> int:
     # On a bench where it can -- a dev HMI with a calibration screen -- the
     # board is both more reliable and slightly more accurate (0.072 px against
     # 0.052, and no argument about which rectangle in the room is the display).
-    args.aperture = not using_board
+    # Marking the corners is the default when there is no board: automatic
+    # border detection needs a clean scene, and a bench is not one.
+    args.mark_corners = not using_board and not args.auto_border
+    args.aperture = not using_board and args.auto_border
     args.display_size = list(size) if size else None
     args.intrinsics = intrinsics
     args.lens_board = args.lens_board or "9x6:30:22"
@@ -435,9 +438,12 @@ def cmd_go(args: argparse.Namespace) -> int:
         print(f"screen {size[0]}x{size[1]}   lens: {lens}")
         if reused:
             print("Tap Intrinsics on the phone to re-shoot it.")
-    print("Put the HMI on its calibration screen for step 1."
-          if using_board else
-          "Run the HMI full-screen, then shoot from the phone.")
+    if using_board:
+        print("Put the HMI on its calibration screen for step 1.")
+    elif args.auto_border:
+        print("Run the HMI full-screen, then shoot from the phone.")
+    else:
+        print("Shoot the cluster, then tap its four corners on the photo.")
     print()
     return cmd_capture_server(args)
 
@@ -536,6 +542,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         render=render,
         charuco=charuco,
         aperture=args.aperture,
+        mark_corners=args.mark_corners,
         lens_board=lens_board,
         display_inset_px=tuple(args.display_inset),
     )
@@ -714,6 +721,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "uses the chessboard the HMI draws instead of its "
                         "border -- more reliable on a desk, where the room is "
                         "full of rectangles, and it needs no lens solve")
+    c.add_argument("--auto-border", action="store_true",
+                   help="find the display's border automatically instead of "
+                        "tapping its corners. Needs a clean scene")
     c.add_argument("--fresh-lens", action="store_true",
                    help="ignore a saved lens solve and shoot a new one")
     c.add_argument("--out", default="out/captures")
@@ -738,6 +748,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the cluster's own board export (its --calibration-export). "
                         "Preferred: it carries the exact corners, so nothing has to "
                         "be guessed or converted")
+    c.add_argument("--mark-corners", action="store_true",
+                   help="tap the display's four corners on the phone, once. "
+                        "Asks the cluster for nothing and works in any scene; "
+                        "the taps are snapped to the panel edge sub-pixel")
     c.add_argument("--aperture", action="store_true",
                    help="calibrate from the display's own physical border. The "
                         "only route that asks the cluster for nothing at all -- "

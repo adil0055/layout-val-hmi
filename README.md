@@ -20,12 +20,19 @@ capture ──▶ undistort ──▶ rectify ──▶ locate ──▶ score �
 ## Quick start
 
 ```bash
-layoutval go                          # a real cluster: reads its own border
+layoutval go                          # tap the display's 4 corners, once
+layoutval go --auto-border            # find the border automatically instead
 layoutval go --board board.json       # a bench HMI that can draw a chessboard
 ```
 
 Scan the QR with a phone on the same network and follow the steps on the page:
 **Intrinsics → Calibrate → Reference → Validate**.
+
+The default asks the cluster for nothing and works in any scene: shoot the
+cluster, tap its four corners on the photo, and the taps are snapped to the
+real panel edge sub-pixel. Rough taps are fine. Once per camera position.
+`--auto-border` finds the border without the tapping, but needs a clean scene —
+a bench photograph full of rectangles is not one.
 
 Which to use is about what the cluster can be asked to do, not which is better
 in the abstract. `--board` is the more reliable of the two on a desk, because a

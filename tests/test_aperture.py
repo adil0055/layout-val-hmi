@@ -21,6 +21,7 @@ from layoutval.calibration import (
     content_fills_aperture,
     find_display_aperture,
     homography_from_display_aperture,
+    homography_from_marked_corners,
 )
 from layoutval.measure import measure_translation
 from layoutval.server import CaptureSession
@@ -576,3 +577,79 @@ def test_supplying_intrinsics_does_not_count_as_calibrated(tmp_path):
     assert session.is_calibrated is True
     assert session.handle("reference", frame).verdict == "OK"
     assert session.handle("validate", frame).verdict in ("PASS", "REVIEW")
+
+
+def test_marked_corners_calibrate_without_asking_the_cluster_anything():
+    """Somebody points at the display. The only route that works in any scene.
+
+    Automatic border detection needs a clean one, and a bench is not: a real
+    photograph of a laptop running the HMI contains the screen, a window inside
+    it, a bezel, a laptop body and a room, several of them rectangles of about
+    the right shape. The search picked a 2107x1537 region that was none of them.
+    """
+    display, _, rig = rig_for()
+    live = shot(rig)
+    truth = display.render()
+    probe = profile_from_reference(truth, screen="b", display_size=display.size)
+
+    # Where the display really is, then thrown off the way a thumb would.
+    exact, _ = find_display_aperture(live, display_size=display.size)
+    rng = np.random.default_rng(0)
+    tapped = exact + rng.normal(0, 6.0, exact.shape)
+
+    geometry = homography_from_marked_corners(
+        live, tapped, display_size=display.size)
+    rect = DisplayGeometry(
+        H=geometry.H, display_size=display.size).rectify(live)
+    errors = [float(np.hypot(m.dx, m.dy))
+              for spec in probe
+              for m in [measure_translation(truth, rect, spec)]
+              if m.dx is not None and m.zncc and m.zncc > 0.5]
+    assert errors, "nothing matched through the marked corners"
+    # Snapped back onto the real edge, a sloppy tap still measures.
+    assert geometry.method == "marked_corners"
+    assert float(np.sqrt(np.mean(np.square(errors)))) < 0.5
+
+
+def test_refinement_never_snaps_to_an_edge_you_did_not_point_at():
+    """A boundary further away than the band that found it is a different edge.
+
+    Opened to 5% of the display's width on a bench photograph, the fit jumped
+    80 px onto the laptop's own bezel, and tap sets differing by 40 px landed
+    93 px apart -- worse than not refining, since raw taps at least stay put.
+    """
+    display, _, rig = rig_for()
+    live = shot(rig)
+    exact, _ = find_display_aperture(live, display_size=display.size)
+
+    solved = []
+    for sigma in (0.0, 4.0, 9.0):
+        rng = np.random.default_rng(3)
+        tapped = exact + (rng.normal(0, sigma, exact.shape) if sigma else 0.0)
+        g = homography_from_marked_corners(
+            live, tapped, display_size=display.size)
+        # Whatever it did, it did not wander off to some other edge.
+        assert float(np.abs(g.corners - tapped).max()) <= 32.0
+        solved.append(g.corners)
+
+    spread = max(float(np.abs(a - b).max())
+                 for i, a in enumerate(solved) for b in solved[i + 1:])
+    assert spread < 25.0, f"tap error not absorbed: {spread:.1f} px apart"
+
+
+def test_four_corners_are_required_and_must_enclose_something(tmp_path):
+    display, _, rig = rig_for()
+    session = CaptureSession(tmp_path, display_size=display.size,
+                             mark_corners=True)
+    assert session.status()["calibrates_from"] == "corners you mark"
+
+    rig.show("main")
+    frame = jpeg(rig.read())
+    rec = session.handle("corners", frame, corners=[[0, 0], [10, 0]])
+    assert rec.verdict == "FAILED"
+    assert "four corners" in rec.detail
+
+    rec = session.handle("corners", frame,
+                         corners=[[0, 0], [3, 0], [3, 3], [0, 3]])
+    assert rec.verdict == "FAILED"
+    assert "enclose" in rec.detail
