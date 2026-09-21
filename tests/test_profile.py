@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -143,3 +144,68 @@ def test_validate_flags_a_tolerance_the_rig_cannot_honour():
 def test_reference_requires_a_path():
     with pytest.raises(RuntimeError, match="no reference"):
         LayoutProfile("s", (10, 10)).reference()
+
+
+def test_segmentation_recovers_when_otsu_lands_in_the_wrong_gap():
+    """Otsu is a two-class split and a rectified frame can have three.
+
+    Black padding outside the display, the screen's own dark background, and
+    the lit artwork. On a frame rectified from hand-marked corners, 29% of it
+    padding, Otsu landed at 42 -- between the padding and everything else --
+    leaving the whole cluster as one blob covering 71% of the frame. It
+    exceeded the size ceiling, was dropped, and the profile came back with one
+    element. Nothing downstream could work from that.
+    """
+    import numpy as np
+
+    from layoutval.autoprofile import segment_reference
+    from layoutval.simulator import ClusterDisplay
+
+    display = ClusterDisplay()
+    display.state.update({
+        "TELLTALE_BATTERY_LOW": True, "TELLTALE_OIL_PRESSURE": True,
+        "TELLTALE_ABS": True, "FUEL_LEVEL": 0.6, "SPEED": 120.0,
+    })
+    lit = display.render()
+    plain = segment_reference(lit)
+    assert len(plain) >= 4
+
+    # The same screen inset into a black frame, as marked corners produce.
+    h, w = lit.shape[:2]
+    padded = np.zeros((int(h * 1.7), int(w * 1.35), 3), np.uint8)
+    y, x = (padded.shape[0] - h) // 2, (padded.shape[1] - w) // 2
+    padded[y:y + h, x:x + w] = lit
+    assert (padded[..., 0] <= 5).mean() > 0.25, "test needs real padding"
+
+    padded_found = segment_reference(padded)
+    assert len(padded_found) >= len(plain), (
+        f"padding cost elements: {len(plain)} -> {len(padded_found)}")
+
+
+def test_the_threshold_search_never_starts_below_otsu():
+    """Climbing must start at Otsu, not at the lowest candidate level.
+
+    Sorting all the candidate levels together starts the search below Otsu,
+    where a lower threshold happens to produce no oversized component and the
+    search stops there. On a frame where Otsu was right that turned 6 correct
+    elements into 8 wrong ones, which is a silent accuracy loss rather than a
+    visible failure.
+    """
+    import numpy as np
+
+    from layoutval.autoprofile import segment_reference
+    from layoutval.simulator import ClusterDisplay
+
+    display = ClusterDisplay()
+    display.state.update({"TELLTALE_ABS": True, "SPEED": 120.0})
+    lit = display.render()
+
+    auto = segment_reference(lit)
+    gray = cv2.cvtColor(lit, cv2.COLOR_BGR2GRAY)
+    otsu, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    at_otsu = segment_reference(lit, threshold=int(otsu))
+    below = segment_reference(lit, threshold=max(1, int(otsu) - 25))
+
+    # The automatic answer is Otsu's, not the looser one below it.
+    assert len(auto) == len(at_otsu)
+    assert len(auto) != len(below) or len(below) == len(at_otsu)

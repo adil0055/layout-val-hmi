@@ -46,41 +46,88 @@ def segment_reference(
 ) -> list[tuple[int, int, int, int, int]]:
     """Lit regions of a rectified frame, as ``(x, y, w, h, area)``.
 
-    ``threshold`` defaults to Otsu, which on a cluster lands between the dark
-    background and the lit artwork without being told where that is.
-
     ``max_area_fraction`` drops anything covering more than that much of the
-    frame. Otsu on an unusually bright screen can return one blob that is
-    most of the display, and an "element" the size of the cluster measures
-    nothing and hides everything inside it.
+    frame: an "element" the size of the cluster measures nothing and hides
+    everything inside it.
+
+    **The threshold corrects itself, because Otsu alone is not safe here.**
+    Otsu is a two-class split, and a rectified frame often has three
+    populations rather than two -- black padding outside the display, the
+    screen's own dark background, and the lit artwork. Measured on a frame
+    rectified from hand-marked corners, with 29% of it black padding, Otsu
+    landed at 42: between the padding and everything else, leaving the whole
+    cluster as one blob covering 71% of the frame. Every element inside it was
+    swallowed and the profile came back with one entry. At 120 the same frame
+    gives 91.
+
+    So when the segmentation produces a component covering more of the frame
+    than an element ever should, that is evidence the threshold is too low, and
+    it is raised until that stops being true. The same correction covers the
+    unusually bright screen the old code could only warn about.
     """
     gray = to_gray(reference)
-    if threshold is None:
-        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    else:
-        _, mask = cv2.threshold(gray, int(threshold), 255, cv2.THRESH_BINARY)
-    if close_kernel > 1:
-        kernel = np.ones((close_kernel, close_kernel), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
     ceiling = max_area_fraction * gray.size
-    found = []
-    for i in range(1, count):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if not (min_area_px <= area <= ceiling):
-            continue
-        found.append((
-            int(stats[i, cv2.CC_STAT_LEFT]),
-            int(stats[i, cv2.CC_STAT_TOP]),
-            int(stats[i, cv2.CC_STAT_WIDTH]),
-            int(stats[i, cv2.CC_STAT_HEIGHT]),
-            area,
-        ))
+
+    if threshold is not None:
+        levels = [int(threshold)]
+    else:
+        # The value OpenCV chose, not one re-derived from the mask: taking the
+        # smallest surviving pixel gives otsu+1, and re-thresholding at that
+        # drops a grey level that Otsu kept.
+        otsu_value, _ = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        otsu = int(otsu_value)
+        # Otsu first, then percentiles of the frame's own brightness. Lit
+        # artwork is a small fraction of a cluster, so the high percentiles are
+        # where the boundary between background and content actually sits.
+        # Otsu first, then only levels ABOVE it. Sorting the whole set instead
+        # starts the search below Otsu, where a lower threshold happens to
+        # produce no oversized component and the loop stops there -- on a
+        # frame where Otsu was right, that turned 6 correct elements into 8
+        # wrong ones.
+        higher = sorted({
+            int(np.percentile(gray, q)) for q in (75, 85, 92, 96, 98)
+        })
+        levels = [otsu] + [v for v in higher if v > otsu]
+        levels = [max(1, min(254, v)) for v in levels]
+
+    kernel = np.ones((close_kernel, close_kernel), np.uint8) if close_kernel > 1 else None
+    best: list[tuple[int, int, int, int, int]] = []
+    for level in levels:
+        _, mask = cv2.threshold(gray, level, 255, cv2.THRESH_BINARY)
+        if kernel is not None:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+
+        oversized = any(stats[i, cv2.CC_STAT_AREA] > ceiling for i in range(1, count))
+        found = []
+        for i in range(1, count):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            if not (min_area_px <= area <= ceiling):
+                continue
+            found.append((
+                int(stats[i, cv2.CC_STAT_LEFT]),
+                int(stats[i, cv2.CC_STAT_TOP]),
+                int(stats[i, cv2.CC_STAT_WIDTH]),
+                int(stats[i, cv2.CC_STAT_HEIGHT]),
+                area,
+            ))
+        if not oversized and found:
+            # Nothing is swallowing the screen at this level, so stop here.
+            # Climbing further to collect more components is a mistake: a
+            # higher threshold breaks real elements into fragments, and
+            # fragments do not match between reference and validate. Tried the
+            # other way round first, maximising the count, and it turned a
+            # passing run into "6 pass, 31 fail".
+            best = found
+            break
+        if not best:
+            best = found
+
     # Reading order, so the ids come out the same way twice and a report reads
     # down the screen rather than in whatever order the labeller happened to go.
-    found.sort(key=lambda r: (r[1], r[0]))
-    return found
+    best.sort(key=lambda r: (r[1], r[0]))
+    return best
 
 
 def profile_from_reference(
