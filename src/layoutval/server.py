@@ -70,6 +70,7 @@ from layoutval.calibration import (
     DisplayGeometry,
     DriftTracker,
     Undistorter,
+    UNSOLVED,
     charuco_anchor,
     check_intrinsics,
     draw_aperture,
@@ -408,7 +409,7 @@ class CaptureSession:
 
     def status(self) -> dict[str, Any]:
         return {
-            "calibrated": self.calibration is not None,
+            "calibrated": self.is_calibrated,
             "has_reference": self.reference is not None,
             "has_profile": self.profile is not None,
             "auto_inventory": self._profile_is_auto,
@@ -435,6 +436,20 @@ class CaptureSession:
             ),
             "captures": len(self.history),
         }
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Whether there is a real display-to-camera mapping, not a placeholder.
+
+        Supplying intrinsics creates a Calibration so the undistortion has
+        somewhere to live, and its identity homography rectifies to a raw crop
+        of the camera frame. That crop is stable between reference and validate,
+        so elements match beautifully and the numbers are in nothing at all --
+        which is exactly the plausible-looking wrong answer this package exists
+        to avoid. ``calibration is not None`` is not the question.
+        """
+        return (self.calibration is not None
+                and self.calibration.geometry.method != UNSOLVED)
 
     def _calibrates_from(self) -> str:
         if self.aperture:
@@ -832,7 +847,7 @@ class CaptureSession:
             self.calibration = Calibration(
                 intrinsics=intrinsics,
                 geometry=(self.calibration.geometry if self.calibration
-                          else DisplayGeometry(H=np.eye(3),
+                          else DisplayGeometry(H=np.eye(3), method=UNSOLVED,
                                                display_size=self.display_size)),
                 rig={"source": "phone capture"},
                 drift_alarm_px=self.drift_alarm_px,
@@ -1066,9 +1081,9 @@ class CaptureSession:
         rec = CaptureRecord(name=f"{base}.jpg", action="reference",
                             when=datetime.now().isoformat(timespec="seconds"))
         self._store(rec.name, frame)
-        if self.calibration is None:
+        if not self.is_calibrated:
             rec.verdict = "FAILED"
-            rec.detail = "calibrate first: there is no display-to-camera mapping yet"
+            rec.detail = "do Calibrate first -- there is no display mapping yet."
             return rec
         undistorted = self._undistort(frame)
         self.reference_camera = undistorted
@@ -1107,9 +1122,9 @@ class CaptureSession:
         rec = CaptureRecord(name=f"{base}.jpg", action="validate",
                             when=datetime.now().isoformat(timespec="seconds"))
         self._store(rec.name, frame)
-        if self.calibration is None:
+        if not self.is_calibrated:
             rec.verdict = "FAILED"
-            rec.detail = "calibrate first"
+            rec.detail = "do Calibrate first -- there is no display mapping yet."
             return rec
         if self.reference is None:
             rec.verdict = "FAILED"

@@ -389,6 +389,14 @@ def calibrate_intrinsics(
 # --------------------------------------------------------------------------
 
 
+#: The ``method`` of a geometry that has not been solved yet. A placeholder is
+#: created whenever intrinsics are supplied without a calibration, so that the
+#: undistortion has somewhere to live -- and an identity homography rectifies to
+#: a raw crop of the camera frame, which looks like a photograph rather than
+#: like an error. Anything that needs a real mapping checks for this.
+UNSOLVED = "unsolved"
+
+
 @dataclass
 class DisplayGeometry:
     """The mapping between display space and camera space.

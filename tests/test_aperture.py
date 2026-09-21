@@ -536,3 +536,43 @@ def test_the_lens_step_stays_reachable_once_solved(tmp_path):
     # And the border route still works while the re-shoot is half done.
     rig.show("main")
     assert session.handle("calibrate", jpeg(rig.read())).verdict == "OK"
+
+
+def test_supplying_intrinsics_does_not_count_as_calibrated(tmp_path):
+    """The placeholder geometry that holds the undistortion is not a mapping.
+
+    Passing --intrinsics builds a Calibration so the lens model has somewhere
+    to live, and its identity homography rectifies to a raw crop of the camera
+    frame. The crop is stable between reference and validate, so every element
+    matches to a few hundredths of a pixel and the whole run looks healthy --
+    while the numbers are in no coordinate system at all. Skipping Calibrate
+    has to fail, not succeed quietly.
+    """
+    from layoutval.calibration import UNSOLVED
+
+    display, _, rig = rig_for()
+    session = CaptureSession(
+        tmp_path,
+        calibration=Calibration(
+            intrinsics=Intrinsics(K=rig.camera.K, dist=rig.camera.dist,
+                                  image_size=rig.camera.sensor_size),
+            geometry=DisplayGeometry(H=np.eye(3), method=UNSOLVED,
+                                     display_size=display.size)),
+        display_size=display.size, aperture=True)
+
+    assert session.calibration is not None      # the lens model is there
+    assert session.is_calibrated is False       # the mapping is not
+    assert session.status()["calibrated"] is False
+
+    rig.show("main")
+    frame = jpeg(rig.read())
+    for action in ("reference", "validate"):
+        rec = session.handle(action, frame)
+        assert rec.verdict == "FAILED", f"{action}: {rec.detail}"
+        assert "Calibrate first" in rec.detail
+
+    # After Calibrate, both work.
+    assert session.handle("calibrate", frame).verdict == "OK"
+    assert session.is_calibrated is True
+    assert session.handle("reference", frame).verdict == "OK"
+    assert session.handle("validate", frame).verdict in ("PASS", "REVIEW")

@@ -330,7 +330,7 @@ def test_validate_refuses_before_calibration(server, rig):
     url = f"http://{host}:{port}/upload?t={server.token}"
     result = post(url, "validate", shoot(rig))
     assert result["verdict"] == "FAILED"
-    assert "calibrate" in result["detail"]
+    assert "Calibrate" in result["detail"]
 
 
 def test_reference_refuses_before_calibration(server, rig):
@@ -338,7 +338,7 @@ def test_reference_refuses_before_calibration(server, rig):
     url = f"http://{host}:{port}/upload?t={server.token}"
     result = post(url, "reference", shoot(rig))
     assert result["verdict"] == "FAILED"
-    assert "calibrate" in result["detail"]
+    assert "Calibrate" in result["detail"]
 
 
 def test_calibration_says_the_board_was_never_shown(server, rig):
@@ -548,7 +548,7 @@ def test_the_whole_loop_works_with_no_profile_at_all(tmp_path):
         # are needed rather than whichever check happens to run first.
         early = post(url, "validate", shoot(bench.rig))
         assert early["verdict"] == "FAILED"
-        assert "calibrate first" in early["detail"]
+        assert "Calibrate first" in early["detail"]
 
         bench.rig.show("checkerboard")
         assert post(url, "calibrate", bench.rig.read())["verdict"] == "OK"

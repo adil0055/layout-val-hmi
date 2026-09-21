@@ -28,6 +28,7 @@ from layoutval.calibration import (
     CharucoSpec,
     DisplayGeometry,
     Intrinsics,
+    UNSOLVED,
     Undistorter,
     calibrate_intrinsics,
     chessboard_display_points,
@@ -502,7 +503,8 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
     if calibration is None and args.intrinsics:
         calibration = Calibration(
             intrinsics=Intrinsics.from_dict(_read_json(args.intrinsics, "--intrinsics")),
-            geometry=DisplayGeometry(H=np.eye(3), display_size=tuple(args.display_size)),
+            geometry=DisplayGeometry(H=np.eye(3), method=UNSOLVED,
+                                     display_size=tuple(args.display_size)),
         )
 
     session = CaptureSession(
