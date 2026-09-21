@@ -422,9 +422,13 @@ class CaptureSession:
                 self.calibration and self.calibration.intrinsics),
             "intrinsic_views": len(self._intrinsic_views),
             "intrinsic_views_wanted": INTRINSIC_VIEWS_WANTED,
+            "uses_intrinsics": self.charuco_spec is not None or self.aperture,
             "needs_intrinsics": (
                 (self.charuco_spec is not None or self.aperture)
                 and not (self.calibration and self.calibration.intrinsics)),
+            "intrinsics_rms": (
+                round(self.calibration.intrinsics.rms, 3)
+                if self.calibration and self.calibration.intrinsics else None),
             "sampling_ratio": (
                 round(self.calibration.geometry.sampling_ratio(), 3)
                 if self.calibration else None
@@ -745,6 +749,11 @@ class CaptureSession:
 
         if self._intrinsic_frame_size is None:
             self._intrinsic_frame_size = (w, h)
+            if self.calibration and self.calibration.intrinsics:
+                # Shooting a fresh set is how you ask for a fresh solve. The
+                # loaded one stays in use until the new set actually solves, so
+                # a half-finished re-shoot never leaves the rig with no lens.
+                rec.detail = "re-solving the lens. "
         elif self._intrinsic_frame_size != (w, h):
             # Intrinsics are in pixels, so they belong to one frame size. Mixing
             # sizes silently produces a calibration that fits neither.
@@ -786,7 +795,8 @@ class CaptureSession:
         self._intrinsic_views.append((obj, img))
         got, want = len(self._intrinsic_views), INTRINSIC_VIEWS_WANTED
         rec.verdict = "OK"
-        rec.detail = f"view {got} of {want}. Change the angle between shots."
+        rec.detail = (rec.detail or "") + (
+            f"view {got} of {want}. Change the angle between shots.")
         if got < want:
             return rec
 
@@ -1307,10 +1317,10 @@ async function refresh() {
     const was = BEZEL + "/" + ANCHORED;
     BEZEL = !!s.charuco; ANCHORED = !!s.anchor_bound;
     $("rebindRow").style.display = (BEZEL && ANCHORED) ? "grid" : "none";
-    $("introw").style.display = s.needs_intrinsics ? "grid" : "none";
+    $("introw").style.display = s.uses_intrinsics ? "grid" : "none";
     $("intcount").textContent = s.intrinsic_views
       ? `${s.intrinsic_views} of ${s.intrinsic_views_wanted} views`
-      : "the lens, once per phone";
+      : (s.has_intrinsics ? "solved \u2014 tap to redo" : "the lens, once per phone");
     document.querySelector('[data-a="intrinsics"]').classList
       .toggle("done", !!s.has_intrinsics);
     // Nothing else can run until the lens is solved, so start there rather

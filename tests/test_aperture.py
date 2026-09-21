@@ -502,3 +502,37 @@ def test_a_loose_lens_solve_is_reported_not_refused():
     # And the failure rms cannot see is still caught, however tight it looks.
     assert check(0.05, tilt=2.5).complaint() is not None
     assert "same angle" in check(0.05, tilt=2.5).complaint()
+
+
+def test_the_lens_step_stays_reachable_once_solved(tmp_path):
+    """A saved lens solve must be re-shootable, not hidden behind its own success.
+
+    `go` picks up a saved intrinsics.json, which satisfied the check and
+    removed the step from the page -- so a solve made under an older, wrong
+    gate could never be replaced from the phone.
+    """
+    display, panel, rig = rig_for()
+    session = CaptureSession(
+        tmp_path,
+        calibration=Calibration(
+            intrinsics=Intrinsics(K=rig.camera.K, dist=rig.camera.dist,
+                                  image_size=rig.camera.sensor_size),
+            geometry=DisplayGeometry(H=np.eye(3), display_size=display.size)),
+        display_size=display.size, aperture=True)
+
+    status = session.status()
+    assert status["uses_intrinsics"] is True   # the step belongs on the page
+    assert status["needs_intrinsics"] is False  # but is already satisfied
+    assert status["intrinsics_rms"] is not None
+
+    # Shooting a fresh view starts a new set without dropping the working one.
+    rig.show("checkerboard")
+    rec = session.handle("intrinsics", jpeg(rig.read()))
+    assert rec.verdict == "OK", rec.detail
+    assert "re-solving" in rec.detail
+    assert session.status()["intrinsic_views"] == 1
+    assert session.status()["has_intrinsics"] is True
+
+    # And the border route still works while the re-shoot is half done.
+    rig.show("main")
+    assert session.handle("calibrate", jpeg(rig.read())).verdict == "OK"

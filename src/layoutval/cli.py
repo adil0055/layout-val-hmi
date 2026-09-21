@@ -386,10 +386,12 @@ def cmd_go(args: argparse.Namespace) -> int:
         )
 
     intrinsics = args.intrinsics
-    if not intrinsics:
+    reused = False
+    if not intrinsics and not args.fresh_lens:
         found = out / "intrinsics.json"
         if found.exists():
             intrinsics = str(found)
+            reused = True
 
     args.aperture = True
     args.display_size = list(size)
@@ -409,8 +411,18 @@ def cmd_go(args: argparse.Namespace) -> int:
     args.no_auto_profile = False
     args.display_inset = [0.0, 0.0]
 
-    print(f"screen {size[0]}x{size[1]}"
-          + ("  lens: saved" if intrinsics else "  lens: not solved yet"))
+    lens = "not solved yet"
+    if intrinsics:
+        try:
+            rms = float(_read_json(intrinsics, "--intrinsics").get("rms", 0.0))
+            lens = f"reusing {intrinsics} (rms {rms:.2f})" if reused else intrinsics
+        except SystemExit:
+            raise
+        except Exception:
+            lens = intrinsics
+    print(f"screen {size[0]}x{size[1]}   lens: {lens}")
+    if reused:
+        print("Tap Intrinsics on the phone to re-shoot it.")
     print("Run the HMI full-screen, then shoot from the phone.")
     print()
     return cmd_capture_server(args)
@@ -682,6 +694,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the screen the HMI fills; detected when not given")
     c.add_argument("--intrinsics", help="reused from --out automatically once solved")
     c.add_argument("--lens-board", default=None, help="default 9x6:30:22")
+    c.add_argument("--fresh-lens", action="store_true",
+                   help="ignore a saved lens solve and shoot a new one")
     c.add_argument("--out", default="out/captures")
     c.add_argument("--host", default="0.0.0.0")
     c.add_argument("--port", type=int, default=8000)
