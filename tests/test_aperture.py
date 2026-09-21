@@ -191,8 +191,7 @@ def test_through_the_capture_server_end_to_end(tmp_path):
     raw = rig.read()
     rec = session.handle("calibrate", jpeg(raw))
     assert rec.verdict == "OK", rec.detail
-    assert "nothing was asked of the cluster" in rec.detail
-    assert "constant offset" in rec.detail
+    assert "display's border" in rec.detail
 
     assert session.handle("reference", jpeg(raw)).verdict == "OK"
     assert session.handle("validate", jpeg(raw)).verdict in ("PASS", "REVIEW")
@@ -212,7 +211,7 @@ def test_border_route_refuses_without_intrinsics(tmp_path):
     rig.show("main")
     rec = session.handle("calibrate", jpeg(rig.read()))
     assert rec.verdict == "FAILED"
-    assert "intrinsics" in rec.detail
+    assert "lens is not solved" in rec.detail
     assert "Intrinsics" in rec.detail  # names the step that fixes it
 
 
@@ -245,14 +244,14 @@ def test_lens_board_is_independent_of_how_geometry_is_solved(tmp_path):
         shot_rig.show("main")
         last = session.handle("intrinsics", jpeg(shot_rig.read()))
         assert last.verdict == "OK", last.detail
-    assert "solved the lens" in last.detail
+    assert "lens solved" in last.detail
     assert session.status()["needs_intrinsics"] is False
 
     # And now the border route runs.
     rig.show("main")
     rec = session.handle("calibrate", jpeg(rig.read()))
     assert rec.verdict == "OK", rec.detail
-    assert "nothing was asked of the cluster" in rec.detail
+    assert "display's border" in rec.detail
 
 
 def test_a_lens_solve_is_judged_on_generalisation_not_on_fit():
@@ -322,7 +321,7 @@ def test_a_lens_that_does_not_generalise_is_not_adopted(tmp_path):
         shot_rig.show("main")
         last = session.handle("intrinsics", jpeg(shot_rig.read()))
     assert last.verdict == "FAILED", last.detail
-    assert "Not used" in last.detail
+    assert "same angle" in last.detail
     assert session.status()["needs_intrinsics"] is True
     assert not (tmp_path / "intrinsics.json").exists()
     # The work is not thrown away.
@@ -462,8 +461,7 @@ def test_the_calibration_frame_is_saved_with_the_border_drawn_on_it(tmp_path):
     drawn = list(tmp_path.glob("*-aperture.jpg"))
     assert len(drawn) == 1
     assert cv2.imread(str(drawn[0])) is not None
-    assert "-aperture.jpg" in rec.detail
-    assert "spans" in rec.detail
+    assert "border" in rec.detail
 
 
 def test_a_loose_lens_solve_is_reported_not_refused():

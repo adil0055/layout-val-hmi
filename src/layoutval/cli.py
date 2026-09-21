@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -345,6 +346,76 @@ def cmd_charuco_board(args: argparse.Namespace) -> int:
     return 0
 
 
+def detect_screen_size() -> tuple[int, int] | None:
+    """The resolution of the screen the HMI is filling, if it can be found.
+
+    The border route searches for a rectangle with the framebuffer's aspect
+    ratio, so this value is not cosmetic -- getting it wrong is the difference
+    between finding the display and finding something else the same shape.
+    Asking the machine beats asking the person.
+    """
+    try:
+        out = subprocess.run(["xrandr", "--current"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        if "*" in line:
+            for token in line.split():
+                if "x" in token and token.replace("x", "").isdigit():
+                    w, _, h = token.partition("x")
+                    return (int(w), int(h))
+    for line in out.splitlines():
+        if " connected" in line:
+            for token in line.split():
+                geom = token.split("+")[0]
+                if "x" in geom and geom.replace("x", "").isdigit():
+                    w, _, h = geom.partition("x")
+                    return (int(w), int(h))
+    return None
+
+
+def cmd_go(args: argparse.Namespace) -> int:
+    """Start capturing, working the rest out rather than asking for it."""
+    out = Path(args.out)
+    size = tuple(args.display_size) if args.display_size else detect_screen_size()
+    if size is None:
+        raise SystemExit(
+            "error: could not work out the screen size. Pass it:\n"
+            "         layoutval go --display-size WIDTH HEIGHT"
+        )
+
+    intrinsics = args.intrinsics
+    if not intrinsics:
+        found = out / "intrinsics.json"
+        if found.exists():
+            intrinsics = str(found)
+
+    args.aperture = True
+    args.display_size = list(size)
+    args.intrinsics = intrinsics
+    args.lens_board = args.lens_board or "9x6:30:22"
+    args.charuco = None
+    args.render = None
+    args.board = None
+    args.profile = None
+    args.calibration = None
+    args.values = None
+    args.pattern = [9, 6]
+    args.square_px = 100.0
+    args.origin = [0.0, 0.0]
+    args.fixed_camera = False
+    args.drift_alarm_px = 2.0
+    args.no_auto_profile = False
+    args.display_inset = [0.0, 0.0]
+
+    print(f"screen {size[0]}x{size[1]}"
+          + ("  lens: saved" if intrinsics else "  lens: not solved yet"))
+    print("Run the HMI full-screen, then shoot from the phone.")
+    print()
+    return cmd_capture_server(args)
+
+
 def cmd_capture_server(args: argparse.Namespace) -> int:
     from layoutval.server import (
         CaptureServer,
@@ -408,38 +479,9 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         except ValueError as exc:
             raise SystemExit(f"error: --charuco: {exc}") from exc
         if not (args.intrinsics or args.calibration):
-            # Not a hard stop any more: the capture page can collect the views
-            # and solve them in-session, so the fix is available at the bench
-            # rather than only back at a shell. Calibrate still refuses until
-            # they exist -- the route cannot produce a defensible number without
-            # undistortion -- but that refusal now names something you can do
-            # standing in front of the cluster.
-            print("note: --charuco has no intrinsics yet, so Calibrate will "
-                  "refuse until it does.")
-            print("      Lens distortion does not cancel for markers the way it "
-                  "nearly does for a board on the screen: measured, this route "
-                  "holds 0.10 px")
-            print("      undistorted on any lens, and 0.6-5.7 px with the "
-                  "distortion left in, losing elements from the match entirely "
-                  "on the wider lenses.")
-            print("      Fix it from the phone: pick Intrinsics on the capture "
-                  "page and shoot 12 views of the board from varied angles. It "
-                  "solves and unblocks itself.")
+            print("The lens is not solved yet -- do Intrinsics on the phone "
+                  "first.")
             print()
-
-    if args.aperture and not (args.intrinsics or args.calibration):
-        print("note: --aperture has no intrinsics yet, so Calibrate will refuse "
-              "until it does.")
-        print("      This route fits straight lines to the display's edges and "
-              "lens distortion bows exactly those lines, so it needs "
-              "undistortion more than any other:")
-        print("      measured, 0.04-0.06 px undistorted on any lens against 1.3 "
-              "px on a mild one and 4-8 px on a normal phone lens.")
-        print("      Fix it from the phone: pick Intrinsics and shoot 12 views "
-              "of a printed board from varied angles. It is the phone's lens "
-              "being measured, so")
-        print("      the board never goes near the cluster.")
-        print()
 
     profile = (LayoutProfile.load(_require(args.profile, "--profile"))
                if args.profile else None)
@@ -634,6 +676,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="white quiet margin around the board, which the marker "
                         "detector needs to find the outer squares (default 10)")
     c.set_defaults(func=cmd_charuco_board)
+
+    c = sub.add_parser("go", help="start capturing; works the rest out itself")
+    c.add_argument("--display-size", nargs=2, type=int, default=None,
+                   help="the screen the HMI fills; detected when not given")
+    c.add_argument("--intrinsics", help="reused from --out automatically once solved")
+    c.add_argument("--lens-board", default=None, help="default 9x6:30:22")
+    c.add_argument("--out", default="out/captures")
+    c.add_argument("--host", default="0.0.0.0")
+    c.add_argument("--port", type=int, default=8000)
+    c.add_argument("--quiet", action="store_true")
+    c.add_argument("--no-qr", action="store_true")
+    c.set_defaults(func=cmd_go)
 
     c = sub.add_parser(
         "capture-server",

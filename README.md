@@ -20,6 +20,16 @@ capture ──▶ undistort ──▶ rectify ──▶ locate ──▶ score �
 ## Quick start
 
 ```bash
+layoutval go
+```
+
+Run the HMI full-screen, scan the QR with a phone on the same network, and
+follow the steps on the page. It detects the screen size, calibrates from the
+display's own border and reuses the lens solve once it has one.
+
+## Quick start (the parts, spelled out)
+
+```bash
 pip install -e ".[dev]"
 layoutval demo --out out/demo      # the whole pipeline against a simulated rig
 pytest                             # 60+ tests, no hardware needed

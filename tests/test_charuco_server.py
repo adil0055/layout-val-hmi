@@ -310,7 +310,7 @@ def test_intrinsics_can_be_collected_from_the_phone(tmp_path):
         last = session.handle("intrinsics", jpeg(shot.read()))
         assert last.verdict == "OK", last.detail
 
-    assert "solved the lens" in last.detail
+    assert "lens solved" in last.detail
     assert (tmp_path / "intrinsics.json").exists()
     assert session.calibration.intrinsics is not None
     assert session.status()["needs_intrinsics"] is False

@@ -786,15 +786,8 @@ class CaptureSession:
         self._intrinsic_views.append((obj, img))
         got, want = len(self._intrinsic_views), INTRINSIC_VIEWS_WANTED
         rec.verdict = "OK"
-        rec.detail = f"view {got} of {want} accepted, {len(img)} corners"
-
+        rec.detail = f"view {got} of {want}. Change the angle between shots."
         if got < want:
-            rec.detail += (
-                ". Move between shots: different angles, distances, and the "
-                "board in different corners of the frame. Views that all look "
-                "alike cannot separate the lens from the pose, and the solve "
-                "will look fine and be wrong"
-            )
             return rec
 
         try:
@@ -822,11 +815,8 @@ class CaptureSession:
         complaint = check.complaint()
         implied = check.expected_element_error_px()
         rec.detail = (
-            f"solved the lens from {got} views: {check.holdout_px:.3f} px on "
-            f"views it had not seen, {check.tilt_spread_deg:.0f} degrees of "
-            f"angle spread. That is a {check.quality()} solve, and it implies "
-            f"about {implied:.2f} px of measurement error -- set tolerances "
-            f"above that, not below it"
+            f"lens solved from {got} views: {check.quality()}, "
+            f"about {implied:.2f} px accuracy"
         )
         if complaint is None:
             self.calibration = Calibration(
@@ -839,18 +829,12 @@ class CaptureSession:
             )
             out = self.out_dir / "intrinsics.json"
             out.write_text(json.dumps(intrinsics.to_dict(), indent=2))
-            rec.detail += f". Saved as {out.name}. Calibrate is unblocked"
+            rec.detail += ". Ready -- go to Calibrate."
             if implied > 0.40:
-                # Adopted, because even a loose model beats none: on the same
-                # lens, skipping undistortion costs 4.08 px where the loosest
-                # solve measured here cost 1.30. Said out loud, because the
-                # number it implies is the rig's floor and a tolerance set
-                # under it will fail at random.
-                rec.detail += (
-                    f". It is on the loose side though -- a sharper board, "
-                    "printed rather than shown on a screen, is what tightens "
-                    "it. Keep shooting and it re-solves as the set improves"
-                )
+                # Adopted, because even a loose model beats none: skipping
+                # undistortion on the same lens costs 4.08 px where the loosest
+                # solve measured cost 1.30. Worth one clause, not a paragraph.
+                rec.detail += " A printed board would tighten it."
             self._intrinsic_views.clear()
             self._intrinsic_frame_size = None
             return rec
@@ -860,11 +844,7 @@ class CaptureSession:
         # undistortion altogether -- so the views are kept and the set can be
         # extended rather than silently accepted.
         rec.verdict = "FAILED"
-        rec.detail += f". Not used: {complaint}."
-        rec.detail += (
-            f" The {got} views are kept -- keep shooting and it re-solves as "
-            "they improve, or restart the server to drop them."
-        )
+        rec.detail = f"{got} views: {complaint.split('.')[0]}. Keep shooting."
         return rec
 
     def _calibrate(
@@ -962,17 +942,7 @@ class CaptureSession:
         """
         if not (self.calibration and self.calibration.intrinsics):
             rec.verdict = "FAILED"
-            rec.detail = (
-                "the border route needs camera intrinsics and none were given. "
-                "It fits straight lines to the display's edges, and lens "
-                "distortion bows exactly those lines -- so this is the route "
-                "that needs undistortion most, not least. Measured: 0.04-0.06 "
-                "px undistorted on any lens, against 1.3 px on a mild lens and "
-                "4-8 px on a normal phone one. Collect them here: pick "
-                "Intrinsics and shoot 12 views of a printed board from varied "
-                "angles. It is the phone's lens being measured, not the "
-                "cluster, so the board never goes near the screen."
-            )
+            rec.detail = ("the lens is not solved yet. Do Intrinsics first.")
             return rec
         try:
             geometry = homography_from_display_aperture(
@@ -981,10 +951,7 @@ class CaptureSession:
             )
         except RuntimeError as exc:
             rec.verdict = "FAILED"
-            rec.detail = (
-                f"{exc}. The frame is saved as {rec.name} -- open it and see "
-                "what it caught."
-            )
+            rec.detail = f"{str(exc).split('.')[0]}. See {rec.name}."
             return rec
         # Always leave a picture of what was found. This route fails by picking
         # a plausible wrong rectangle, and no number describes that as well as
@@ -999,25 +966,10 @@ class CaptureSession:
         self._commit_geometry(geometry, "phone capture, the display's own border")
         diag = geometry.aperture
         rec.verdict = "OK"
-        rec.detail = (
-            "solved from the display's own border -- nothing was asked of the "
-            f"cluster. Found as a {diag['polarity']} region at threshold "
-            f"{diag['threshold']}, stable over {diag['levels_stable']} levels, "
-            f"fills {diag['rectangularity']:.0%} of its own bounding box. "
-            f"What is lit inside spans {diag['content_span'][0]:.0%} by "
-            f"{diag['content_span'][1]:.0%} of it. See "
-            f"{rec.name.replace('.jpg', '-aperture.jpg')} for what was found"
-        )
-        if self.display_inset_px == (0.0, 0.0):
-            rec.detail += (
-                ". Note: this locates the physical opening, and the active area "
-                "sits behind it by a mask width this cannot see, so display "
-                "coordinates here carry a constant offset. It cancels exactly "
-                "between reference and validate, so it does not affect a defect "
-                "measurement -- pass --display-inset only if you need absolute "
-                "coordinates to compare against a design"
-            )
-        self._note_sampling_ratio(rec, geometry)
+        rec.detail = "found the display's border. Next: Reference."
+        ratio = geometry.sampling_ratio()
+        if ratio < 2.0:
+            rec.detail += f" (sampling {ratio:.1f} -- move closer for finer work)"
         return rec
 
     def _calibrate_from_content(
