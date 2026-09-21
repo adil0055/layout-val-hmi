@@ -128,8 +128,21 @@ A solve reporting 0.051 px left 1.3 px of real error behind, and one that would
 have passed a 0.3 px rms gate was worse than not undistorting at all. So the
 solve is scored on whether it **generalises** — fit on most of the views,
 measured on the ones held back — plus how much the board's angle actually
-varied. A lens model that does not pass is not adopted; the views are kept so
-the set can be extended.
+varied. Too little angle spread is refused: it is the failure no error figure
+can see.
+
+The held-out number is otherwise **priced, not gated**. It maps almost linearly
+onto what the rig then costs (roughly `0.6 × holdout`), so the solve is adopted
+and the record says what it implies:
+
+| held-out | implies | |
+|---|---|---|
+| 0.26 px | 0.11 px | tight |
+| 0.52 px | 0.26 px | workable |
+| 1.04 px | 0.63 px | loose |
+
+All of those beat skipping undistortion, which on the same lens costs 4.08 px.
+Set tolerances above the implied figure, not below it.
 
 It locates the physical opening, so display coordinates from it carry a
 constant offset against the active area behind the mask. That cancels exactly

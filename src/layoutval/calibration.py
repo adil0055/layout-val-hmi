@@ -182,10 +182,26 @@ class LensCheck:
     #: degrees of spread and every bad one 2.1-2.6.
     MIN_TILT_SPREAD_DEG = 6.0
 
-    #: Held-out reprojection above this means the views themselves were poor --
-    #: soft, noisy, or shot through a screen. Measured, a set at 0.24 left 0.50
-    #: px of real error where a set at 0.05 left 0.11.
-    MAX_HOLDOUT_PX = 0.20
+    #: Held-out reprojection maps almost linearly onto the error the rig then
+    #: makes, measured by adding corner-localisation noise (which is what moire
+    #: off a screen, JPEG sharpening and a soft board all amount to):
+    #:
+    #:     holdout px   element error
+    #:          0.05         0.093 px
+    #:          0.26         0.113 px
+    #:          0.52         0.261 px
+    #:          0.78         0.460 px
+    #:          1.04         0.631 px
+    #:          2.34         1.296 px
+    #:
+    #: So roughly ``0.6 * holdout``, and that is a number to report rather than
+    #: a line to refuse at. Even the worst row above beats not undistorting,
+    #: which on the same lens costs 4.08 px -- so a loose solve is still worth
+    #: having, as long as nobody mistakes it for a tight one.
+    ERROR_PER_HOLDOUT_PX = 0.6
+
+    #: Past this the solve is too loose to be worth the undistortion pass.
+    MAX_HOLDOUT_PX = 3.0
 
     def complaint(self) -> str | None:
         """What is wrong with this solve, in words, or None if nothing is.
@@ -213,14 +229,33 @@ class LensCheck:
         if self.holdout_px > self.MAX_HOLDOUT_PX:
             return (
                 f"the lens model is {self.holdout_px:.2f} px out on views it did "
-                "not see, against the "
-                f"{self.MAX_HOLDOUT_PX:.2f} px worth trusting. The views "
-                "themselves were poor -- soft, noisy, or shot off a screen, "
-                "where the display's own pixel grid beats against the sensor's "
-                "and moves every corner. Print the board if you can, fill the "
-                "frame with it, and keep it sharp"
+                f"not see, past the {self.MAX_HOLDOUT_PX:.1f} px where "
+                "undistorting stops being worth doing. The views themselves "
+                "were poor -- soft, noisy, or shot off a screen, where the "
+                "display's own pixel grid beats against the sensor's and moves "
+                "every corner. Print the board if you can, fill the frame with "
+                "it, and keep it sharp"
             )
         return None
+
+    def expected_element_error_px(self) -> float:
+        """Roughly what this lens solve will cost the measurements through it.
+
+        Not a guarantee -- a floor to set tolerances against, which is the same
+        arithmetic :meth:`Tolerance.defensible_floor` does for everything else.
+        A number that is stated can be worked with; the same number hidden
+        behind a pass mark cannot.
+        """
+        return self.ERROR_PER_HOLDOUT_PX * max(self.holdout_px, 0.0)
+
+    def quality(self) -> str:
+        """One word for how good this solve is, for a record to carry."""
+        implied = self.expected_element_error_px()
+        if implied <= 0.15:
+            return "tight"
+        if implied <= 0.40:
+            return "workable"
+        return "loose"
 
 
 def _reprojection_px(obj, img, K, dist, rvec, tvec) -> float:

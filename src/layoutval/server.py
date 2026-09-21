@@ -820,10 +820,13 @@ class CaptureSession:
             self._intrinsic_frame_size,
         )
         complaint = check.complaint()
+        implied = check.expected_element_error_px()
         rec.detail = (
             f"solved the lens from {got} views: {check.holdout_px:.3f} px on "
-            f"views it had not seen ({check.rms:.3f} px on the ones it fitted), "
-            f"{check.tilt_spread_deg:.0f} degrees of angle spread"
+            f"views it had not seen, {check.tilt_spread_deg:.0f} degrees of "
+            f"angle spread. That is a {check.quality()} solve, and it implies "
+            f"about {implied:.2f} px of measurement error -- set tolerances "
+            f"above that, not below it"
         )
         if complaint is None:
             self.calibration = Calibration(
@@ -837,6 +840,17 @@ class CaptureSession:
             out = self.out_dir / "intrinsics.json"
             out.write_text(json.dumps(intrinsics.to_dict(), indent=2))
             rec.detail += f". Saved as {out.name}. Calibrate is unblocked"
+            if implied > 0.40:
+                # Adopted, because even a loose model beats none: on the same
+                # lens, skipping undistortion costs 4.08 px where the loosest
+                # solve measured here cost 1.30. Said out loud, because the
+                # number it implies is the rig's floor and a tolerance set
+                # under it will fail at random.
+                rec.detail += (
+                    f". It is on the loose side though -- a sharper board, "
+                    "printed rather than shown on a screen, is what tightens "
+                    "it. Keep shooting and it re-solves as the set improves"
+                )
             self._intrinsic_views.clear()
             self._intrinsic_frame_size = None
             return rec

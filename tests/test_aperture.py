@@ -464,3 +464,43 @@ def test_the_calibration_frame_is_saved_with_the_border_drawn_on_it(tmp_path):
     assert cv2.imread(str(drawn[0])) is not None
     assert "-aperture.jpg" in rec.detail
     assert "spans" in rec.detail
+
+
+def test_a_loose_lens_solve_is_reported_not_refused():
+    """A loose lens model still beats no lens model, so it is adopted and priced.
+
+    Measured by adding corner-localisation noise -- what moire off a screen,
+    JPEG sharpening and a soft board all amount to -- the held-out error maps
+    almost linearly onto what the rig then costs:
+
+        holdout 0.26 -> 0.113 px      holdout 1.04 -> 0.631 px
+        holdout 0.52 -> 0.261 px      holdout 2.34 -> 1.296 px
+
+    Every one of those beats skipping undistortion, which on the same lens
+    costs 4.08 px. An earlier gate refused anything past 0.20 px, a figure
+    taken from simulator-clean views that no phone photographing a screen can
+    reach. It blocked solves that were entirely usable.
+    """
+    from layoutval.calibration import LensCheck
+
+    def check(holdout, tilt=20.0):
+        return LensCheck(rms=holdout * 0.9, holdout_px=holdout,
+                         tilt_spread_deg=tilt, depth_spread=0.4, views=12)
+
+    # Usable solves are adopted, and say what they will cost.
+    for holdout, expected in ((0.26, 0.16), (0.52, 0.31), (1.04, 0.62)):
+        c = check(holdout)
+        assert c.complaint() is None, holdout
+        assert c.expected_element_error_px() == pytest.approx(expected, abs=0.02)
+
+    # Quality is a word a record can carry.
+    assert check(0.05).quality() == "tight"
+    assert check(0.52).quality() == "workable"
+    assert check(1.04).quality() == "loose"
+
+    # Past the point where undistorting stops being worth it, it is refused.
+    assert check(3.5).complaint() is not None
+
+    # And the failure rms cannot see is still caught, however tight it looks.
+    assert check(0.05, tilt=2.5).complaint() is not None
+    assert "same angle" in check(0.05, tilt=2.5).complaint()
