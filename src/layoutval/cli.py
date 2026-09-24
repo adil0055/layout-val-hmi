@@ -377,19 +377,22 @@ def detect_screen_size() -> tuple[int, int] | None:
 
 
 def cmd_go(args: argparse.Namespace) -> int:
-    """Start capturing, working the rest out rather than asking for it."""
+    """Start capturing, working the rest out rather than asking for it.
+
+    The phone offers three ways to locate the display and switches between them
+    live: corners found automatically (the default), corners tapped by hand,
+    and the cluster's own chessboard when a board export is given.
+    """
     out = Path(args.out)
     using_board = bool(args.board)
-    size = tuple(args.display_size) if args.display_size else None
-    if not using_board:
-        # Only the border route needs this: it searches for a rectangle with
-        # the framebuffer's aspect ratio. A board carries its own canvas size.
-        size = size or detect_screen_size()
-        if size is None:
-            raise SystemExit(
-                "error: could not work out the screen size. Pass it:\n"
-                "         layoutval go --display-size WIDTH HEIGHT"
-            )
+    # The corner modes map the screen's four corners, so they need the screen's
+    # resolution. The chessboard carries its own canvas size in the board file.
+    size = tuple(args.display_size) if args.display_size else detect_screen_size()
+    if size is None and not using_board:
+        raise SystemExit(
+            "error: could not work out the screen size. Pass it:\n"
+            "         layoutval go --display-size WIDTH HEIGHT"
+        )
 
     intrinsics = args.intrinsics
     reused = False
@@ -399,14 +402,12 @@ def cmd_go(args: argparse.Namespace) -> int:
             intrinsics = str(found)
             reused = True
 
-    # The border route is for a cluster that cannot be asked to draw anything.
-    # On a bench where it can -- a dev HMI with a calibration screen -- the
-    # board is both more reliable and slightly more accurate (0.072 px against
-    # 0.052, and no argument about which rectangle in the room is the display).
-    # Marking the corners is the default when there is no board: automatic
-    # border detection needs a clean scene, and a bench is not one.
-    args.mark_corners = not using_board and not args.auto_border
-    args.aperture = not using_board and args.auto_border
+    if args.auto_border:
+        # The older fully automatic border route, kept for a clean scene.
+        args.aperture, args.mark_corners, args.calib_mode = True, False, ""
+    else:
+        args.aperture, args.mark_corners = False, True
+        args.calib_mode = args.mode or ("chessboard" if using_board else "auto")
     args.display_size = list(size) if size else None
     args.intrinsics = intrinsics
     args.lens_board = args.lens_board or "9x6:30:22"
@@ -432,18 +433,12 @@ def cmd_go(args: argparse.Namespace) -> int:
             raise
         except Exception:
             lens = intrinsics
-    if using_board:
-        print(f"calibrating from the board in {args.board}")
-    else:
-        print(f"screen {size[0]}x{size[1]}   lens: {lens}")
-        if reused:
-            print("Tap Intrinsics on the phone to re-shoot it.")
-    if using_board:
-        print("Put the HMI on its calibration screen for step 1.")
-    elif args.auto_border:
-        print("Run the HMI full-screen, then shoot from the phone.")
-    else:
-        print("Shoot the cluster, then tap its four corners on the photo.")
+    shown = f"{size[0]}x{size[1]}" if size else "from the board"
+    print(f"screen {shown}   lens: {lens}")
+    modes = "auto corners, tap corners" + (", chessboard" if using_board else "")
+    print(f"modes on the phone: {modes}")
+    if reused:
+        print("Tap Intrinsics on the phone to re-shoot the lens.")
     print()
     return cmd_capture_server(args)
 
@@ -472,6 +467,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
     else:
         display_size = (1920, 720)
 
+    board_canvas = None
     if args.board:
         board = _read_json(args.board, "--board", BOARD_HINT)
         try:
@@ -479,15 +475,16 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
             # column x's centre at x, and Qt puts it at x + 0.5.
             display_points = np.array(board["corners_pixel_centre"], dtype=np.float64)
             pattern = tuple(board["pattern_size"])
+            board_canvas = tuple(int(v) for v in board["canvas"])
             if not args.display_size:
-                display_size = tuple(board["canvas"])
+                display_size = board_canvas
         except (KeyError, TypeError, ValueError) as exc:
             raise SystemExit(
                 f"error: {args.board} is not a board export ({exc}). It should be "
                 "what the cluster's --calibration-export writes."
             )
         print(f"board: {pattern[0]}x{pattern[1]} inner corners on a "
-              f"{display_size[0]}x{display_size[1]} canvas, from {args.board}")
+              f"{board_canvas[0]}x{board_canvas[1]} canvas, from {args.board}")
 
     if render is not None and (render.shape[1], render.shape[0]) != display_size:
         raise SystemExit(
@@ -543,6 +540,8 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         charuco=charuco,
         aperture=args.aperture,
         mark_corners=args.mark_corners,
+        calib_mode=getattr(args, "calib_mode", ""),
+        board_display_size=board_canvas,
         lens_board=lens_board,
         display_inset_px=tuple(args.display_inset),
     )
@@ -721,6 +720,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "uses the chessboard the HMI draws instead of its "
                         "border -- more reliable on a desk, where the room is "
                         "full of rectangles, and it needs no lens solve")
+    c.add_argument("--mode", choices=("auto", "manual", "chessboard"),
+                   help="which mode the phone starts in; it can switch at any "
+                        "time. Default: chessboard with --board, else auto")
     c.add_argument("--auto-border", action="store_true",
                    help="find the display's border automatically instead of "
                         "tapping its corners. Needs a clean scene")

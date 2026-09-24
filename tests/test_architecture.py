@@ -20,6 +20,7 @@ MEASUREMENT_PATH = [
     "verdict.py",
     "pipeline.py",
     "calibration.py",
+    "displayfind.py",
     "capture.py",
     "residual.py",
     "repeatability.py",

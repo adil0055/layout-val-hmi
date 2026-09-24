@@ -64,6 +64,7 @@ import cv2
 import numpy as np
 
 from layoutval.autoprofile import profile_from_reference
+from layoutval.displayfind import propose_display_corners
 from layoutval.calibration import (
     Calibration,
     CharucoSpec,
@@ -94,8 +95,13 @@ from layoutval.types import RunReport, Verdict
 #: order of magnitude past that is not a photograph.
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
-ACTIONS = ("intrinsics", "calibrate", "corners", "rebind", "reference",
-           "validate")
+ACTIONS = ("intrinsics", "calibrate", "propose", "corners", "rebind",
+           "reference", "validate")
+
+#: How the display is located, as the phone offers them. ``manual``: tap the
+#: four corners. ``auto``: the corners are proposed and you confirm or drag
+#: them. ``chessboard``: the cluster draws its calibration pattern.
+CALIBRATION_MODES = ("manual", "auto", "chessboard")
 
 #: Views wanted before the intrinsics solve is attempted.  Eight is the same
 #: floor the offline command uses: a calibration solved from three
@@ -293,6 +299,8 @@ class CaptureRecord:
     verdict: str = ""
     detail: str = ""
     report: dict[str, Any] | None = None
+    #: Proposed corners, for the phone to show as draggable dots.
+    proposal: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -335,6 +343,8 @@ class CaptureSession:
         aperture: bool = False,
         mark_corners: bool = False,
         display_inset_px: tuple[float, float] = (0.0, 0.0),
+        calib_mode: str = "",
+        board_display_size: tuple[int, int] | None = None,
     ) -> None:
         self.lock = threading.Lock()
         self.out_dir = Path(out_dir)
@@ -357,11 +367,6 @@ class CaptureSession:
         #: matches the screen's own artwork instead of needing a pattern drawn
         #: for it, so the cluster never has to leave the screen under test.
         self.render = render
-        #: A board stuck to the bezel, when there is one.  This is the route for
-        #: a cluster you cannot ask to draw anything: the markers live outside
-        #: the active area, so the screen under test can stay on the screen
-        #: under test.  It costs one binding frame, once -- see
-        #: :meth:`_calibrate_charuco`.
         #: Calibrate from the display's own physical border. This is the only
         #: route that asks the cluster for nothing at all -- not a pattern, not
         #: a framebuffer, and not the one binding frame the bezel markers need.
@@ -372,6 +377,11 @@ class CaptureSession:
         #: part a person does instantly.
         self.mark_corners = mark_corners
         self.display_inset_px = display_inset_px
+        #: A board stuck to the bezel, when there is one.  This is the route for
+        #: a cluster you cannot ask to draw anything: the markers live outside
+        #: the active area, so the screen under test can stay on the screen
+        #: under test.  It costs one binding frame, once -- see
+        #: :meth:`_calibrate_charuco`.
         self.charuco_spec = charuco
         self.charuco_board = charuco.board() if charuco else None
         #: The board used to solve the *lens*, which has nothing to do with how
@@ -395,6 +405,15 @@ class CaptureSession:
         self.display_size = display_size or (
             calibration.geometry.display_size if calibration else (1920, 720)
         )
+        #: Which way the display is being located, when the phone chooses. Each
+        #: mode maps to its own display space: the corners of the screen for
+        #: the corner modes, the board's canvas for the chessboard.
+        self.calib_mode = ""
+        self.corner_display_size = tuple(self.display_size)
+        self.board_display_size = (tuple(board_display_size)
+                                   if board_display_size else None)
+        if calib_mode:
+            self.set_mode(calib_mode)
         self.reference: np.ndarray | None = None
         self.reference_camera: np.ndarray | None = None
         self.history: list[CaptureRecord] = []
@@ -407,6 +426,53 @@ class CaptureSession:
 
         if self.charuco_spec is not None:
             self._load_anchor()
+
+    # -- calibration mode ---------------------------------------------------
+
+    def available_modes(self) -> dict[str, bool]:
+        """Which modes this session can offer, and why one might not be."""
+        return {
+            "manual": True,
+            "auto": True,
+            # The chessboard only means something with the board's own export:
+            # it carries the exact corners the cluster drew. Guessing the board
+            # is how a smaller grid inside a bigger one solves at the wrong scale.
+            "chessboard": self.display_points is not None,
+        }
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in CALIBRATION_MODES:
+            raise ValueError(f"unknown mode {mode!r}; one of {', '.join(CALIBRATION_MODES)}")
+        if not self.available_modes()[mode]:
+            raise ValueError(
+                "chessboard mode needs the board the cluster exports -- start "
+                "with `layoutval go --board board.json`")
+        with self.lock:
+            switching = bool(self.calib_mode) and mode != self.calib_mode
+            self.calib_mode = mode
+            self.mark_corners = mode in ("manual", "auto")
+            self.aperture = False
+            self.display_size = (self.board_display_size or self.display_size
+                                 if mode == "chessboard" else self.corner_display_size)
+            if switching:
+                # A new mode is a new calibration: the modes map into different
+                # display spaces, so the old mapping and anything measured
+                # through it no longer apply. Left in place, the page saw a
+                # calibrated session with no reference and moved on to Reference
+                # -- and the chessboard photo meant to calibrate became the
+                # reference instead. The lens solve belongs to the phone, not to
+                # the mode, so it stays.
+                intrinsics = self.calibration.intrinsics if self.calibration else None
+                self.calibration = None if intrinsics is None else Calibration(
+                    intrinsics=intrinsics,
+                    geometry=DisplayGeometry(H=np.eye(3), method=UNSOLVED,
+                                             display_size=self.display_size),
+                    drift_alarm_px=self.drift_alarm_px)
+                self.reference = None
+                self.reference_camera = None
+                if self._profile_is_auto:
+                    self.profile = None
+                    self._profile_is_auto = False
 
     # -- helpers ------------------------------------------------------------
 
@@ -425,17 +491,17 @@ class CaptureSession:
             "display_size": list(self.display_size),
             "fixed_camera": self.fixed_camera,
             "calibrates_from": self._calibrates_from(),
+            "mode": self.calib_mode,
+            "modes": self.available_modes() if self.calib_mode else {},
             "charuco": self.charuco_spec.to_dict() if self.charuco_spec else None,
             "anchor_bound": self.charuco_anchor is not None,
             "has_intrinsics": bool(
                 self.calibration and self.calibration.intrinsics),
             "intrinsic_views": len(self._intrinsic_views),
             "intrinsic_views_wanted": INTRINSIC_VIEWS_WANTED,
-            "uses_intrinsics": (self.charuco_spec is not None or self.aperture
-                                or self.mark_corners),
+            "uses_intrinsics": self._uses_intrinsics(),
             "needs_intrinsics": (
-                (self.charuco_spec is not None or self.aperture
-                 or self.mark_corners)
+                self._uses_intrinsics()
                 and not (self.calibration and self.calibration.intrinsics)),
             "intrinsics_rms": (
                 round(self.calibration.intrinsics.rms, 3)
@@ -461,7 +527,18 @@ class CaptureSession:
         return (self.calibration is not None
                 and self.calibration.geometry.method != UNSOLVED)
 
+    def _uses_intrinsics(self) -> bool:
+        # The chessboard gives the mapping from dozens of interior points and
+        # never needed a lens solve; the routes that fit a display's edges do.
+        if self.calib_mode == "chessboard":
+            return False
+        return self.charuco_spec is not None or self.aperture or self.mark_corners
+
     def _calibrates_from(self) -> str:
+        if self.calib_mode:
+            return {"manual": "corners you mark",
+                    "auto": "corners found automatically",
+                    "chessboard": "the cluster's chessboard"}[self.calib_mode]
         if self.mark_corners:
             return "corners you mark"
         if self.aperture:
@@ -489,6 +566,10 @@ class CaptureSession:
         frame = decode_upload(data)
         stamp = datetime.now().strftime("%H%M%S")
         base = f"{stamp}-{action}"
+        if action == "propose":
+            # Read-only: nothing about the session changes until the dots are
+            # confirmed and come back as "corners".
+            return self._propose(frame, base)
         with self.lock:
             if action == "corners":
                 return self._record(self._calibrate_corners(frame, base, corners))
@@ -738,6 +819,9 @@ class CaptureSession:
 
     def _commit_geometry(self, geometry: Any, source: str) -> None:
         """Adopt a new display-to-camera solve and drop what it invalidates."""
+        # Display space is whatever this solve mapped into; with modes that map
+        # into different spaces, the session follows the one in force.
+        self.display_size = tuple(geometry.display_size)
         self.calibration = Calibration(
             intrinsics=self.calibration.intrinsics if self.calibration else None,
             geometry=geometry,
@@ -969,6 +1053,36 @@ class CaptureSession:
         self.reference_camera = None
         return rec
 
+    def _propose(self, frame: np.ndarray, base: str) -> CaptureRecord:
+        """Proposed display corners, for the phone to show as draggable dots."""
+        rec = CaptureRecord(name=f"{base}.jpg", action="propose",
+                            when=datetime.now().isoformat(timespec="seconds"))
+        intrinsics = self.calibration.intrinsics if self.calibration else None
+        if intrinsics is None:
+            proposal = propose_display_corners(frame)
+        else:
+            # Found on the undistorted frame, where the display's edges are
+            # straight. On the raw photograph lens distortion bows them, and
+            # straight lines fitted to bowed edges met 29-34 px off at the
+            # corners -- enough that the snap-to-edge step then refused them.
+            # The dots go back to the phone in the raw photograph's pixels,
+            # since that is the picture it is showing.
+            undistorter = Undistorter(intrinsics)
+            proposal = propose_display_corners(undistorter(frame))
+            if proposal is not None:
+                proposal.corners = _distort_points(
+                    proposal.corners, intrinsics, undistorter.new_K)
+        if proposal is None:
+            rec.verdict = "FAILED"
+            rec.detail = "couldn't find the display -- tap its four corners."
+            return rec
+        rec.verdict = "OK"
+        rec.detail = ("found the display. Check the dots, drag any that are off, "
+                      "then use them." if not proposal.confident else
+                      "found the display. Use these corners, or drag to adjust.")
+        rec.proposal = proposal.to_dict(frame.shape)
+        return rec
+
     def _calibrate_corners(
         self, frame: np.ndarray, base: str,
         corners: list[list[float]] | None,
@@ -1001,7 +1115,7 @@ class CaptureSession:
 
         try:
             geometry = homography_from_marked_corners(
-                undistorted, points, display_size=self.display_size,
+                undistorted, points, display_size=self.corner_display_size,
                 inset_px=self.display_inset_px,
             )
         except RuntimeError as exc:
@@ -1326,6 +1440,12 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
       padding:9px 11px;font-size:12.5px;margin-top:10px}
 .stat{display:flex;justify-content:space-between;font-size:13px;color:#9DADB5;padding:3px 0}
 .stat b{color:#E3EAE8;font-weight:600;font-variant-numeric:tabular-nums}
+.modes{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px}
+.modes button{background:#1E272C;color:#C2CED6;border:1px solid #2B373D;border-radius:9px;
+              padding:10px 4px;font-size:13px;font-weight:600;-webkit-tap-highlight-color:transparent}
+.modes button.on{background:#1D5B8A;border-color:#3E8FD0;color:#fff}
+.modes button:disabled{color:#4A5961;border-style:dashed}
+#markcv{touch-action:none}
 button.ghost{flex:1;background:#1E272C;color:#E3EAE8;border:1px solid #2B373D;
              border-radius:9px;padding:13px;font-size:15px;font-weight:600}
 button.ghost:disabled{color:#5C6B73}
@@ -1335,6 +1455,13 @@ button.ghost#marksend:not(:disabled){background:#2F7D57;border-color:#2F7D57}
 <body>
 <h1>Cluster capture</h1>
 <p class="sub">Point at the cluster and shoot. Measuring happens on the laptop.</p>
+
+<div class="modes" id="modebar" style="display:none">
+  <button data-m="auto">Auto corners</button>
+  <button data-m="manual">Tap corners</button>
+  <button data-m="chessboard">Chessboard</button>
+</div>
+<div class="hint" id="modehint" style="margin:-6px 0 12px"></div>
 
 <div class="steps" id="steps">
   <div class="step" data-a="corners"><b>1 Corners</b><span>tap the display</span></div>
@@ -1360,7 +1487,7 @@ button.ghost#marksend:not(:disabled){background:#2F7D57;border-color:#2F7D57}
 </div>
 
 <div class="card" id="marker" style="display:none">
-  <b>Tap the four corners of the display</b>
+  <b id="marktitle">Tap the four corners of the display</b>
   <div class="hint" id="markhint">corner 1 of 4</div>
   <div style="position:relative;margin-top:10px">
     <img id="markimg" class="shot" style="margin:0">
@@ -1387,6 +1514,7 @@ button.ghost#marksend:not(:disabled){background:#2F7D57;border-color:#2F7D57}
 const TOKEN = new URLSearchParams(location.search).get("t") || "";
 let action = "calibrate";
 let BEZEL = false, ANCHORED = false;
+let MODE = "", MODES = {};
 const $ = id => document.getElementById(id);
 
 document.querySelectorAll(".step").forEach(el => {
@@ -1400,7 +1528,9 @@ function paintSteps() {
     reference: "Show the screen under test, correct. This becomes what later shots are compared against.",
     validate: "Show the same screen with whatever you are testing. Keep the phone where it was.",
     rebind: "Only needed if the bezel sticker was moved or reprinted. Needs the markers and the calibration screen together again.",
-    corners: "Shoot the cluster, then tap its four corners on the photo. Rough taps are fine \u2014 the edges get snapped to the panel. Once per camera position.",
+    corners: MODE === "auto"
+      ? "Shoot the whole screen with a margin round it. The corners are found for you \u2014 check them, drag any that are off. Once per camera position."
+      : "Shoot the cluster, then tap its four corners on the photo. Rough taps are fine \u2014 the edges get snapped to the panel. Once per camera position.",
     intrinsics: "Shoot the board from a different angle and distance each time \u2014 near, far, tilted, and in each corner of the frame. Shots that all look alike cannot separate the lens from the pose."
   };
   if (BEZEL) {
@@ -1409,6 +1539,37 @@ function paintSteps() {
       : "First time only: the markers and the cluster's calibration screen, together in one frame.";
   }
   $("hint").textContent = hints[action];
+}
+
+document.querySelectorAll(".modes button").forEach(b => {
+  b.onclick = async () => {
+    if (b.disabled || b.dataset.m === MODE) return;
+    try {
+      const r = await fetch(`/mode?t=${TOKEN}`, {method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({mode: b.dataset.m})});
+      const s = await r.json();
+      if (!r.ok) { show({verdict: "FAILED", detail: s.detail}); return; }
+    } catch (e) { show({verdict: "FAILED", detail: "could not reach the laptop: " + e}); }
+    $("marker").style.display = "none";
+    action = b.dataset.m === "chessboard" ? "calibrate" : "corners";
+    await refresh(); paintSteps();
+  };
+});
+
+function paintModes() {
+  const bar = $("modebar");
+  bar.style.display = MODE ? "grid" : "none";
+  document.querySelectorAll(".modes button").forEach(b => {
+    b.classList.toggle("on", b.dataset.m === MODE);
+    b.disabled = MODES[b.dataset.m] === false;
+  });
+  $("modehint").textContent = !MODE ? "" : {
+    auto: "The corners are found for you. Check the dots, drag any that are off.",
+    manual: "You tap the four corners of the screen on the photo.",
+    chessboard: "The cluster shows its chessboard for one shot."
+  }[MODE] + (MODES.chessboard === false && MODE !== "chessboard"
+      ? " (Chessboard needs --board.)" : "");
 }
 
 async function refresh() {
@@ -1427,7 +1588,12 @@ async function refresh() {
     BEZEL = !!s.charuco; ANCHORED = !!s.anchor_bound;
     $("rebindRow").style.display = (BEZEL && ANCHORED) ? "grid" : "none";
     $("introw").style.display = s.uses_intrinsics ? "grid" : "none";
-    const byHand = s.calibrates_from === "corners you mark";
+    MODE = s.mode || ""; MODES = s.modes || {};
+    paintModes();
+    document.querySelector('[data-a="corners"] span').textContent =
+      MODE === "auto" ? "find the display" : "tap the display";
+    const byHand = MODE ? MODE !== "chessboard"
+                        : s.calibrates_from === "corners you mark";
     document.querySelector('[data-a="corners"]').style.display = byHand ? "" : "none";
     document.querySelector('[data-a="calibrate"]').style.display = byHand ? "none" : "";
     document.querySelector('[data-a="corners"]').classList.toggle("done", s.calibrated);
@@ -1440,14 +1606,20 @@ async function refresh() {
       .toggle("done", !!s.has_intrinsics);
     // Nothing else can run until the lens is solved, so start there rather
     // than letting Calibrate be picked and refused.
-    if (s.needs_intrinsics && action === "calibrate") { action = "intrinsics"; }
-    if (!s.needs_intrinsics && action === "intrinsics") { action = "calibrate"; }
+    if (s.needs_intrinsics && (action === "calibrate" || action === "corners")) {
+      action = "intrinsics";
+    }
+    if (!s.needs_intrinsics && action === "intrinsics" && !s.has_intrinsics) {
+      action = byHand ? "corners" : "calibrate";
+    }
     document.querySelector('[data-a="calibrate"] span').textContent =
       BEZEL ? (ANCHORED ? "markers only" : "bind: markers + pattern") : "chessboard up";
     if (was !== BEZEL + "/" + ANCHORED) paintSteps();
     document.querySelector('[data-a="calibrate"]').classList.toggle("done", s.calibrated);
     document.querySelector('[data-a="reference"]').classList.toggle("done", s.has_reference);
-    if (s.calibrated && !s.has_reference && action === "calibrate") { action = "reference"; paintSteps(); }
+    if (s.calibrated && !s.has_reference && (action === "calibrate" || action === "corners")) {
+      action = "reference"; paintSteps();
+    }
   } catch (e) { /* the laptop went away; the next poll will say so */ }
 }
 
@@ -1477,16 +1649,42 @@ function paintTaps() {
   }
   $("markhint").textContent = taps.length < 4
     ? `corner ${taps.length + 1} of 4 \u2014 go round the display, any direction`
-    : "four corners marked. A rough tap is fine \u2014 the edges get snapped to the panel.";
+    : "Press and drag a dot to move it. Close is fine \u2014 the edges get snapped to the panel.";
   $("marksend").disabled = taps.length !== 4;
 }
 
-$("markcv").onclick = ev => {
-  if (taps.length >= 4) return;
-  const r = ev.target.getBoundingClientRect();
-  taps.push([(ev.clientX - r.left) / r.width, (ev.clientY - r.top) / r.height]);
+// Tap to place a dot, press on a dot to drag it. Same for proposed dots, so a
+// proposal that is slightly off is fixed with a thumb rather than retaken.
+let dragging = -1;
+function at(ev) {
+  const r = $("markcv").getBoundingClientRect();
+  return [(ev.clientX - r.left) / r.width, (ev.clientY - r.top) / r.height, r];
+}
+$("markcv").addEventListener("pointerdown", ev => {
+  const [x, y, r] = at(ev);
+  let best = -1, bestD = 1e9;
+  taps.forEach((t, i) => {
+    const d = Math.hypot((t[0] - x) * r.width, (t[1] - y) * r.height);
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  if (best >= 0 && bestD < 34) {
+    dragging = best;
+    $("markcv").setPointerCapture(ev.pointerId);
+  } else if (taps.length < 4) {
+    taps.push([x, y]);
+    paintTaps();
+  }
+  ev.preventDefault();
+});
+$("markcv").addEventListener("pointermove", ev => {
+  if (dragging < 0) return;
+  const [x, y] = at(ev);
+  taps[dragging] = [Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))];
   paintTaps();
-};
+  ev.preventDefault();
+});
+["pointerup", "pointercancel"].forEach(k =>
+  $("markcv").addEventListener(k, () => { dragging = -1; }));
 $("markundo").onclick = () => { taps.pop(); paintTaps(); };
 $("marksend").onclick = async () => {
   const body = new FormData();
@@ -1511,14 +1709,34 @@ $("shot").onchange = async ev => {
   const file = ev.target.files[0];
   if (!file) return;
   if (action === "corners") {
-    // Nothing is uploaded until the corners are marked, so the photograph is
-    // shown here and held until then.
+    // Nothing is calibrated until the corners are confirmed, so the photograph
+    // is shown here and held until then. In auto mode the laptop proposes the
+    // dots first; they arrive already placed, and are dragged like any other.
     pending = file; taps = [];
     $("markimg").onload = paintTaps;
     $("markimg").src = URL.createObjectURL(file);
     $("marker").style.display = "block";
     $("result").style.display = "none";
     ev.target.value = "";
+    $("marktitle").textContent = MODE === "auto" ? "Finding the display\u2026"
+                                                 : "Tap the four corners of the display";
+    if (MODE === "auto") {
+      const body = new FormData();
+      body.append("action", "propose");
+      body.append("image", file, file.name || "capture.jpg");
+      try {
+        const r = await fetch(`/upload?t=${TOKEN}`, { method: "POST", body });
+        const res = await r.json();
+        if (res.proposal && pending === file) { taps = res.proposal.corners; }
+        $("marktitle").textContent = res.proposal
+          ? (res.proposal.confident ? "Found it \u2014 drag a dot if it's off"
+                                    : "Check these \u2014 drag any dot that's off")
+          : "Couldn't find it \u2014 tap the four corners";
+      } catch (e) {
+        $("marktitle").textContent = "Couldn't reach the laptop \u2014 tap the corners";
+      }
+      paintTaps();
+    }
     return;
   }
   const label = $("shootLabel");
@@ -1677,10 +1895,28 @@ class _Handler(BaseHTTPRequestHandler):
         kind = "image/png" if target.suffix == ".png" else "image/jpeg"
         self._send(HTTPStatus.OK, target.read_bytes(), kind)
 
+    def _set_mode(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 4096:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"detail": "too large"})
+            return
+        mode = _read_mode(self.rfile.read(length) if length else b"")
+        try:
+            self.session.set_mode(mode)
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"detail": str(exc)})
+            return
+        if not self.server.quiet:  # type: ignore[attr-defined]
+            print(f"  mode: {mode}")
+        self._json(HTTPStatus.OK, self.session.status())
+
     def do_POST(self) -> None:  # noqa: N802
         url = urlparse(self.path)
         if not self._authorised(parse_qs(url.query)):
             self._send(HTTPStatus.FORBIDDEN, b"bad token", "text/plain; charset=utf-8")
+            return
+        if url.path == "/mode":
+            self._set_mode()
             return
         if url.path != "/upload":
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
@@ -1729,6 +1965,27 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.OK, payload)
 
 
+def _distort_points(points: np.ndarray, intrinsics: Any, new_k: np.ndarray) -> np.ndarray:
+    """Undistorted-frame pixels back to the raw photograph's pixels.
+
+    The inverse of the ``cv2.undistortPoints(..., P=new_K)`` that the corners
+    route applies to taps, so a proposed dot that is accepted unchanged lands
+    exactly where it was found.
+    """
+    pts = np.asarray(points, np.float64).reshape(-1, 2)
+    rays = np.column_stack([pts, np.ones(len(pts))]) @ np.linalg.inv(new_k).T
+    raw, _ = cv2.projectPoints(rays.reshape(-1, 1, 3), np.zeros(3), np.zeros(3),
+                               intrinsics.K, intrinsics.dist)
+    return raw.reshape(-1, 2)
+
+
+def _read_mode(body: bytes) -> str:
+    try:
+        return str(json.loads(body.decode("utf-8") or "{}").get("mode", ""))
+    except (ValueError, AttributeError):
+        return ""
+
+
 def _payload(record: CaptureRecord) -> dict[str, Any]:
     """What the phone needs to show, and no more."""
     out: dict[str, Any] = {
@@ -1736,6 +1993,8 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
         "detail": record.detail,
         "action": record.action,
     }
+    if record.proposal:
+        out["proposal"] = record.proposal
     report = record.report
     if not report:
         return out
