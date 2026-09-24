@@ -512,10 +512,26 @@ class RunReport:
 
     @property
     def verdict(self) -> Verdict:
+        """The measurements, plus flags that are findings about *this run*.
+
+        A flag only moves the verdict if it carries a severity saying so. Any
+        flag at all used to downgrade a clean run to REVIEW, which sounds
+        cautious and is the opposite: the hand-held caveat is attached to every
+        frame shot by hand, so every such run came back REVIEW however well it
+        measured -- "80 pass, 0 review, 0 fail" under the word REVIEW. A signal
+        that is always on carries nothing, and it trains people to skip the one
+        that matters.
+
+        Notes still travel with the report, they just do not pretend to be
+        results.
+        """
         v = Verdict.worst([r.verdict for r in self.results])
         if any(f.get("severity") == "fail" for f in self.flags):
             return Verdict.FAIL
-        if v is Verdict.PASS and (self.flags or self.residual_findings):
+        if v is Verdict.PASS and (
+            any(f.get("severity") == "review" for f in self.flags)
+            or self.residual_findings
+        ):
             return Verdict.REVIEW
         return v
 

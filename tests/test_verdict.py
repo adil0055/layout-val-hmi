@@ -82,3 +82,50 @@ def test_worst_verdict_aggregation():
     assert Verdict.worst([Verdict.PASS, Verdict.REVIEW]) is Verdict.REVIEW
     assert Verdict.worst([Verdict.REVIEW, Verdict.FAIL]) is Verdict.FAIL
     assert Verdict.worst([]) is Verdict.PASS
+
+
+def test_a_note_does_not_turn_a_clean_run_into_review():
+    """A caveat about the method is not a finding about the run.
+
+    Every flag used to downgrade a passing run to REVIEW. The hand-held caveat
+    is attached to every frame shot by hand, so every hand-held run came back
+    REVIEW however well it measured -- "80 pass, 0 review, 0 fail" printed
+    under the word REVIEW. A signal that is always on carries nothing, and it
+    teaches people to ignore the one that matters.
+    """
+    from layoutval.types import ElementResult, Measurement, RunReport, Tolerance
+
+    def passing(name):
+        return ElementResult(
+            element_id=name, verdict=Verdict.PASS, reason=None,
+            measurement=Measurement(element_id=name, dx=0.0, dy=0.0, zncc=0.99),
+            tolerance=Tolerance(), source="auto",
+        )
+
+    report = RunReport(screen="s", theme="day")
+    report.results = [passing("a"), passing("b")]
+    assert report.verdict is Verdict.PASS
+
+    report.flag("pose_resolved", severity="note", detail="hand-held")
+    assert report.verdict is Verdict.PASS, "a note must not change the verdict"
+
+    # A flag that really is about this run still counts.
+    report.flag("camera_moved", severity="review", detail="the camera moved")
+    assert report.verdict is Verdict.REVIEW
+
+    # And a failing flag still fails, note or not.
+    report.flag("settling_timeout", severity="fail", detail="never settled")
+    assert report.verdict is Verdict.FAIL
+
+
+def test_an_unlabelled_flag_is_treated_as_a_note():
+    """Only an explicit severity moves the verdict, so the default is safe."""
+    from layoutval.types import ElementResult, Measurement, RunReport, Tolerance
+
+    report = RunReport(screen="s", theme="day")
+    report.results = [ElementResult(
+        element_id="a", verdict=Verdict.PASS, reason=None,
+        measurement=Measurement(element_id="a", dx=0.0, dy=0.0, zncc=0.99),
+        tolerance=Tolerance(), source="auto")]
+    report.flag("something_worth_recording", detail="no severity given")
+    assert report.verdict is Verdict.PASS

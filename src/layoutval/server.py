@@ -1250,8 +1250,12 @@ class CaptureSession:
                     detail="the camera has moved since the reference was taken",
                 )
             elif not self.fixed_camera:
+                # A note, not a finding: this is how a hand-held rig always
+                # works, so it is true of every frame and says nothing about
+                # this one. Marking it "review" made every hand-held run come
+                # back REVIEW no matter how cleanly it measured.
                 report.flag(
-                    "pose_resolved", severity="review",
+                    "pose_resolved", severity="note",
                     shift_px=round(est.magnitude_px, 2),
                     detail=(
                         "hand-held: this frame's pose was re-solved against the "
