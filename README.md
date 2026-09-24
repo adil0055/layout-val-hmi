@@ -20,19 +20,27 @@ capture ──▶ undistort ──▶ rectify ──▶ locate ──▶ score �
 ## Quick start
 
 ```bash
-layoutval go                          # tap the display's 4 corners, once
-layoutval go --auto-border            # find the border automatically instead
-layoutval go --board board.json       # a bench HMI that can draw a chessboard
+layoutval go                          # finds the display's corners itself
+layoutval go --board board.json       # also offers the cluster's own chessboard
 ```
 
 Scan the QR with a phone on the same network and follow the steps on the page:
 **Intrinsics → Calibrate → Reference → Validate**.
 
-The default asks the cluster for nothing and works in any scene: shoot the
-cluster, tap its four corners on the photo, and the taps are snapped to the
-real panel edge sub-pixel. Rough taps are fine. Once per camera position.
-`--auto-border` finds the border without the tapping, but needs a clean scene —
-a bench photograph full of rectangles is not one.
+The page has a switch for how the display is found, and it can be changed at
+any time:
+
+| mode | what you do |
+|---|---|
+| **Auto corners** (default) | shoot the cluster; four dots appear on its corners. Drag one if it is off, then confirm |
+| **Tap corners** | tap the four corners yourself |
+| **Chessboard** | the cluster draws its board (needs `--board`) |
+
+Both corner modes ask the cluster for nothing, and either way the dots are
+snapped to the real panel edge sub-pixel, so rough is fine. Switching mode
+starts calibration over — the new mode maps into a different display space — but
+keeps the lens solve. `--auto-border` keeps the older fully automatic border
+fit, which needs a clean scene.
 
 Which to use is about what the cluster can be asked to do, not which is better
 in the abstract. `--board` is the more reliable of the two on a desk, because a
@@ -89,6 +97,8 @@ FUEL_BAR              injected (+2.25,+0.00) px  measured (+2.02,-0.01) px  -> R
 | `report` | JSON, annotated overlays, JUnit. |
 | `server` | Phone capture over the local network, and the page it opens. |
 | `autoprofile` | An inventory taken from the reference frame, when there is no authored one. |
+| `displayfind` | Proposes the display's four corners from an ordinary photograph. |
+| `glare` | Subtracts reflections off the cover glass; flags what they clipped. |
 | `authoring` | Snap assistance and a segmentation-model hook — **authoring only**. |
 | `simulator` | Synthetic cluster and virtual camera, for tests and the demo. |
 
@@ -256,6 +266,29 @@ plainly: **a correction that re-solves the whole pose also absorbs a fault in
 which every element moved together.** Per-element faults survive it — the rest
 of the frame dominates the fit — but a whole-layout shift does not. Clamp the
 phone and pass `--fixed-camera`, and the pose is checked rather than re-solved.
+
+**Reflections off the glass are subtracted before anything is compared.** A
+reflection is light *added* to what the display emits, large and smooth or large
+and flat-sided, where the artwork is small strokes. A morphological opening
+estimates it, and it comes off in linear light, where light actually adds. On
+the simulator, with reflections that move between the reference and the test
+shot, a good screen went from four FAILs and two REVIEWs in six glare scenes
+to passing every scene where nothing clipped, while a 2 px fault still measured
+1.70–1.78 px (1.77 px with no glare at all).
+Two things it cannot do, and says so instead of guessing:
+
+- **a pixel the reflection clipped is gone.** An element under one comes back
+  REVIEW, `glare`, never PASS or FAIL. Learned reflection-removal models are not
+  used: they produce a plausible picture, and measuring that would be measuring
+  the model;
+- **a strong reflection on the reference** can hide an element from the
+  inventory altogether, so every result against it carries a REVIEW until the
+  reference is retaken.
+
+Cheapest fixes, in order: tilt the phone until the reflection is off the
+display, shade the screen with a hood or your body, or put a polarising filter
+on the lens and turn it until the room fades (LCD light is polarised; most
+reflected room light is not). `--keep-glare` turns the subtraction off.
 
 Two more things a phone brings with it. Its photos carry an EXIF orientation
 rather than rotated pixels, which is handled — a frame that came in on its side

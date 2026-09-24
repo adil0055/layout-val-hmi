@@ -136,10 +136,10 @@ indistinguishable from a real defect.
 
 ---
 
-## 5. Calibration: five routes to one homography
+## 5. Calibration: six routes to one homography
 
 `calibration.py` is the largest module because stage 3 decides everything
-downstream. All five routes produce a `DisplayGeometry` carrying `H`, the
+downstream. All six routes produce a `DisplayGeometry` carrying `H`, the
 `display_size`, a `method` string and a fit `residual_px`, so the report always
 records *how* the frame was rectified.
 
@@ -149,7 +149,8 @@ records *how* the frame was rectified.
 | **B** | `homography_from_charuco` | one binding frame, then nothing | board stuck to the bezel |
 | **C** | `homography_from_display_edges` | one full-white frame | fallback |
 | **D** | `homography_from_screen_content` | its framebuffer | dev/simulated HMI only |
-| **E** | `homography_from_display_aperture` | **nothing at all** | production cluster |
+| **E** | `homography_from_display_aperture` | **nothing at all** | production cluster, clean scene |
+| **F** | `homography_from_marked_corners` | **nothing at all** | any scene; the default for `layoutval go` |
 
 **Route E is the one that matters for a real cluster**, which will not draw a
 chessboard, will not hand over its framebuffer, and will not hold still on a
@@ -189,6 +190,46 @@ the active area sits behind a mask it cannot see. That offset *cancels exactly*
 between reference and validate, since both rectify through the same homography,
 so it does not affect a defect measurement. It matters only for absolute
 comparison against a design, where `inset_px` takes the mask width.
+
+### Route F, and proposing its corners
+
+Route F takes four rough corner points and snaps each side to the real panel
+edge sub-pixel. Where the points come from is a separate question with three
+answers, and the phone can switch between them at any time (§11): a person taps
+them, `displayfind.py` proposes them and a person confirms, or route A replaces
+the lot when the cluster can draw its board.
+
+`propose_display_corners` exists because the hard part of route E on a bench
+photograph is not accuracy but *which rectangle*: a laptop on a desk offers the
+screen, the window's title bar, the desktop's top bar, the lid and the keyboard,
+all with long straight edges. What it does:
+
+- **Line segments, not contours.** LSD on a CLAHE-equalised copy (the
+  equalisation took a fragmented bottom edge after an exposure change from
+  failing to 120/120), grouped into near-horizontal and near-vertical families
+  and merged collinearly.
+- **Each side is chosen on its own, innermost first, by one rule: nothing lit
+  sits on a bezel.** For a candidate side, lit marks (a white top-hat) are
+  counted in a band just beyond it -- 60% of the way to the next line outward,
+  so the band stays on the bezel and does not reach the keyboard or the desk --
+  and only between the two neighbouring sides, sampled at every pixel. A title
+  bar fails it (the clock and the window title are beyond it); the panel's edge
+  passes it. Scoring whole quadrilaterals was tried first and kept choosing lid
+  and keyboard; the brightness-polarity prior it leaned on was measured false on
+  the bench photographs.
+- **A side must cover the span between its neighbours** (at least 45%), so a
+  short stray segment cannot stand in for an edge.
+- **The winner is refitted at full resolution**, allowed to move at most 0.5% of
+  the diagonal, and the proposal says whether it is `confident`.
+
+Measured on the two bench photographs under 120 random warps -- perspective,
+rotation, exposure -- it found the screen every time, and was never confidently
+wrong. It proposes on the undistorted frame and maps the dots back into the
+photograph's own pixels: proposed on the raw photograph instead, lens distortion
+bowed the edges and the corners landed 29-34 px off, far enough for route F's
+snap to refuse them. Accepted unchanged, the proposal now snaps to within
+0.03 px of route E's border fit. It is deterministic line geometry and sits on
+the measurement path under the same no-learned-models test as everything else.
 
 ### Drift
 
@@ -343,10 +384,68 @@ Actions, in the order a rig needs them:
 | action | what it does |
 |---|---|
 | `intrinsics` | accumulate views of a lens board; solve when there are enough |
-| `calibrate` | solve display-to-camera by the configured route |
+| `propose` | find the display's corners and send them back as dots; changes nothing |
+| `corners` | calibrate from four corners, tapped or confirmed (route F) |
+| `calibrate` | solve display-to-camera from the cluster's chessboard (route A) |
 | `rebind` | re-tie a bezel board to the active area after the camera moves |
 | `reference` | rectify and keep as the golden reference |
 | `validate` | measure against that reference and answer |
+
+**Modes.** `POST /mode` switches between `auto` (proposed corners), `manual`
+(tapped corners) and `chessboard`, live. The corner modes map into the screen's
+full resolution and the chessboard into the board's canvas, so a switch is a
+different display space: it starts calibration over, drops the reference and a
+discovered inventory, and keeps the lens solve, which belongs to the camera.
+Choosing the mode already on is not a switch. (Left calibrated across a switch,
+the page saw no reference, moved straight on to Reference, and the chessboard
+photograph meant to calibrate became the reference.) The chessboard mode is
+refused without `--board`: guessing a board is how a smaller grid solves at the
+wrong scale.
+
+**Glare.** Every reference/test pair is de-glared before it is compared
+(`glare.py`). A reflection off the cover glass is light added to what the display
+emits, and a single photograph cannot say which is which -- but it can say what
+is *large*: a reflection is a smooth hill or a flat-sided window, the artwork is
+strokes. So:
+
+- **Estimate** the large-scale light with a morphological opening (the
+  rolling-ball background of shading correction), a square a tenth of the
+  frame's short side. It keeps a window frame's hard edges and square corners
+  exactly. A median filter was tried first; it rounded the corners and, once
+  smoothed, softened the edges, leaving rims 50-70 levels high straight through
+  the elements they crossed. For a day theme (dark artwork on light), a closing
+  instead; the polarity is decided once, on the reference.
+- **Subtract pairwise, in linear light.** Each frame loses the large-scale light
+  the other lacks, and both are left on the dimmer of the two. Light adds in
+  linear units, so that is where it comes off; in encoded values a reflection
+  lifts black a long way and white hardly at all. One floor per frame was tried
+  first and could not bring back down anything darker than the floor. A
+  reflection in the same place in both frames stays in both, where it cancels.
+- **Align on de-glared frames too.** The hand-held pose re-solve matches
+  brightness, and with the camera perfectly still a moved reflection was read
+  as 0.5-11 px of camera motion, dragging every element with it.
+- **Refuse what cannot be recovered.** A clipped pixel held something between
+  "a bit less than white" and white; once the reflection on it passes 0.3 in
+  linear units that range reaches below 217 of 255, and an element with more
+  than 2% of its box like that is REVIEW, `glare`. (At 0.03 an unchanged bench
+  photograph came back 69 elements REVIEW -- white digits under a faint
+  reflection, which are white whatever it does.) A strong reflection on the
+  *reference* can wash an element out of the inventory entirely, where no
+  per-element flag can reach it, so it puts a REVIEW on every result until the
+  reference is retaken. Residual-check findings that sit on a subtracted
+  reflection become a note: the reflection's photon noise stays behind after its
+  light is removed.
+
+Measured through the whole capture session, hand-held, reflections moving
+between the two shots: without it, four FAILs and two REVIEWs on a good screen
+across six glare scenes; with it, a PASS in every scene where nothing clipped,
+and a 2 px fault measured 1.70-1.78 px against 1.77 px with no glare. On the two
+bench photographs, validated against themselves and against copies with
+reflections added, it changes nothing that was right and passes everything that
+was not. A 5-megapixel pair costs 0.2-0.5 s. Learned single-image reflection
+removal was considered and rejected for the measurement path: it returns a
+plausible image, and a measurement of a plausible image is a measurement of the
+model. `--keep-glare` turns all of this off.
 
 Design notes worth knowing:
 
@@ -385,7 +484,12 @@ way to know whether a measurement chain reports the right number.
 
 It deliberately reproduces the artefacts specific to photographing a display:
 perspective and lens distortion, backlight PWM banding whose phase advances per
-frame, defocus, thermal drift, shot noise and 8-bit quantisation.
+frame, defocus, thermal drift, shot noise and 8-bit quantisation -- and
+reflections off the cover glass (`Reflection`), which are added in linear light
+and after the PWM banding, because the room's light shares neither the
+display's encoding nor its backlight. (Added before the banding at first, a
+reflection came out striped, and the glare correction was being tuned against
+stripes no room produces.)
 `BezelPanel`/`BezelRig` add a display set into a trim that can carry a ChArUco
 board, which is what makes routes B and E testable at all.
 
@@ -432,7 +536,9 @@ src/layoutval/
 ├── types.py          core data model; every geometric quantity in display px
 ├── pipeline.py       the six stages, wired
 ├── capture.py        stage 1: frames, median stacking, settling detection
-├── calibration.py    stages 2–3: intrinsics, five homography routes, drift
+├── calibration.py    stages 2–3: intrinsics, six homography routes, drift
+├── displayfind.py    proposes the display's corners from an ordinary photograph
+├── glare.py          reflections off the glass: subtracted, or flagged
 ├── measure.py        stage 4: estimators, per-kind measurement, guards
 ├── verdict.py        stage 5: ordered rules → verdict + reason
 ├── report.py         stage 6: JSON records and annotated overlays
@@ -485,3 +591,12 @@ Stated plainly, because the alternative is someone discovering them later:
   already extracted, but it is not built.
 - **Colour and symbol validation are thinner than geometry.** The HSV mask
   machinery exists for telltales but is not developed into a full colour check.
+- **Glare is handled one photograph at a time.** A compact, strong reflection
+  (a lamp, not a window) is only partly subtracted: the opening cannot follow
+  the top of a hill much narrower than its square, and leaves the top of it
+  behind. Anything that large also treats as background a filled element wider
+  than a tenth of the frame -- in both frames alike, so it cancels, but its
+  interior is not measured. The strongest remedy for both is not built: several
+  photographs from slightly different places, aligned in display space, and the
+  darkest value each pixel takes across them -- reflections move with the camera
+  and the content does not, and a reflection only ever adds light.

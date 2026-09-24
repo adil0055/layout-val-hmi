@@ -542,6 +542,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         mark_corners=args.mark_corners,
         calib_mode=getattr(args, "calib_mode", ""),
         board_display_size=board_canvas,
+        deglare=not getattr(args, "keep_glare", False),
         lens_board=lens_board,
         display_inset_px=tuple(args.display_inset),
     )
@@ -733,6 +734,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--port", type=int, default=8000)
     c.add_argument("--quiet", action="store_true")
     c.add_argument("--no-qr", action="store_true")
+    c.add_argument("--keep-glare", action="store_true",
+                   help="measure photographs as taken, without subtracting "
+                        "reflections off the glass")
     c.set_defaults(func=cmd_go)
 
     c = sub.add_parser(
@@ -797,6 +801,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--values", help="JSON of signal values for moving elements")
     c.add_argument("--fixed-camera", action="store_true",
                    help="the camera is mounted: check its pose but do not re-solve it")
+    c.add_argument("--keep-glare", action="store_true",
+                   help="measure photographs as taken, without subtracting "
+                        "reflections off the glass")
     c.add_argument("--drift-alarm-px", type=float, default=2.0)
     c.add_argument("--quiet", action="store_true")
     c.add_argument("--no-qr", action="store_true",

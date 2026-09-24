@@ -315,6 +315,41 @@ def _distortion_map(K: np.ndarray, dist: np.ndarray, size: tuple[int, int]) -> t
 
 
 @dataclass
+class Reflection:
+    """Something bright in the room, reflected in the cluster's cover glass.
+
+    Laid over the camera frame rather than drawn on the display, because that
+    is where it lives: it belongs to the room and the glass, so when the camera
+    moves it moves across the display's content instead of with it. Positions
+    and sizes are fractions of the sensor.
+    """
+
+    centre: tuple[float, float] = (0.5, 0.5)
+    size: tuple[float, float] = (0.2, 0.2)
+    strength: float = 60.0
+    """Grey levels it lifts a black pixel to at its centre. It adds in linear
+    light, so it lifts bright content far less. Strong enough and pixels clip --
+    and a clipped pixel carries no information about what is under it."""
+
+    softness: float = 0.0
+    """Blur of the reflection's edges, in pixels. 0 gives a soft Gaussian blob
+    -- an out-of-focus window; a few pixels gives a lamp or a window frame,
+    with edges sharp enough to look like content."""
+
+    def image(self, shape: tuple[int, int]) -> np.ndarray:
+        h, w = shape
+        cx, cy = self.centre[0] * w, self.centre[1] * h
+        sx, sy = self.size[0] * w / 2, self.size[1] * h / 2
+        if self.softness <= 0:
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            return self.strength * np.exp(-(((xx - cx) / sx) ** 2 + ((yy - cy) / sy) ** 2))
+        out = np.zeros((h, w), np.float32)
+        cv2.rectangle(out, (int(cx - sx), int(cy - sy)), (int(cx + sx), int(cy + sy)),
+                      float(self.strength), -1)
+        return cv2.GaussianBlur(out, (0, 0), self.softness)
+
+
+@dataclass
 class VirtualCamera:
     """Turns a framebuffer into something that looks like a photograph of one."""
 
@@ -340,6 +375,9 @@ class VirtualCamera:
     drift tracker and its alarm."""
 
     seed: int = 0
+
+    glare: list[Reflection] = field(default_factory=list)
+    """Reflections in the cover glass. Empty by default."""
 
     def __post_init__(self) -> None:
         dw, dh = self.display_size
@@ -402,6 +440,19 @@ class VirtualCamera:
                 2 * np.pi * (rows / self.pwm_period_px + phase)
             )
             img *= band[:, None, None]
+
+        if self.glare:
+            # Added in linear light, because that is where light adds: a lamp's
+            # reflection lifts a black pixel a long way and a white one hardly
+            # at all, which squeezes the content's contrast under it rather than
+            # just offsetting it. Adding in encoded values would make glare a
+            # pure offset -- the one kind every correlator already ignores.
+            # After the flicker banding: that is the backlight's PWM, and the
+            # room's light does not share it.
+            linear = (np.clip(img, 0, 255) / 255.0) ** 2.2
+            for reflection in self.glare:
+                linear += (reflection.image((sh, sw)) / 255.0)[..., None] ** 2.2
+            img = 255.0 * np.clip(linear, 0, None) ** (1 / 2.2)
 
         if self.noise_sigma > 0:
             img += self._rng.normal(0.0, self.noise_sigma, img.shape).astype(np.float32)

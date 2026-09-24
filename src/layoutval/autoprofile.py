@@ -105,6 +105,12 @@ def segment_reference(
             area = int(stats[i, cv2.CC_STAT_AREA])
             if not (min_area_px <= area <= ceiling):
                 continue
+            # A hairline -- a box outline 223 px long and 2 high, on a bench
+            # photograph -- has the area and none of the height: its template
+            # would be under the 3 px the correlator needs, and it came back
+            # as a measurement error on a frame compared with itself.
+            if min(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]) < 3:
+                continue
             found.append((
                 int(stats[i, cv2.CC_STAT_LEFT]),
                 int(stats[i, cv2.CC_STAT_TOP]),

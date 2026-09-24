@@ -65,6 +65,34 @@ Rigid mount, ideally not sharing a bench with anything that moves. Enclose the
 rig or use a polarising filter — the display is emissive, so ambient light
 contributes nothing but reflections off the cover glass.
 
+### Glare
+
+A reflection is room light added on top of what the display emits. What can be
+done about it, cheapest first:
+
+1. **Move the reflection off the display.** Tilt the camera a few degrees; a
+   reflection moves across the glass as the camera does and the content does not.
+2. **Block it at the source.** A hood from lens to bezel — black card, a cone of
+   black foam, a dark cloth — is the only fix that works for every reflection,
+   and it is what production inspection cells do.
+3. **A polarising filter on the lens.** LCDs, and most OLEDs, emit linearly
+   polarised light (commonly at 45°, so polarised sunglasses still work), while
+   light reflected off the glass is at most partly polarised. Turn the filter
+   until the display is brightest: the display loses little and the room at
+   least half, and near the glass's Brewster angle (about 56° off-normal)
+   nearly all of it. A phone clip-on circular polariser works; it acts as a
+   linear one here.
+
+What the software does about the rest (`glare.py`,
+[architecture §11](architecture.md#11-the-capture-server)): large-scale light is
+estimated with a morphological opening and subtracted in linear light, from each
+photograph against the other. That removes a reflection completely wherever
+nothing clipped. Where a reflection did clip, the content under it is gone —
+for this code and for any other; the learned reflection-removal models of
+2024–2026 return a *plausible* picture, which is not a measurement — so an
+element there is reported REVIEW, `glare`, and a strong reflection on the
+reference puts a REVIEW on every result until the reference is retaken.
+
 Allow 10–15 minutes of warm-up before a run: both the display and the camera body
 expand as they heat, and that shows up as a slow drift of a pixel or two. This is
 why the repeatability study spreads its frames over ~30 minutes rather than

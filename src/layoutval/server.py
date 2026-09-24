@@ -64,6 +64,7 @@ import cv2
 import numpy as np
 
 from layoutval.autoprofile import profile_from_reference
+from layoutval import glare
 from layoutval.displayfind import propose_display_corners
 from layoutval.calibration import (
     Calibration,
@@ -345,8 +346,19 @@ class CaptureSession:
         display_inset_px: tuple[float, float] = (0.0, 0.0),
         calib_mode: str = "",
         board_display_size: tuple[int, int] | None = None,
+        deglare: bool = True,
     ) -> None:
         self.lock = threading.Lock()
+        #: Subtract reflections off the cover glass before measuring, and hold
+        #: back a verdict on anything they clipped. See :mod:`layoutval.glare`.
+        self.deglare = deglare
+        self.glare_bright: bool | None = None
+        #: Where a strong reflection lay on the reference. The reference decides
+        #: what is measured -- the inventory is found in it and every template
+        #: is cut from it -- and a reflection in the same place in every later
+        #: frame is invisible to a comparison of two frames, so this is kept
+        #: from the reference itself.
+        self.reference_glare: np.ndarray | None = None
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.profile = profile
@@ -470,6 +482,7 @@ class CaptureSession:
                     drift_alarm_px=self.drift_alarm_px)
                 self.reference = None
                 self.reference_camera = None
+                self.reference_glare = None
                 if self._profile_is_auto:
                     self.profile = None
                     self._profile_is_auto = False
@@ -833,6 +846,7 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
+        self.reference_glare = None
 
     def _note_sampling_ratio(self, rec: CaptureRecord, geometry: Any) -> None:
         ratio = geometry.sampling_ratio()
@@ -1051,6 +1065,7 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
+        self.reference_glare = None
         return rec
 
     def _propose(self, frame: np.ndarray, base: str) -> CaptureRecord:
@@ -1227,6 +1242,7 @@ class CaptureSession:
             )
         self.reference = None
         self.reference_camera = None
+        self.reference_glare = None
         return rec
 
     def _why_no_board(self, frame: np.ndarray, saved_as: str) -> str:
@@ -1282,13 +1298,27 @@ class CaptureSession:
             f"rectified to {self.reference.shape[1]}x{self.reference.shape[0]} "
             "display px and kept as the reference"
         )
+        # Elements are found on the frame with its reflections taken off, or a
+        # reflection's edge is found as an element and its hill merges real ones.
+        segment_from = self.reference
+        self.reference_glare = None
+        if self.deglare and self.reference.ndim == 3:
+            self.glare_bright = glare.bright_on_dark(self.reference)
+            segment_from, excess = glare.flatten(self.reference, bright=self.glare_bright)
+            self.reference_glare = excess > glare.EXCESS_MIN
+            if glare.reference_is_hit(self.reference_glare):
+                rec.detail += (
+                    f". A strong reflection covers {100 * self.reference_glare.mean():.1f}% "
+                    "of it, and what is under it may not be found or measured. Move "
+                    "the camera or shade the screen and take the reference again"
+                )
 
         # With no authored inventory, take one from the frame itself rather than
         # having nothing to measure. Only ever replaces an inventory this made
         # earlier -- an authored profile is the better answer and is left alone.
         if self.auto_profile and (self.profile is None or self._profile_is_auto):
             found = profile_from_reference(
-                self.reference,
+                segment_from,
                 screen=self.profile.screen if self.profile else "auto",
                 display_size=self.display_size,
             )
@@ -1329,8 +1359,19 @@ class CaptureSession:
         tracker = None
         if self.reference_camera is not None:
             h, w = undistorted.shape[:2]
+            ref_view, live_view = self.reference_camera, undistorted
+            if self.deglare and undistorted.ndim == 3 and \
+                    self.reference_camera.shape == undistorted.shape:
+                seen = glare.deglare_pair(self.reference_camera, undistorted,
+                                          bright=self.glare_bright)
+                ref_view, live_view = seen.reference, seen.live
+            # Lined up on the frames with their reflections taken out. ECC
+            # matches brightness, and a reflection that moved between the two
+            # shots is a brightness change it explains as the camera moving:
+            # with the camera still, glare alone was read as 0.5-11 px of
+            # motion, which then dragged every element with it.
             tracker = DriftTracker(
-                self.reference_camera,
+                ref_view,
                 (0, 0, w, h),
                 alarm_px=self.drift_alarm_px,
                 motion=(cv2.MOTION_EUCLIDEAN if self.fixed_camera
@@ -1347,7 +1388,7 @@ class CaptureSession:
 
         H = self.calibration.geometry.H
         if tracker is not None:
-            est = tracker.measure(undistorted)
+            est = tracker.measure(live_view)
             report.metadata["pose_shift_px"] = round(est.magnitude_px, 2)
             if not est.converged:
                 rec.verdict = "FAILED"
@@ -1380,9 +1421,36 @@ class CaptureSession:
 
         live = self.calibration.geometry.rectify(undistorted, H)
         self._store(f"{base}-rectified.png", live)
+        pair = None
+        if self.deglare and live.ndim == 3 and live.shape == self.reference.shape:
+            pair = glare.deglare_pair(self.reference, live, bright=self.glare_bright)
         report = pipeline.measure_frame(
-            live, values=self.values, reference=self.reference, report=report
+            pair.live if pair else live, values=self.values,
+            reference=pair.reference if pair else self.reference, report=report,
         )
+        if pair is not None:
+            clipped = pair.clipped
+            if self.reference_glare is not None and self.reference_glare.shape == clipped.shape:
+                clipped = clipped | self.reference_glare
+                if glare.reference_is_hit(self.reference_glare):
+                    report.flag(
+                        "reference_glare", severity="review",
+                        area_pct=round(100 * float(self.reference_glare.mean()), 2),
+                        detail=(
+                            "a strong reflection lay on part of the reference, so "
+                            "what is under it may not be checked. Retake the "
+                            "reference without it."
+                        ),
+                    )
+            glare.mark_unmeasurable(report, self.profile, clipped, values=self.values)
+            glare.set_aside_residual(report, pair.footprint)
+            if pair.subtracted >= 20:
+                report.flag(
+                    "glare_subtracted", severity="note",
+                    peak_levels=pair.subtracted,
+                    area_pct=round(100 * float(pair.footprint.mean()), 1),
+                    detail="a reflection on the glass was measured and subtracted",
+                )
 
         overlay = annotate(live, report, self.profile, values=self.values)
         self._store(f"{base}-overlay.png", overlay)
@@ -1998,7 +2066,12 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
     report = record.report
     if not report:
         return out
-    out["flags"] = [f.get("detail") or f.get("flag", "") for f in report.get("flags", [])]
+    # Findings only. A note -- the hand-held caveat, a reflection that was
+    # subtracted cleanly -- is true of the run rather than a problem with it,
+    # and a yellow box under PASS reads as "something is wrong". Notes stay in
+    # the saved report.
+    out["flags"] = [f.get("detail") or f.get("flag", "") for f in report.get("flags", [])
+                    if f.get("severity") != "note"]
     rows = []
     for element in report.get("elements", []):
         if element["verdict"] == "PASS":
@@ -2007,8 +2080,10 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
         delta = m.get("abs_delta")
         reason = element["reason"] or ""
         # No distance for an element that was not drawn: there is nothing for it
-        # to be a distance from, and a number there reads as a near miss.
-        show_delta = delta is not None and not m.get("element_absent")
+        # to be a distance from, and a number there reads as a near miss. Nor for
+        # one under glare: it was measured on pixels that say nothing.
+        show_delta = (delta is not None and not m.get("element_absent")
+                      and reason != glare.GLARE)
         rows.append({
             "id": element["element_id"],
             "verdict": element["verdict"],

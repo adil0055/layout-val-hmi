@@ -21,6 +21,7 @@ MEASUREMENT_PATH = [
     "pipeline.py",
     "calibration.py",
     "displayfind.py",
+    "glare.py",
     "capture.py",
     "residual.py",
     "repeatability.py",
