@@ -65,6 +65,7 @@ import numpy as np
 
 from layoutval.autoprofile import profile_from_reference
 from layoutval import glare
+from layoutval.blur import match_shake
 from layoutval.displayfind import propose_display_corners
 from layoutval.calibration import (
     Calibration,
@@ -1453,15 +1454,24 @@ class CaptureSession:
         pair = None
         if self.deglare and live.ndim == 3 and live.shape == self.reference.shape:
             pair = glare.deglare_pair(self.reference, live, bright=self.glare_bright)
+        ref_m, live_m = (pair.reference, pair.live) if pair else (self.reference, live)
+        # A photo smeared by the hand moving during the exposure is compared
+        # with the reference smeared the same way. See layoutval.blur.
+        shake = match_shake(ref_m, live_m)
+        ref_m, live_m = shake.reference, shake.live
+        if shake.kernel is not None:
+            report.flag("shake_matched", severity="note", blurred=shake.applied_to,
+                        spread_px=round(shake.spread_px, 2),
+                        detail="one photo was smeared by camera shake; the other was "
+                               "blurred to match before comparing")
         report = pipeline.measure_frame(
-            pair.live if pair else live, values=self.values,
-            reference=pair.reference if pair else self.reference, report=report,
+            live_m, values=self.values, reference=ref_m, report=report,
         )
         if pair is not None:
             # Glare is taken out, never reported on: it is the room, not the
             # display, and a verdict is about the display. What was subtracted
             # is kept in the saved report as a note.
-            glare.recheck_under_glare(report, self.profile, pair.reference, pair.live,
+            glare.recheck_under_glare(report, self.profile, ref_m, live_m,
                                       pair.footprint, pair.clipped, values=self.values)
             glare.set_aside_residual(report, pair.footprint)
             if pair.subtracted >= 20:
@@ -2104,6 +2114,14 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
     # the saved report.
     out["flags"] = [f.get("detail") or f.get("flag", "") for f in report.get("flags", [])
                     if f.get("severity") != "note"]
+    found = report.get("residual", {}).get("findings", [])
+    if found:
+        # The one thing that makes a run REVIEW with every element passing, so
+        # it is said, not left for somebody to wonder about.
+        out["flags"].append(
+            f"{len(found)} area(s) look clearly different from the reference in a "
+            "way the element checks did not explain -- something drawn, moved or "
+            "gone. They are boxed in yellow on the overlay.")
     rows = []
     for element in report.get("elements", []):
         if element["verdict"] == "PASS":

@@ -22,6 +22,7 @@ MEASUREMENT_PATH = [
     "calibration.py",
     "displayfind.py",
     "glare.py",
+    "blur.py",
     "capture.py",
     "residual.py",
     "repeatability.py",

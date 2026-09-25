@@ -50,6 +50,7 @@ def residual_check(
     min_area_px: int = 64,
     blur_sigma: float = 1.0,
     max_findings: int = 20,
+    min_difference: float = 40.0,
 ) -> tuple[float, list[ResidualFinding]]:
     """SSIM residual over the whole rectified frame.
 
@@ -61,6 +62,15 @@ def residual_check(
     A light blur is applied first: it suppresses the single-pixel disagreement
     that camera resampling always produces, without touching the
     tens-of-pixels-wide artefacts this check exists to find.
+
+    **A region must also have changed by ``min_difference`` grey levels.** SSIM
+    compares texture relative to contrast, so on a dark, flat part of the screen
+    it scores the faintest disagreement as total: the moire of the panel's pixel
+    grid, the noise under a subtracted reflection, what is left of a smear once
+    the two photos have been blurred to match. Two photographs of one screen,
+    both passing on all 80 elements, came back REVIEW for it. Something drawn or
+    erased changes the brightness by a hundred levels or more; those changes are
+    a few to a few tens.
     """
     ref = to_gray(reference).astype(np.float32)
     lv = to_gray(live).astype(np.float32)
@@ -84,7 +94,11 @@ def residual_check(
         if area < min_area_px:
             continue
         x, y, w, h = (int(stats[i, k]) for k in range(4))
-        region = dissim[y : y + h, x : x + w][labels[y : y + h, x : x + w] == i]
+        inside = labels[y : y + h, x : x + w] == i
+        region = dissim[y : y + h, x : x + w][inside]
+        change = float(np.percentile(np.abs(ref[y : y + h, x : x + w] - lv[y : y + h, x : x + w])[inside], 90))
+        if change < min_difference:
+            continue
         overlaps = []
         for spec in specs or []:
             v = resolve_value(spec, values)
@@ -96,6 +110,7 @@ def residual_check(
                 mean_dissimilarity=float(region.mean()),
                 area_px=area,
                 overlaps=overlaps,
+                difference=round(change, 1),
             )
         )
 

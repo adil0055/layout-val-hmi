@@ -144,3 +144,22 @@ def test_z_order_assertion_says_so_when_the_boxes_do_not_overlap():
     results = check_occlusions(ref, ref.copy(), specs)
     assert results[0].verdict is Verdict.REVIEW
     assert results[0].reason == "occlusion_not_applicable"
+
+
+def test_a_faint_texture_difference_is_not_a_finding():
+    """On a dark flat ground SSIM calls any texture change total; it is not a change."""
+    from layoutval.residual import residual_check
+
+    rng = np.random.default_rng(0)
+    ref = np.full((300, 400, 3), 16, np.uint8)
+    live = ref.copy()
+    # Moire-like ripple, a dozen levels deep: what re-photographing a panel does.
+    yy, xx = np.mgrid[0:300, 0:400]
+    ripple = (6 * np.sin(xx / 3.1) * np.sin(yy / 2.7)).astype(np.float32)
+    live = np.clip(live + ripple[..., None] + rng.normal(0, 2, live.shape), 0, 255).astype(np.uint8)
+    _, faint = residual_check(ref, live)
+    assert faint == []
+    cv2.rectangle(live, (200, 120), (246, 142), (230, 230, 230), -1)   # something new drawn
+    _, found = residual_check(ref, live)
+    assert found and any(abs(f.bbox[0] - 200) < 8 for f in found)
+    assert all(f.difference >= 40 for f in found)

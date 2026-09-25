@@ -486,6 +486,9 @@ class ResidualFinding:
     mean_dissimilarity: float
     area_px: int
     overlaps: list[str] = field(default_factory=list)
+    difference: float = 0.0
+    """How far the brightness actually changed there: the 90th percentile of the
+    absolute difference, in grey levels."""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

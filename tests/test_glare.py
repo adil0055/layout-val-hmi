@@ -193,3 +193,13 @@ def test_the_phone_shows_findings_not_notes(tmp_path):
                             {"flag": "glare", "severity": "review", "detail": "a reflection"},
                         ], "elements": []})
     assert _payload(rec)["flags"] == ["a reflection"]
+
+
+def test_the_phone_says_why_a_run_with_every_element_passing_is_review():
+    """80 pass, 0 review, 0 fail under the word REVIEW, and nothing saying why."""
+    from layoutval.server import CaptureRecord
+
+    rec = CaptureRecord(name="x.jpg", action="validate", when="now", verdict="REVIEW",
+                        report={"flags": [], "elements": [],
+                                "residual": {"findings": [{"bbox": [1, 2, 3, 4]}]}})
+    assert any("boxed in yellow" in f for f in _payload(rec)["flags"])

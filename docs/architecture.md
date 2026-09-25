@@ -373,7 +373,17 @@ element nobody taught, the wrong z-order.
 **Advisory, always.** Pixel-level comparison of camera captures is noisy enough
 that a hard threshold either fires constantly or is set so loose it catches
 nothing. Its job is to surface things a per-element measurement passes cleanly,
-for a human to look at.
+for a human to look at. A finding makes a run with every element passing
+REVIEW, and the phone says so in words and boxes it on the overlay.
+
+**It has to be a real change.** SSIM compares texture relative to contrast, so
+on a dark flat part of a screen it scores the faintest disagreement as total:
+the moire of the panel's pixel grid, the noise left where a reflection was
+subtracted, what remains of a smear once two photos are blurred to match. Two
+photographs of one screen came back "80 pass, 0 review, 0 fail" under the word
+REVIEW for it. A region is now a finding only if the brightness there changed
+by 40 grey levels or more (the 90th percentile of the difference); something
+drawn or erased changes it by a hundred or more, those by a few to a few tens.
 
 ---
 
@@ -474,6 +484,23 @@ was not. A 5-megapixel pair costs 0.2-0.5 s. Learned single-image reflection
 removal was considered and rejected for the measurement path: it returns a
 plausible image, and a measurement of a plausible image is a measurement of the
 model. `--keep-glare` turns all of this off.
+
+**Camera shake.** Moving the phone *between* shots is the pose re-solve's job;
+blur *within* a shot is `blur.py`'s. The two aligned, de-glared frames are
+related, to a good approximation, by one convolution, and with the sharp one
+known the kernel is a regularised Fourier division (a Wiener estimate), cut to
+a 20 px radius, cleaned of negative lobes and isolated specks, and normalised.
+Both directions are tried, since either photo can be the shaken one; the
+kernel is applied to the sharper photo only if it brings the two at least 10%
+closer, and only after being re-centred on its own centroid, so it changes how
+sharp an element looks and never where it is. It is one kernel for the whole
+frame, fitted to every element at once, so an element that moved does not move
+it. Measured: a 6 px streak had put up to 19 elements of a good screen at FAIL
+and a 12 px one most of them; both now pass on both bench photographs, and a
+2 px fault under a 12 px streak measured 1.56-1.77 px against 1.77 unshaken. At
+20 px the shake is no longer one kernel across the frame -- perspective scales it
+differently from one side of the display to the other -- and a few elements
+read 1.5-2.7 px off.
 
 **Full-resolution phone photographs.** A current iPhone shoots 24 MP. Two
 steps were sized for smaller frames and, at 24 MP, ran long enough for the
@@ -581,7 +608,8 @@ src/layoutval/
 ├── capture.py        stage 1: frames, median stacking, settling detection
 ├── calibration.py    stages 2–3: intrinsics, six homography routes, drift
 ├── displayfind.py    proposes the display's corners from an ordinary photograph
-├── glare.py          reflections off the glass: subtracted, or flagged
+├── glare.py          reflections off the glass, subtracted
+├── blur.py           camera shake, matched between the two photos
 ├── measure.py        stage 4: estimators, per-kind measurement, guards
 ├── verdict.py        stage 5: ordered rules → verdict + reason
 ├── report.py         stage 6: JSON records and annotated overlays

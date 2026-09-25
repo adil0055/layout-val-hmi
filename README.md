@@ -99,6 +99,7 @@ FUEL_BAR              injected (+2.25,+0.00) px  measured (+2.02,-0.01) px  -> R
 | `autoprofile` | An inventory taken from the reference frame, when there is no authored one. |
 | `displayfind` | Proposes the display's four corners from an ordinary photograph. |
 | `glare` | Subtracts reflections off the cover glass before anything is compared. |
+| `blur` | Matches camera shake: blurs the sharper photo by the smear worked out between the two. |
 | `authoring` | Snap assistance and a segmentation-model hook — **authoring only**. |
 | `simulator` | Synthetic cluster and virtual camera, for tests and the demo. |
 
@@ -288,6 +289,15 @@ Cheapest fixes for that, in order: tilt the phone until the reflection is off
 the display, shade the screen with a hood or your body, or put a polarising
 filter on the lens and turn it until the room fades (LCD light is polarised;
 most reflected room light is not). `--keep-glare` turns the subtraction off.
+
+**Camera shake is matched, not refused.** A hand moving while the shutter is
+open smears the photo, and a sharp reference against a smeared test shot read
+as wrong content: a 6 px streak put up to 19 elements of a good screen at FAIL,
+a 12 px streak most of them. The smear is now worked out from the two photos
+themselves and the sharper one blurred to match; the kernel is re-centred first,
+so it can blur an element but never move one. Streaks up to 12 px pass cleanly
+and a 2 px fault under them still measures 1.56–1.77 px. A 20 px streak, a
+visibly blurred photo, can leave a few elements marginal: retake it.
 
 Two more things a phone brings with it. Its photos carry an EXIF orientation
 rather than rotated pixels, which is handled — a frame that came in on its side
