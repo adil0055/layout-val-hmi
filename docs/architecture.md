@@ -447,6 +447,21 @@ removal was considered and rejected for the measurement path: it returns a
 plausible image, and a measurement of a plausible image is a measurement of the
 model. `--keep-glare` turns all of this off.
 
+**Full-resolution phone photographs.** A current iPhone shoots 24 MP. Two
+steps were sized for smaller frames and, at 24 MP, ran long enough for the
+phone to give up on the request, which Safari reports only as "Load failed":
+the hand-held pose re-solve took 31-46 s and 3.4 GB whenever the phone had
+moved between shots, and the chessboard search 12-18 s. The pose is now solved
+on a copy no longer than 2000 px and conjugated back to full resolution
+(3-4.5 s, under 1 GB; a 2 px fault measured 1.76-1.79 px against 1.82-1.85 at
+full size). The chessboard is now found on a copy that size and each corner
+refined on the full photograph, with a window scaled to the square: 0.7-0.9 s,
+and more accurate, not less, since the fixed 5 px window it used before was
+too small for corners that large (0.08-0.19 px rms against 0.38-0.88). The
+measurement itself still rectifies from the full photograph. The terminal
+prints a line as each photograph arrives, so a request the phone gave up on
+still shows where it got to.
+
 Design notes worth knowing:
 
 - **Intrinsics are collected as correspondences, not frames.** A phone

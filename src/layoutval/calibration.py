@@ -101,6 +101,58 @@ class Undistorter:
         return cv2.remap(img, self.map1, self.map2, cv2.INTER_CUBIC)
 
 
+#: Longest side a chessboard is searched for at. See :func:`find_chessboard`.
+DETECT_SIDE = 2000
+
+
+def find_chessboard(
+    image: np.ndarray, pattern_size: tuple[int, int]
+) -> tuple[np.ndarray, bool] | None:
+    """Inner corners of a chessboard in ``image``'s own pixels, or None.
+
+    Returns ``(corners, refined)``: ``refined`` says whether they have already
+    been refined at full resolution.
+
+    The search runs on a copy no longer than :data:`DETECT_SIDE`. On a phone's
+    24 MP photograph, ``findChessboardCornersSB`` spent 17.7 s searching --
+    11 s even to say there was no board -- which is long enough for the phone
+    to give up on the request, and "Load failed" is all it says then. Found
+    small, the corners are mapped back and each one refined on the full image
+    with a window a quarter of the square, so what comes back is as precise as
+    a full-size search, in a tenth of the time. A frame already small enough
+    is searched as it is, exactly as before.
+    """
+    gray = to_gray(image)
+    h, w = gray.shape[:2]
+    scale = min(1.0, DETECT_SIDE / max(h, w))
+    small = gray if scale == 1.0 else cv2.resize(
+        gray, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+    ok, corners = cv2.findChessboardCornersSB(
+        small, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
+    )
+    if not ok:
+        return None
+    corners = corners.reshape(-1, 2).astype(np.float64)
+    if scale == 1.0:
+        return corners.astype(np.float32), False
+    # cv2.resize maps pixel centres: x_small = (x + 0.5) * s - 0.5.
+    sx, sy = small.shape[1] / w, small.shape[0] / h
+    full = (corners + 0.5) / np.array([sx, sy]) - 0.5
+    cols, rows = pattern_size
+    grid = full.reshape(rows, cols, 2)
+    spacing = min(
+        float(np.linalg.norm(np.diff(grid, axis=1), axis=2).min()) if cols > 1 else np.inf,
+        float(np.linalg.norm(np.diff(grid, axis=0), axis=2).min()) if rows > 1 else np.inf,
+    )
+    win = int(np.clip(spacing / 4.0, 2, 30))
+    refined = cv2.cornerSubPix(
+        gray, full.astype(np.float32).reshape(-1, 1, 2), (win, win), (-1, -1),
+        (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-4),
+    )
+    return refined.reshape(-1, 2), True
+
+
+
 def board_points_for_intrinsics(
     image: np.ndarray,
     *,
@@ -126,14 +178,12 @@ def board_points_for_intrinsics(
 
     if pattern_size is None:
         raise ValueError("need either a ChArUco board or a chessboard pattern size")
-    ok, corners = cv2.findChessboardCornersSB(
-        to_gray(image), pattern_size,
-        flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY,
-    )
-    if not ok:
+    found = find_chessboard(image, pattern_size)
+    if found is None:
         raise RuntimeError(
             f"no {pattern_size[0]}x{pattern_size[1]} chessboard in this view"
         )
+    corners = found[0]
     obj = np.zeros((pattern_size[0] * pattern_size[1], 3), np.float32)
     obj[:, :2] = np.mgrid[0 : pattern_size[0], 0 : pattern_size[1]].T.reshape(-1, 2)
     obj *= square_size_mm
@@ -365,14 +415,11 @@ def calibrate_intrinsics(
 
     obj_points, img_points = [], []
     for img in images:
-        gray = to_gray(img)
-        ok, corners = cv2.findChessboardCornersSB(
-            gray, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
-        )
-        if not ok:
+        found = find_chessboard(img, pattern_size)
+        if found is None:
             continue
         obj_points.append(obj)
-        img_points.append(corners.reshape(-1, 2).astype(np.float32))
+        img_points.append(found[0].reshape(-1, 2).astype(np.float32))
 
     if len(obj_points) < min_views:
         raise RuntimeError(
@@ -568,16 +615,15 @@ def homography_from_display_pattern(
     (see :func:`chessboard_display_points`).
     """
     gray = to_gray(camera_img)
-    ok, corners = cv2.findChessboardCornersSB(
-        gray, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
-    )
-    if not ok:
+    found = find_chessboard(gray, pattern_size)
+    if found is None:
         raise RuntimeError(
             "calibration pattern not found -- check focus, exposure and that the "
             "whole board is inside the frame"
         )
+    corners, already = found
     corners = corners.astype(np.float32).reshape(-1, 1, 2)
-    if refine:
+    if refine and not already:
         corners = cv2.cornerSubPix(
             gray,
             corners,
@@ -1619,6 +1665,25 @@ class DriftEstimate:
     @property
     def exceeds(self) -> bool:  # set by DriftTracker.measure
         return getattr(self, "_exceeds", False)
+
+    def rescaled(self, scale: float) -> "DriftEstimate":
+        """This estimate, made on frames resized by ``scale``, in the originals' pixels.
+
+        ``cv2.resize`` maps pixel centres, so the resize is the affine map
+        ``x' = s*x + (s-1)/2`` rather than a pure scale, and the warp is
+        conjugated by exactly that.
+        """
+        c = 0.5 * (scale - 1.0)
+        S = np.array([[scale, 0.0, c], [0.0, scale, c], [0.0, 0.0, 1.0]])
+        out = DriftEstimate(
+            magnitude_px=self.magnitude_px / scale,
+            rotation_deg=self.rotation_deg,
+            correlation=self.correlation,
+            converged=self.converged,
+            warp_camera=np.linalg.inv(S) @ self.warp_camera @ S,
+        )
+        out._exceeds = self.exceeds  # type: ignore[attr-defined]
+        return out
 
 
 class DriftTracker:

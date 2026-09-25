@@ -96,6 +96,9 @@ from layoutval.types import RunReport, Verdict
 #: order of magnitude past that is not a photograph.
 MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
+#: Longest side the hand-held pose is solved at. See ``_validate``.
+TRACK_SIDE = 2000
+
 ACTIONS = ("intrinsics", "calibrate", "propose", "corners", "rebind",
            "reference", "validate")
 
@@ -1358,22 +1361,34 @@ class CaptureSession:
 
         tracker = None
         if self.reference_camera is not None:
-            h, w = undistorted.shape[:2]
+            # Lined up on a reduced copy. The pose is eight numbers fitted to the
+            # whole frame, and a phone's full 24 MP bought nothing for them but
+            # 13-19 s and 3.4 GB -- enough to have the laptop kill the server or
+            # the phone give up waiting. Only the alignment is reduced; the
+            # measurement still rectifies from the full photograph.
+            h0, w0 = undistorted.shape[:2]
+            scale = min(1.0, TRACK_SIDE / max(h0, w0))
             ref_view, live_view = self.reference_camera, undistorted
-            if self.deglare and undistorted.ndim == 3 and \
-                    self.reference_camera.shape == undistorted.shape:
-                seen = glare.deglare_pair(self.reference_camera, undistorted,
-                                          bright=self.glare_bright)
+            if ref_view.shape != live_view.shape:
+                scale = 1.0     # left as it was; ECC says it cannot line them up
+            if scale < 1.0:
+                size = (round(w0 * scale), round(h0 * scale))
+                ref_view = cv2.resize(ref_view, size, interpolation=cv2.INTER_AREA)
+                live_view = cv2.resize(live_view, size, interpolation=cv2.INTER_AREA)
+                scale = size[0] / w0
+            h, w = live_view.shape[:2]
+            if self.deglare and live_view.ndim == 3 and ref_view.shape == live_view.shape:
+                # And on the frames with their reflections taken out. ECC
+                # matches brightness, and a reflection that moved between the
+                # two shots is a brightness change it explains as the camera
+                # moving: with the camera still, glare alone was read as
+                # 0.5-11 px of motion, which then dragged every element with it.
+                seen = glare.deglare_pair(ref_view, live_view, bright=self.glare_bright)
                 ref_view, live_view = seen.reference, seen.live
-            # Lined up on the frames with their reflections taken out. ECC
-            # matches brightness, and a reflection that moved between the two
-            # shots is a brightness change it explains as the camera moving:
-            # with the camera still, glare alone was read as 0.5-11 px of
-            # motion, which then dragged every element with it.
             tracker = DriftTracker(
                 ref_view,
                 (0, 0, w, h),
-                alarm_px=self.drift_alarm_px,
+                alarm_px=self.drift_alarm_px * scale,
                 motion=(cv2.MOTION_EUCLIDEAN if self.fixed_camera
                         else cv2.MOTION_HOMOGRAPHY),
             )
@@ -1389,6 +1404,8 @@ class CaptureSession:
         H = self.calibration.geometry.H
         if tracker is not None:
             est = tracker.measure(live_view)
+            if scale < 1.0:
+                est = est.rescaled(scale)
             report.metadata["pose_shift_px"] = round(est.magnitude_px, 2)
             if not est.converged:
                 rec.verdict = "FAILED"
@@ -1522,7 +1539,7 @@ button.ghost#marksend:not(:disabled){background:#2F7D57;border-color:#2F7D57}
 </head>
 <body>
 <h1>Cluster capture</h1>
-<p class="sub">Point at the cluster and shoot. Measuring happens on the laptop.</p>
+<p class="sub">Point at the cluster and shoot. The computer running layoutval does the measuring.</p>
 
 <div class="modes" id="modebar" style="display:none">
   <button data-m="auto">Auto corners</button>
@@ -1618,7 +1635,7 @@ document.querySelectorAll(".modes button").forEach(b => {
         body: JSON.stringify({mode: b.dataset.m})});
       const s = await r.json();
       if (!r.ok) { show({verdict: "FAILED", detail: s.detail}); return; }
-    } catch (e) { show({verdict: "FAILED", detail: "could not reach the laptop: " + e}); }
+    } catch (e) { lost(e); }
     $("marker").style.display = "none";
     action = b.dataset.m === "chessboard" ? "calibrate" : "corners";
     await refresh(); paintSteps();
@@ -1765,7 +1782,7 @@ $("marksend").onclick = async () => {
     const r = await fetch(`/upload?t=${TOKEN}`, { method: "POST", body });
     show(await r.json());
   } catch (e) {
-    show({ verdict: "FAILED", detail: "could not reach the laptop: " + e });
+    lost(e);
   }
   $("marksend").textContent = "Use these corners";
   $("marker").style.display = "none";
@@ -1801,7 +1818,7 @@ $("shot").onchange = async ev => {
                                     : "Check these \u2014 drag any dot that's off")
           : "Couldn't find it \u2014 tap the four corners";
       } catch (e) {
-        $("marktitle").textContent = "Couldn't reach the laptop \u2014 tap the corners";
+        $("marktitle").textContent = "Couldn't reach the computer \u2014 tap the corners";
       }
       paintTaps();
     }
@@ -1817,7 +1834,7 @@ $("shot").onchange = async ev => {
     const r = await fetch(`/upload?t=${TOKEN}`, { method: "POST", body });
     show(await r.json());
   } catch (e) {
-    show({ verdict: "FAILED", detail: "could not reach the laptop: " + e });
+    lost(e);
   }
   label.textContent = "Take photo";
   label.classList.remove("busy");
@@ -1825,6 +1842,12 @@ $("shot").onchange = async ev => {
   refresh();
 };
 
+// The phone only uploads; the computer running layoutval does the work. When a
+// request dies with no answer, iPhone Safari says only "Load failed".
+function lost(e) {
+  show({verdict: "FAILED", detail: "No answer from the computer running layoutval (" + e +
+    "). Check it is still running there and the phone is on the same Wi-Fi, then try again."});
+}
 function show(res) {
   const box = $("result");
   box.style.display = "block";
@@ -1873,7 +1896,7 @@ li{{margin-bottom:8px}}p{{color:#9DADB5}}</style></head><body>
 {received}
 <p>Three things cause that:</p>
 <ul>
-<li><b>It was mistyped.</b> Scan the square the laptop printed instead of typing
+<li><b>It was mistyped.</b> Scan the square the computer printed instead of typing
     the address; that is what it is there for.</li>
 <li><b>The server was restarted.</b> The token changes every run, so an address
     from an earlier one stops working. Use the one on screen now.</li>
@@ -2010,6 +2033,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         started = time.monotonic()
+        if not self.server.quiet:  # type: ignore[attr-defined]
+            # Printed before the work, so a request the phone gave up on still
+            # shows here: nothing at all means it never arrived.
+            print(f"  {action}: photo received ({length / 2**20:.1f} MB), working...",
+                  flush=True)
         try:
             pixels = None
             if corners:
