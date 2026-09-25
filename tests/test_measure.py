@@ -149,3 +149,27 @@ def test_needle_pose_reports_when_there_is_no_hub():
 
 def test_needle_pose_returns_none_on_empty_mask():
     assert needle_pose(np.zeros((50, 50), np.uint8), (25.0, 25.0)) is None
+
+
+def test_an_element_touching_the_frame_edge_is_measured_like_any_other():
+    """Compared with itself, an element in the frame's corner came back
+    "missing or displaced" at 0.00 px: its search window, clipped by the edge,
+    began exactly where it sat."""
+    import cv2
+
+    from layoutval.measure import measure_translation
+    from layoutval.types import ElementSpec, PositionModel
+    from layoutval.verdict import verdict_for
+
+    img = np.full((400, 900, 3), 12, np.uint8)
+    cv2.ellipse(img, (0, 0), (60, 60), 0, 0, 90, (200, 200, 200), 3)
+    cv2.ellipse(img, (899, 399), (60, 60), 0, 180, 270, (200, 200, 200), 3)
+    for bbox in [(0.0, 0.0, 62.0, 62.0), (837.0, 337.0, 63.0, 63.0)]:
+        spec = ElementSpec(id="edge", bbox=bbox, position=PositionModel(origin=bbox[:2]))
+        same = measure_translation(img, img.copy(), spec)
+        assert verdict_for(same, spec.tolerance)[0].value == "PASS"
+        assert abs(same.dx) < 0.05 and abs(same.dy) < 0.05
+        shifted = cv2.warpAffine(img, np.float32([[1, 0, 2], [0, 1, 1]]), (900, 400),
+                                 borderMode=cv2.BORDER_REPLICATE)
+        moved = measure_translation(img, shifted, spec)
+        assert abs(moved.dx - 2.0) < 0.1 and abs(moved.dy - 1.0) < 0.1

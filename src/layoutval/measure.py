@@ -416,7 +416,21 @@ def measure_translation(
 
     th, tw = template.shape[:2]
     sx, sy, sw, sh = search_rect(spec, value, live.shape, anchor=(ax, ay), size=(tw, th))
-    area = crop(live, (sx, sy, sw, sh))
+    # A window the frame's edge clipped is filled back out from the edge pixels
+    # -- as the template itself is, since getRectSubPix replicates the border.
+    # Left clipped, the window started exactly where an element touching the
+    # edge sits, so its own position was on the window's border and it came
+    # back "missing or displaced" at 0.00 px, compared with itself.
+    full = (round(ax - spec.search_margin_px), round(ay - spec.search_margin_px),
+            round(tw + 2 * spec.search_margin_px), round(th + 2 * spec.search_margin_px))
+    if (sx, sy, sw, sh) != full and sw > 0 and sh > 0:
+        l, t = sx - full[0], sy - full[1]
+        r, b = full[0] + full[2] - (sx + sw), full[1] + full[3] - (sy + sh)
+        area = cv2.copyMakeBorder(crop(live, (sx, sy, sw, sh)), t, b, l, r,
+                                  cv2.BORDER_REPLICATE)
+        sx, sy, sw, sh = full
+    else:
+        area = crop(live, (sx, sy, sw, sh))
     if area.shape[0] < th or area.shape[1] < tw:
         m.error = (
             f"search area {area.shape[1]}x{area.shape[0]} is smaller than the "
