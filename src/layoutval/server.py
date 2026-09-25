@@ -78,6 +78,7 @@ from layoutval.calibration import (
     draw_aperture,
     find_display_aperture,
     chessboard_display_points,
+    find_chessboard,
     detect_charuco,
     homography_from_charuco,
     homography_from_display_aperture,
@@ -350,18 +351,16 @@ class CaptureSession:
         calib_mode: str = "",
         board_display_size: tuple[int, int] | None = None,
         deglare: bool = True,
+        board_candidates: list[dict] | None = None,
     ) -> None:
         self.lock = threading.Lock()
-        #: Subtract reflections off the cover glass before measuring, and hold
-        #: back a verdict on anything they clipped. See :mod:`layoutval.glare`.
+        #: Subtract reflections off the cover glass before measuring. Never
+        #: changes a verdict on its own. See :mod:`layoutval.glare`.
         self.deglare = deglare
         self.glare_bright: bool | None = None
-        #: Where a strong reflection lay on the reference. The reference decides
-        #: what is measured -- the inventory is found in it and every template
-        #: is cut from it -- and a reflection in the same place in every later
-        #: frame is invisible to a comparison of two frames, so this is kept
-        #: from the reference itself.
-        self.reference_glare: np.ndarray | None = None
+        #: Boards the cluster may be drawing, when no board file was given: the
+        #: grid found in the photograph says which (see ``hmi_board``).
+        self.board_candidates = list(board_candidates or [])
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.profile = profile
@@ -449,10 +448,11 @@ class CaptureSession:
         return {
             "manual": True,
             "auto": True,
-            # The chessboard only means something with the board's own export:
-            # it carries the exact corners the cluster drew. Guessing the board
-            # is how a smaller grid inside a bigger one solves at the wrong scale.
-            "chessboard": self.display_points is not None,
+            # The chessboard needs the exact corners the cluster drew: from its
+            # export, or from the HMI's own layout, identified by the grid size
+            # found. Guessing a board is how a smaller grid inside a bigger one
+            # solves at the wrong scale.
+            "chessboard": self.display_points is not None or bool(self.board_candidates),
         }
 
     def set_mode(self, mode: str) -> None:
@@ -485,7 +485,6 @@ class CaptureSession:
                     drift_alarm_px=self.drift_alarm_px)
                 self.reference = None
                 self.reference_camera = None
-                self.reference_glare = None
                 if self._profile_is_auto:
                     self.profile = None
                     self._profile_is_auto = False
@@ -849,7 +848,6 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
-        self.reference_glare = None
 
     def _note_sampling_ratio(self, rec: CaptureRecord, geometry: Any) -> None:
         ratio = geometry.sampling_ratio()
@@ -1015,15 +1013,32 @@ class CaptureSession:
         # guessing the square size and the half-pixel between Qt's convention
         # and the detector's -- and that half pixel goes straight into the
         # homography and from there into every measurement through it.
+        pattern, found = self.pattern_size, None
         points = (
             self.display_points if self.display_points is not None
             else chessboard_display_points(
                 self.pattern_size, self.square_px, self.pattern_origin
             )
         )
+        known = self.display_points is not None
+        if not known and self.board_candidates:
+            for board in self.board_candidates:
+                found = find_chessboard(undistorted, board["pattern_size"])
+                if found is not None:
+                    pattern, points, known = board["pattern_size"], board["corners"], True
+                    self.board_display_size = self.display_size = board["canvas"]
+                    break
+            else:
+                rec.verdict = "FAILED"
+                rec.detail = (
+                    "no HMI chessboard in this photo. Put the cluster on its "
+                    "calibration screen (the chessboard), get the whole board in "
+                    "frame, and shoot again."
+                )
+                return rec
         try:
             geometry = homography_from_display_pattern(
-                undistorted, self.pattern_size, points, display_size=self.display_size
+                undistorted, pattern, points, display_size=self.display_size, found=found
             )
         except RuntimeError:
             rec.verdict = "FAILED"
@@ -1051,7 +1066,7 @@ class CaptureSession:
         # self-consistent reading of a 9x6 one, and this end cannot know which
         # was drawn. Only the board's own export can settle it, so say plainly
         # when it was not used rather than imply the question was checked.
-        if self.display_points is None:
+        if not known:
             rec.detail += (
                 ". Note: the board was described by hand rather than taken from "
                 "--board, so nothing here can confirm it is the board the cluster "
@@ -1068,7 +1083,6 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
-        self.reference_glare = None
         return rec
 
     def _propose(self, frame: np.ndarray, base: str) -> CaptureRecord:
@@ -1245,7 +1259,6 @@ class CaptureSession:
             )
         self.reference = None
         self.reference_camera = None
-        self.reference_glare = None
         return rec
 
     def _why_no_board(self, frame: np.ndarray, saved_as: str) -> str:
@@ -1304,17 +1317,15 @@ class CaptureSession:
         # Elements are found on the frame with its reflections taken off, or a
         # reflection's edge is found as an element and its hill merges real ones.
         segment_from = self.reference
-        self.reference_glare = None
         if self.deglare and self.reference.ndim == 3:
             self.glare_bright = glare.bright_on_dark(self.reference)
-            segment_from, excess = glare.flatten(self.reference, bright=self.glare_bright)
-            self.reference_glare = excess > glare.EXCESS_MIN
-            if glare.reference_is_hit(self.reference_glare):
-                rec.detail += (
-                    f". A strong reflection covers {100 * self.reference_glare.mean():.1f}% "
-                    "of it, and what is under it may not be found or measured. Move "
-                    "the camera or shade the screen and take the reference again"
-                )
+            segment_from, _ = glare.flatten(self.reference, bright=self.glare_bright)
+        # What the camera actually saw, in display space. Corners placed past
+        # the edge of the photograph leave empty border in the rectified frame,
+        # and the photograph's edge against it is a long straight line that
+        # segments like an element and cannot be measured.
+        seen = self.calibration.geometry.rectify(
+            np.full(undistorted.shape[:2], 255, np.uint8)) > 250
 
         # With no authored inventory, take one from the frame itself rather than
         # having nothing to measure. Only ever replaces an inventory this made
@@ -1322,6 +1333,7 @@ class CaptureSession:
         if self.auto_profile and (self.profile is None or self._profile_is_auto):
             found = profile_from_reference(
                 segment_from,
+                valid=seen,
                 screen=self.profile.screen if self.profile else "auto",
                 display_size=self.display_size,
             )
@@ -1446,26 +1458,18 @@ class CaptureSession:
             reference=pair.reference if pair else self.reference, report=report,
         )
         if pair is not None:
-            clipped = pair.clipped
-            if self.reference_glare is not None and self.reference_glare.shape == clipped.shape:
-                clipped = clipped | self.reference_glare
-                if glare.reference_is_hit(self.reference_glare):
-                    report.flag(
-                        "reference_glare", severity="review",
-                        area_pct=round(100 * float(self.reference_glare.mean()), 2),
-                        detail=(
-                            "a strong reflection lay on part of the reference, so "
-                            "what is under it may not be checked. Retake the "
-                            "reference without it."
-                        ),
-                    )
-            glare.mark_unmeasurable(report, self.profile, clipped, values=self.values)
+            # Glare is taken out, never reported on: it is the room, not the
+            # display, and a verdict is about the display. What was subtracted
+            # is kept in the saved report as a note.
+            glare.recheck_under_glare(report, self.profile, pair.reference, pair.live,
+                                      pair.footprint, pair.clipped, values=self.values)
             glare.set_aside_residual(report, pair.footprint)
             if pair.subtracted >= 20:
                 report.flag(
                     "glare_subtracted", severity="note",
                     peak_levels=pair.subtracted,
                     area_pct=round(100 * float(pair.footprint.mean()), 1),
+                    clipped_pct=round(100 * float(pair.clipped.mean()), 2),
                     detail="a reflection on the glass was measured and subtracted",
                 )
 
@@ -2108,10 +2112,8 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
         delta = m.get("abs_delta")
         reason = element["reason"] or ""
         # No distance for an element that was not drawn: there is nothing for it
-        # to be a distance from, and a number there reads as a near miss. Nor for
-        # one under glare: it was measured on pixels that say nothing.
-        show_delta = (delta is not None and not m.get("element_absent")
-                      and reason != glare.GLARE)
+        # to be a distance from, and a number there reads as a near miss.
+        show_delta = delta is not None and not m.get("element_absent")
         rows.append({
             "id": element["element_id"],
             "verdict": element["verdict"],

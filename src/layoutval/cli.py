@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 
 from layoutval.calibration import (
+    HMI_CANVASES,
     Calibration,
     CharucoSpec,
     DisplayGeometry,
@@ -34,6 +35,7 @@ from layoutval.calibration import (
     chessboard_display_points,
     homography_from_display_edges,
     homography_from_display_pattern,
+    hmi_board,
 )
 from layoutval.capture import median_stack
 from layoutval.linearity import LinearityStudy, apply_linearity, best_estimator, run_linearity
@@ -381,7 +383,8 @@ def cmd_go(args: argparse.Namespace) -> int:
 
     The phone offers three ways to locate the display and switches between them
     live: corners found automatically (the default), corners tapped by hand,
-    and the cluster's own chessboard when a board export is given.
+    and the cluster's own chessboard -- from its export with ``--board``, or
+    without one, identified from the HMI's own layout by the grid it shows.
     """
     out = Path(args.out)
     using_board = bool(args.board)
@@ -423,6 +426,7 @@ def cmd_go(args: argparse.Namespace) -> int:
     args.drift_alarm_px = 2.0
     args.no_auto_profile = False
     args.display_inset = [0.0, 0.0]
+    args.hmi_boards = not using_board
 
     lens = "not solved yet"
     if intrinsics:
@@ -435,8 +439,7 @@ def cmd_go(args: argparse.Namespace) -> int:
             lens = intrinsics
     shown = f"{size[0]}x{size[1]}" if size else "from the board"
     print(f"screen {shown}   lens: {lens}")
-    modes = "auto corners, tap corners" + (", chessboard" if using_board else "")
-    print(f"modes on the phone: {modes}")
+    print("modes on the phone: auto corners, tap corners, chessboard")
     if reused:
         print("Tap Intrinsics on the phone to re-shoot the lens.")
     print()
@@ -543,6 +546,10 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         calib_mode=getattr(args, "calib_mode", ""),
         board_display_size=board_canvas,
         deglare=not getattr(args, "keep_glare", False),
+        board_candidates=(
+            [hmi_board(*canvas) for canvas in HMI_CANVASES]
+            if getattr(args, "hmi_boards", False) else None
+        ),
         lens_board=lens_board,
         display_inset_px=tuple(args.display_inset),
     )
@@ -581,6 +588,9 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
     if args.render:
         print("  1  Calibrate   the screen under test -- no chessboard needed,")
         print("                 it matches the framebuffer you supplied")
+    elif getattr(args, "calib_mode", "") in ("auto", "manual"):
+        print("  1  Calibrate   the whole cluster in frame; check the four corner dots")
+        print("                 (or switch to Chessboard on the phone)")
     else:
         print("  1  Calibrate   cluster showing its chessboard, filling the frame")
     print("  2  Reference   cluster showing the screen under test, correct")

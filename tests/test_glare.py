@@ -143,21 +143,45 @@ def test_a_real_fault_is_still_measured_through_a_moving_reflection(tmp_path):
         clean["measurement"]["abs_delta"], abs=0.15)
 
 
-def test_what_a_reflection_clipped_is_review_not_a_verdict(tmp_path):
+def test_a_lamp_over_a_telltale_does_not_fail_a_good_screen(tmp_path):
+    """A compact lamp is only partly subtracted; what it leaves is a slope of
+    light, which failed the identity check until it was re-done on detail."""
     report = shoot(tmp_path, [], [LAMP])
-    assert report["verdict"] == "REVIEW"
-    reasons = {e["element_id"]: (e["verdict"], e["reason"]) for e in report["elements"]}
-    assert ("REVIEW", "glare") in reasons.values()
-    assert not any(v == "FAIL" for v, _ in reasons.values())
-    assert any(f["flag"] == "glare" for f in report["flags"])
+    assert report["verdict"] == "PASS", [
+        (e["element_id"], e["reason"]) for e in report["elements"] if e["verdict"] != "PASS"]
+    assert not any(f.get("severity") in ("review", "fail") for f in report["flags"])
 
 
-def test_a_strong_reflection_on_the_reference_is_never_a_quiet_pass(tmp_path):
-    """The same lamp in both shots washed a telltale out of the inventory, and a
-    2 px fault in it came back PASS: nothing compared two frames that differed."""
-    report = shoot(tmp_path, [LAMP], [LAMP], fault=("TELLTALE_OIL_PRESSURE", (2.0, 0.0)))
-    assert report["verdict"] != "PASS"
-    assert any(f["flag"] == "reference_glare" for f in report["flags"])
+def test_a_real_fault_under_a_lamp_is_still_found(tmp_path):
+    hit = element_at(shoot(tmp_path, [], [LAMP], fault=("TELLTALE_OIL_PRESSURE", (2.0, 0.0))),
+                     216, 74)
+    assert hit["verdict"] != "PASS"
+    assert hit["measurement"]["abs_delta"] == pytest.approx(2.0, abs=0.35)
+
+
+def test_a_wrong_symbol_under_a_lamp_still_fails(tmp_path):
+    """Re-checked on detail alone, a different glyph still differs in its strokes."""
+    display = ClusterDisplay()
+    display.state.update(NOMINAL)
+    camera = VirtualCamera(display_size=display.size)
+    rig = SimulatedRig(display, camera)
+    session = CaptureSession(
+        tmp_path, pattern_size=PATTERN, square_px=SQUARE_PX, pattern_origin=PATTERN_ORIGIN,
+        display_size=display.size, values=VALUES)
+    rig.show("checkerboard")
+    session.handle("calibrate", jpeg(rig.read()))
+    rig.show("main")
+    session.handle("reference", jpeg(rig.read()))
+    display.swapped.add("TELLTALE_BATTERY_LOW")
+    camera.glare = [Reflection((0.24, 0.33), (0.12, 0.20), 220)]
+    battery = element_at(session.handle("validate", jpeg(rig.read())).report, 120, 74)
+    assert (battery["verdict"], battery["reason"]) == ("FAIL", "wrong_content")
+
+
+def test_the_same_photo_twice_passes_however_much_glare_is_on_it(tmp_path):
+    """What the bench saw: one glared photo as reference and test, 75 REVIEWs."""
+    report = shoot(tmp_path, [LAMP, WINDOW_A], [LAMP, WINDOW_A])
+    assert report["verdict"] == "PASS"
 
 
 def test_the_phone_shows_findings_not_notes(tmp_path):

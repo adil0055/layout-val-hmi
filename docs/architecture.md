@@ -350,6 +350,17 @@ named it. It buys sub-pixel accuracy equal to an authored profile against the
 question "does this frame match the reference frame" — and it explicitly does
 *not* answer "does the build match the design".
 
+It leaves out what could be segmented but not measured. A region whose detail
+is one-dimensional -- a straight line or edge, scored by the structure tensor's
+smaller eigenvalue over its larger, the Shi-Tomasi corner test -- looks the same
+all along its length, so its position along it cannot be found: compared with
+itself, a 370 px edge on a bench photograph matched 8 px down its own length and
+came back FAIL. On two bench photographs lines scored under 0.02, a long bar
+0.07, and every tick, digit and icon 0.12 or more; the cut is 0.05. A region
+touching the part of the rectified frame the camera never saw -- corners placed
+past the photograph's edge leave empty border -- is the photograph's edge, not
+an element. Neither kind was ever measurable; both used to be FAIL.
+
 ---
 
 ## 10. The residual check
@@ -398,9 +409,16 @@ different display space: it starts calibration over, drops the reference and a
 discovered inventory, and keeps the lens solve, which belongs to the camera.
 Choosing the mode already on is not a switch. (Left calibrated across a switch,
 the page saw no reference, moved straight on to Reference, and the chessboard
-photograph meant to calibrate became the reference.) The chessboard mode is
-refused without `--board`: guessing a board is how a smaller grid solves at the
-wrong scale.
+photograph meant to calibrate became the reference.) The chessboard mode needs
+the exact corners the cluster drew. With `--board` they come from the HMI's
+export; without it, `layoutval go` carries the HMI's own layout rule
+(`hmi_board`: 100 px squares, one square of quiet zone, centred, origin on a
+whole pixel) for each skin's canvas, and the grid the camera finds says which
+skin it is -- 14x5 inner corners on 1790x870, 16x4 on 1920x720, neither of which
+fits inside the other. Checked against the HMI's own `pattern_geometry`, corner
+for corner, and measured at 0.02-0.05 px against the simulator's true mapping.
+With neither, the mode is refused: guessing a board is how a smaller grid
+inside a bigger one solves at the wrong scale.
 
 **Glare.** Every reference/test pair is de-glared before it is compared
 (`glare.py`). A reflection off the cover glass is light added to what the display
@@ -424,17 +442,27 @@ strokes. So:
 - **Align on de-glared frames too.** The hand-held pose re-solve matches
   brightness, and with the camera perfectly still a moved reflection was read
   as 0.5-11 px of camera motion, dragging every element with it.
-- **Refuse what cannot be recovered.** A clipped pixel held something between
-  "a bit less than white" and white; once the reflection on it passes 0.3 in
-  linear units that range reaches below 217 of 255, and an element with more
-  than 2% of its box like that is REVIEW, `glare`. (At 0.03 an unchanged bench
-  photograph came back 69 elements REVIEW -- white digits under a faint
-  reflection, which are white whatever it does.) A strong reflection on the
-  *reference* can wash an element out of the inventory entirely, where no
-  per-element flag can reach it, so it puts a REVIEW on every result until the
-  reference is retaken. Residual-check findings that sit on a subtracted
+- **Re-check identity on detail where a reflection lay.** A compact lamp is
+  only partly subtracted -- the opening cannot follow the top of a hill much
+  narrower than its square -- and leaves a slope of light, which correlation
+  reads as different content. An element that fails its identity check under a
+  reflection is compared again at the measured position on its fine detail
+  alone (each patch less a blur of itself) and without the pixels the
+  reflection clipped. Over a good screen that turned a FAIL into a PASS; a 2 px
+  fault under the same lamp still measured 2.03 px, and a wrong symbol under it
+  still failed.
+- **Never a verdict of its own.** Glare is the room, not the display. It is
+  subtracted and the elements are measured; it does not put REVIEW on anything.
+  (An earlier version did, for anything a reflection clipped and for every
+  result against a reference with a strong reflection on it; on a glared bench
+  photograph compared with itself that was 75 REVIEWs, and the rule was wrong
+  for what the rig is for.) Residual-check findings that sit on a subtracted
   reflection become a note: the reflection's photon noise stays behind after its
-  light is removed.
+  light is removed. How much light was taken off is a note in the saved report.
+- **What is left.** An element a reflection turned completely white carries
+  nothing; the camera recorded no content there, and its result is whatever
+  measuring that white patch gives -- usually wrong content. The fix is to move
+  the camera or shade the screen.
 
 Measured through the whole capture session, hand-held, reflections moving
 between the two shots: without it, four FAILs and two REVIEWs on a good screen
@@ -607,11 +635,12 @@ Stated plainly, because the alternative is someone discovering them later:
 - **Colour and symbol validation are thinner than geometry.** The HSV mask
   machinery exists for telltales but is not developed into a full colour check.
 - **Glare is handled one photograph at a time.** A compact, strong reflection
-  (a lamp, not a window) is only partly subtracted: the opening cannot follow
-  the top of a hill much narrower than its square, and leaves the top of it
-  behind. Anything that large also treats as background a filled element wider
-  than a tenth of the frame -- in both frames alike, so it cancels, but its
-  interior is not measured. The strongest remedy for both is not built: several
-  photographs from slightly different places, aligned in display space, and the
-  darkest value each pixel takes across them -- reflections move with the camera
-  and the content does not, and a reflection only ever adds light.
+  (a lamp, not a window) is only partly subtracted, and the identity re-check
+  on detail covers for that, not the subtraction itself. The opening also treats
+  as background a filled element wider than a tenth of the frame -- in both
+  frames alike, so it cancels, but its interior is not measured. And an element
+  a reflection whitened completely cannot be measured at all. The strongest
+  remedy for all three is not built: several photographs from slightly
+  different places, aligned in display space, and the darkest value each pixel
+  takes across them -- reflections move with the camera and the content does
+  not, and a reflection only ever adds light.

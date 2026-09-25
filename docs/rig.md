@@ -87,11 +87,11 @@ What the software does about the rest (`glare.py`,
 [architecture §11](architecture.md#11-the-capture-server)): large-scale light is
 estimated with a morphological opening and subtracted in linear light, from each
 photograph against the other. That removes a reflection completely wherever
-nothing clipped. Where a reflection did clip, the content under it is gone —
+nothing clipped, and glare never produces a verdict of its own. Where a
+reflection turned something completely white, the content under it is gone —
 for this code and for any other; the learned reflection-removal models of
-2024–2026 return a *plausible* picture, which is not a measurement — so an
-element there is reported REVIEW, `glare`, and a strong reflection on the
-reference puts a REVIEW on every result until the reference is retaken.
+2024–2026 return a *plausible* picture, which is not a measurement — and the
+remedies above are the only ones.
 
 Allow 10–15 minutes of warm-up before a run: both the display and the camera body
 expand as they heat, and that shows up as a slow drift of a pixel or two. This is

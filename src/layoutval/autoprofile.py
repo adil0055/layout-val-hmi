@@ -136,6 +136,28 @@ def segment_reference(
     return best
 
 
+def structure(gray: np.ndarray, box: tuple[int, int, int, int], pad: int = 3) -> float:
+    """How two-dimensional the detail in ``box`` is: 0 for a straight line, 1 for a dot.
+
+    The smaller eigenvalue of the gradient structure tensor over the larger --
+    the corner test of Shi and Tomasi. A straight line or edge looks the same
+    all along its length, so nothing can say where along it an element sits:
+    compared with itself, a 370 px edge on a bench photograph matched 8 px
+    down its own length and came back FAIL. Measured on two bench photographs,
+    lines score under 0.02, a long bar 0.07, and every tick mark, digit and
+    icon 0.12 or more.
+    """
+    x, y, w, h = box
+    H, W = gray.shape[:2]
+    patch = gray[max(0, y - pad):min(H, y + h + pad), max(0, x - pad):min(W, x + w + pad)]
+    patch = patch.astype(np.float32)
+    gx = cv2.Sobel(patch, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(patch, cv2.CV_32F, 0, 1, ksize=3)
+    a, b, c = float((gx * gx).sum()), float((gx * gy).sum()), float((gy * gy).sum())
+    half, root = (a + c) / 2.0, float(np.sqrt(max(((a - c) / 2.0) ** 2 + b * b, 0.0)))
+    return (half - root) / (half + root) if half + root > 0 else 0.0
+
+
 def profile_from_reference(
     reference: np.ndarray,
     *,
@@ -144,12 +166,19 @@ def profile_from_reference(
     display_size: tuple[int, int] | None = None,
     defaults: Tolerance | None = None,
     max_elements: int = 80,
+    valid: np.ndarray | None = None,
+    min_structure: float = 0.05,
     **segment_kw,
 ) -> LayoutProfile:
     """Build a measurable inventory out of a reference frame.
 
     Elements are named for where they are, because there is nothing else to name
     them after, and that id is stable for a given reference.
+
+    ``valid`` marks the part of the frame the camera actually saw; a region
+    touching anything else is the edge of the photograph, not an element.
+    Regions with less 2-D detail than ``min_structure`` (see :func:`structure`)
+    are left out: their position along their own length cannot be measured.
     """
     height, width = reference.shape[:2]
     profile = LayoutProfile(
@@ -159,6 +188,11 @@ def profile_from_reference(
         defaults=defaults or Tolerance(),
     )
     regions = segment_reference(reference, **segment_kw)
+    gray = to_gray(reference)
+    if valid is not None:
+        seen = cv2.erode(valid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        regions = [r for r in regions if seen[r[1]:r[1] + r[3], r[0]:r[0] + r[2]].all()]
+    regions = [r for r in regions if structure(gray, r[:4]) >= min_structure]
     # Biggest first when there are too many: a cap that kept the top-left corner
     # of the screen and dropped the instruments would be the wrong forty.
     if len(regions) > max_elements:

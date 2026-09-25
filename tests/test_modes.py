@@ -260,3 +260,57 @@ def test_accepting_a_proposal_unchanged_snaps_to_the_panel_edge(tmp_path, rig):
                   [[-0.5, dh - 0.5]]], np.float64),
         session.calibration.geometry.H).reshape(-1, 2)
     assert float(np.abs(solved - border).max()) < 0.5
+
+
+# -- the chessboard with no board file ---------------------------------------
+
+
+def hmi_screen(canvas_w, canvas_h, square=100):
+    """The HMI's calibration screen, drawn the way its CalibrationScene draws it."""
+    cols = (canvas_w - 2 * square) // square
+    rows = (canvas_h - 2 * square) // square
+    ox = int(round((canvas_w - cols * square) / 2.0))
+    oy = int(round((canvas_h - rows * square) / 2.0))
+    img = np.zeros((canvas_h, canvas_w, 3), np.uint8)
+    img[oy - square:oy + (rows + 1) * square, ox - square:ox + (cols + 1) * square] = 255
+    for r in range(rows):
+        for c in range(cols):
+            if (c + r) % 2 == 0:
+                img[oy + r * square:oy + (r + 1) * square, ox + c * square:ox + (c + 1) * square] = 0
+    return img
+
+
+@pytest.mark.parametrize("canvas", [(1790, 870), (1920, 720)])
+def test_the_chessboard_needs_no_board_file(tmp_path, canvas):
+    """The grid the camera finds says which skin's board it is, and so every corner."""
+    from layoutval.calibration import HMI_CANVASES, hmi_board
+
+    camera = VirtualCamera(display_size=canvas, sensor_size=(2600, 1600), sampling_ratio=1.3,
+                           k1=0.0, k2=0.0, tilt_deg=5.0, roll_deg=-2.0)
+    session = CaptureSession(tmp_path, display_size=(1920, 1080), mark_corners=True,
+                             calib_mode="auto",
+                             board_candidates=[hmi_board(*c) for c in HMI_CANVASES])
+    assert session.status()["modes"]["chessboard"] is True
+    session.set_mode("chessboard")
+    rec = session.handle("calibrate", jpeg(camera.shoot(hmi_screen(*canvas))))
+    assert rec.verdict == "OK", rec.detail
+    assert "described by hand" not in rec.detail
+    assert session.display_size == canvas
+    # The solved mapping agrees with the camera's true one across the canvas.
+    w, h = canvas
+    probe = np.array([[[0.0, 0.0]], [[w - 1.0, 0.0]], [[w - 1.0, h - 1.0]], [[w / 2, h / 2]]])
+    solved = cv2.perspectiveTransform(probe, session.calibration.geometry.H)
+    truth = cv2.perspectiveTransform(probe, camera.H_true)
+    assert float(np.abs(solved - truth).max()) < 0.15      # measured 0.02-0.05
+
+
+def test_no_hmi_chessboard_in_the_photo_says_so(tmp_path, rig):
+    from layoutval.calibration import HMI_CANVASES, hmi_board
+
+    session = CaptureSession(tmp_path, display_size=(1920, 1080), mark_corners=True,
+                             calib_mode="chessboard",
+                             board_candidates=[hmi_board(*c) for c in HMI_CANVASES])
+    rig.show("main")
+    rec = session.handle("calibrate", jpeg(rig.read()))
+    assert rec.verdict == "FAILED"
+    assert "calibration screen" in rec.detail

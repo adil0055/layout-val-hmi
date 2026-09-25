@@ -587,6 +587,37 @@ def chessboard_display_points(
     return np.array(pts, dtype=np.float64)
 
 
+#: The canvases the cluster's HMI draws on, one per skin, and the square size
+#: its calibration screen uses unless told otherwise (``hmi/backend/calibration.py``
+#: and the skins' ``designW``/``designH``).
+HMI_CANVASES = ((1790, 870), (1920, 720))
+HMI_SQUARE_PX = 100
+
+
+def hmi_board(canvas_w: int, canvas_h: int, square_px: int = HMI_SQUARE_PX) -> dict:
+    """The chessboard the HMI's calibration screen draws on a canvas.
+
+    The same layout as the HMI's own ``pattern_geometry``: one square of quiet
+    zone on every side, the board centred, its origin rounded to a whole pixel.
+    Corners are in pixel-centre coordinates -- a board edge drawn at Qt
+    coordinate X is at X - 0.5 here -- which is what the detector reports.
+    With it, the chessboard needs no exported file: the two skins' boards differ
+    in size (14x5 and 16x4 inner corners), neither fits inside the other, so the
+    grid the camera finds says which one it is, and with it every corner.
+    """
+    cols = max(3, (canvas_w - 2 * square_px) // square_px)
+    rows = max(3, (canvas_h - 2 * square_px) // square_px)
+    origin_x = int(round((canvas_w - cols * square_px) / 2.0))
+    origin_y = int(round((canvas_h - rows * square_px) / 2.0))
+    corners = [[origin_x + i * square_px - 0.5, origin_y + j * square_px - 0.5]
+               for j in range(1, rows) for i in range(1, cols)]
+    return {
+        "pattern_size": (cols - 1, rows - 1),
+        "corners": np.array(corners, dtype=np.float64),
+        "canvas": (int(canvas_w), int(canvas_h)),
+    }
+
+
 def _orient_corners(corners: np.ndarray, pattern_size: tuple[int, int]) -> np.ndarray:
     """Normalise the 180-degree ambiguity in chessboard corner ordering.
 
@@ -607,15 +638,18 @@ def homography_from_display_pattern(
     *,
     display_size: tuple[int, int],
     refine: bool = True,
+    found: tuple[np.ndarray, bool] | None = None,
 ) -> DisplayGeometry:
     """Method A -- the cluster renders the calibration pattern itself.
 
     ``display_points`` are the framebuffer coordinates of the pattern's inner
     corners, in the same row-major order the detector returns them
-    (see :func:`chessboard_display_points`).
+    (see :func:`chessboard_display_points`). ``found`` is what
+    :func:`find_chessboard` already returned for this frame, if it has been run.
     """
     gray = to_gray(camera_img)
-    found = find_chessboard(gray, pattern_size)
+    if found is None:
+        found = find_chessboard(gray, pattern_size)
     if found is None:
         raise RuntimeError(
             "calibration pattern not found -- check focus, exposure and that the "

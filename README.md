@@ -34,7 +34,7 @@ any time:
 |---|---|
 | **Auto corners** (default) | shoot the cluster; four dots appear on its corners. Drag one if it is off, then confirm |
 | **Tap corners** | tap the four corners yourself |
-| **Chessboard** | the cluster draws its board (needs `--board`) |
+| **Chessboard** | put the cluster on its calibration screen and shoot it. No file needed: the grid it finds says which skin's board it is |
 
 Both corner modes ask the cluster for nothing, and either way the dots are
 snapped to the real panel edge sub-pixel, so rough is fine. Switching mode
@@ -98,7 +98,7 @@ FUEL_BAR              injected (+2.25,+0.00) px  measured (+2.02,-0.01) px  -> R
 | `server` | Phone capture over the local network, and the page it opens. |
 | `autoprofile` | An inventory taken from the reference frame, when there is no authored one. |
 | `displayfind` | Proposes the display's four corners from an ordinary photograph. |
-| `glare` | Subtracts reflections off the cover glass; flags what they clipped. |
+| `glare` | Subtracts reflections off the cover glass before anything is compared. |
 | `authoring` | Snap assistance and a segmentation-model hook — **authoring only**. |
 | `simulator` | Synthetic cluster and virtual camera, for tests and the demo. |
 
@@ -275,20 +275,19 @@ the simulator, with reflections that move between the reference and the test
 shot, a good screen went from four FAILs and two REVIEWs in six glare scenes
 to passing every scene where nothing clipped, while a 2 px fault still measured
 1.70–1.78 px (1.77 px with no glare at all).
-Two things it cannot do, and says so instead of guessing:
 
-- **a pixel the reflection clipped is gone.** An element under one comes back
-  REVIEW, `glare`, never PASS or FAIL. Learned reflection-removal models are not
-  used: they produce a plausible picture, and measuring that would be measuring
-  the model;
-- **a strong reflection on the reference** can hide an element from the
-  inventory altogether, so every result against it carries a REVIEW until the
-  reference is retaken.
+Glare never produces a verdict of its own. A compact lamp, which the
+subtraction only partly removes, is handled by re-checking the element under it
+on its fine detail alone; a wrong symbol under the same lamp still fails. The
+one thing no software can do is see through a reflection that turned an element
+completely white: the camera recorded nothing there. Learned reflection-removal
+models are not used: they paint in a plausible picture, and measuring that
+would be measuring the model.
 
-Cheapest fixes, in order: tilt the phone until the reflection is off the
-display, shade the screen with a hood or your body, or put a polarising filter
-on the lens and turn it until the room fades (LCD light is polarised; most
-reflected room light is not). `--keep-glare` turns the subtraction off.
+Cheapest fixes for that, in order: tilt the phone until the reflection is off
+the display, shade the screen with a hood or your body, or put a polarising
+filter on the lens and turn it until the room fades (LCD light is polarised;
+most reflected room light is not). `--keep-glare` turns the subtraction off.
 
 Two more things a phone brings with it. Its photos carry an EXIF orientation
 rather than rotated pixels, which is handled — a frame that came in on its side

@@ -15,14 +15,14 @@ decides everything that can honestly be done about it:
   it lifts black a long way and white hardly at all, squeezing the contrast of
   whatever sits under it.
 
-* **Light that clipped the sensor cannot be taken away.** A pixel at 255 says
-  only "at least this bright"; the content under it is gone, and no algorithm
-  recovers it -- not this one and not a learned one. The learned
-  reflection-removal models (single-image reflection separation, 2024-2026)
-  produce a *plausible* image, which is a picture of what a network expects a
-  cluster to look like, and measuring it would be measuring the network. So
-  they stay out of the measurement path, and a clipped element is reported as
-  unmeasurable -- REVIEW, "glare" -- never as a pass or a fail.
+* **Light that clipped the sensor cannot be taken away** -- by this or by
+  anything else. The learned reflection-removal models (single-image
+  reflection separation, 2024-2026) paint in a *plausible* image, which is a
+  picture of what a network expects a cluster to look like, and measuring it
+  would be measuring the network; they stay out of the measurement path.
+  Glare never changes a verdict on its own: the reflection is subtracted, the
+  elements are measured, and how much was taken off is a note in the saved
+  report.
 
 The remedy for clipping is physical: move the camera so the reflection falls
 somewhere else, shade the display, or put a polariser on the lens. An LCD's
@@ -52,17 +52,9 @@ CLIP_LEVEL = 250
 keeps saturated regions from sitting exactly at 255."""
 
 EXCESS_MIN = 0.3
-"""Added light, linear, past which a clipped pixel has lost something worth
-having. A clipped pixel with reflection ``e`` on it held content somewhere
-between ``1 - e`` and white; at 0.3 that is anything from 217 of 255 up, the top
-fifth of an element's contrast gone. Below it the clip hides a few levels of an
-already white stroke, which is what white artwork looks like to any phone,
-reflection or not. (At 0.03, an unchanged bench photograph compared with itself
-came back 69 elements REVIEW; at 0.16, still 7.)"""
-
-ELEMENT_FRACTION = 0.02
-"""Share of an element's box that may be glare-clipped before its measurement
-stops being trusted."""
+"""Added light, linear, past which a clipped pixel is counted as lost to a
+reflection in the saved report's note: content under it could have been
+anything from 217 of 255 up."""
 
 FOOTPRINT_MIN = 0.01
 """Added light, linear, that marks where a reflection was: about 30 grey levels
@@ -254,44 +246,6 @@ def element_fraction(mask: np.ndarray, bbox: tuple[float, float, float, float]) 
     return float(mask[y0:y1, x0:x1].mean())
 
 
-GLARE = "glare"
-"""Reason given to an element that glare made unmeasurable."""
-
-
-def mark_unmeasurable(report, profile, mask: np.ndarray, *, values=None) -> list[str]:
-    """Turn the verdict of every element glare clipped into REVIEW, "glare".
-
-    Whatever it measured -- pass or fail -- was measured partly on pixels that
-    say nothing about the display, so neither answer is one to act on. The
-    measurement stays in the record. Returns the ids it changed.
-    """
-    from layoutval.types import Verdict, resolve_value
-
-    hit: list[str] = []
-    if not mask.any():
-        return hit
-    for result in report.results:
-        try:
-            spec = profile[result.element_id]
-        except KeyError:
-            continue
-        box = spec.expected_bbox(resolve_value(spec, values))
-        if element_fraction(mask, box) > ELEMENT_FRACTION:
-            result.verdict = Verdict.REVIEW
-            result.reason = GLARE
-            hit.append(result.element_id)
-    if hit:
-        report.flag(
-            GLARE, severity="review", elements=hit,
-            detail=(
-                "a reflection saturated the camera over these, so what is under it "
-                "cannot be seen. Move the camera a little, shade the screen, or use "
-                "a polarising filter, and take it again."
-            ),
-        )
-    return hit
-
-
 def set_aside_residual(report, footprint: np.ndarray) -> int:
     """Move whole-frame residual findings that sit on a reflection into a note.
 
@@ -325,14 +279,67 @@ def set_aside_residual(report, footprint: np.ndarray) -> int:
     return len(moved)
 
 
-REFERENCE_AREA = 0.001
-"""Share of the reference a strong reflection may cover before every result
-measured against it carries a warning. Strong is :data:`EXCESS_MIN`: there a
-washed-out element may not have been found at all, and one that was never found
-cannot be flagged on its own. (A saturating lamp on the bench simulator clipped
-14 pixels and washed a telltale out of the inventory entirely; a 2 px fault in
-it then came back PASS.)"""
+def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray,
+                        footprint: np.ndarray, clipped: np.ndarray, *, values=None) -> list[str]:
+    """Check identity again, on detail alone, for elements a reflection lay over.
 
+    A compact, bright reflection -- a lamp rather than a window -- is only
+    partly subtracted: the top of its hill is narrower than the opening can
+    follow. What it leaves is a smooth slope of light across whatever sits
+    under it, and correlation, which forgives an even change of brightness but
+    not a slope, reads a telltale on that slope as a different telltale. Over a
+    good screen that was a FAIL, which is the reflection deciding the verdict.
 
-def reference_is_hit(mask: np.ndarray | None) -> bool:
-    return mask is not None and float(mask.mean()) > REFERENCE_AREA
+    So an element whose identity check failed under a reflection is compared
+    again at the position that was measured, on its fine detail only -- each
+    patch less a blur of itself, which a smooth slope cannot survive and a
+    stroke does -- and without the pixels the reflection clipped, which carry
+    nothing (two pixels of margin for the bloom round a clip). The same element
+    matches; a different symbol still differs in its strokes and stays a
+    failure. Needs 30% of the element unclipped. Returns the ids it changed.
+    """
+    from layoutval.capture import to_gray
+    from layoutval.measure import subpixel_crop
+    from layoutval.types import resolve_value
+    from layoutval.verdict import WRONG_CONTENT, evaluate
+
+    if not footprint.any():
+        return []
+    lost = cv2.dilate(clipped.astype(np.uint8) * 255, np.ones((5, 5), np.uint8))
+    lit = footprint.astype(np.uint8) * 255
+    changed: list[str] = []
+    for i, result in enumerate(report.results):
+        m = result.measurement
+        if result.reason != WRONG_CONTENT or m.dx is None or m.dy is None:
+            continue
+        try:
+            spec = profile[result.element_id]
+        except KeyError:
+            continue
+        x, y, w, h = spec.expected_bbox(resolve_value(spec, values))
+        here, there = (x, y, w, h), (x + m.dx, y + m.dy, w, h)
+        if not ((subpixel_crop(lit, here) > 0).any() or (subpixel_crop(lit, there) > 0).any()):
+            continue
+        keep = ~((subpixel_crop(lost, here) > 0) | (subpixel_crop(lost, there) > 0))
+        if keep.mean() < 0.3 or keep.sum() < 30:
+            continue
+        sigma = max(1.5, min(w, h) / 6.0)
+
+        def detail(patch: np.ndarray) -> np.ndarray:
+            g = to_gray(patch).astype(np.float32)
+            return (g - cv2.GaussianBlur(g, (0, 0), sigma)).astype(np.float64)[keep]
+
+        a = detail(subpixel_crop(reference, here))
+        b = detail(subpixel_crop(live, there))
+        a, b = a - a.mean(), b - b.mean()
+        den = float(np.sqrt((a * a).sum() * (b * b).sum()))
+        if den <= 0:
+            continue
+        score = float((a * b).sum()) / den
+        if score < result.tolerance.identity_min:
+            continue
+        m.zncc = score
+        m.method += " (detail, under glare)"
+        report.results[i] = evaluate(spec, m)
+        changed.append(spec.id)
+    return changed
