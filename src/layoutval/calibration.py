@@ -53,17 +53,28 @@ class Intrinsics:
     """Reprojection error from the calibration solve, in camera pixels.  Below
     0.3 px is the gate for accepting a calibration."""
 
+    alpha: float = 0.0
+    """What undistortion keeps: 0 crops to the region valid all the way to the
+    edges, 1 keeps every pixel of the photograph. Stored with the solve, because
+    the display mapping is solved in the undistorted frame and only holds for
+    the frame it was solved in."""
+
     def __post_init__(self) -> None:
         self.K = np.asarray(self.K, dtype=np.float64).reshape(3, 3)
         self.dist = np.asarray(self.dist, dtype=np.float64).ravel()
         self.image_size = (int(self.image_size[0]), int(self.image_size[1]))
 
-    def undistort_maps(self, alpha: float = 0.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def undistort_maps(self, alpha: float | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Precomputed remap tables plus the new camera matrix.
 
-        ``alpha=0`` crops to the all-valid region, which is what you want: it
-        keeps every pixel in the undistorted frame meaningful.
+        ``alpha=0`` crops to the all-valid region, which keeps every pixel of
+        the undistorted frame meaningful and throws part of the photograph away
+        -- lopsidedly when the solve's lens centre is off, and a hand-held
+        phone's solve often is: measured, 6% of each edge strip for a good solve
+        and up to 24% of one side for a loose one, cut off before anything else
+        ran. ``alpha=1`` keeps the whole photograph. Default: :attr:`alpha`.
         """
+        alpha = self.alpha if alpha is None else alpha
         new_K, _ = cv2.getOptimalNewCameraMatrix(
             self.K, self.dist, self.image_size, alpha, self.image_size
         )
@@ -78,6 +89,7 @@ class Intrinsics:
             "dist": self.dist.tolist(),
             "image_size": list(self.image_size),
             "rms": self.rms,
+            "alpha": self.alpha,
         }
 
     @classmethod
@@ -87,13 +99,14 @@ class Intrinsics:
             dist=np.array(d["dist"], dtype=np.float64),
             image_size=tuple(d["image_size"]),
             rms=float(d.get("rms", 0.0)),
+            alpha=float(d.get("alpha", 0.0)),
         )
 
 
 class Undistorter:
     """Applies stored intrinsics.  Builds the remap tables once."""
 
-    def __init__(self, intrinsics: Intrinsics, alpha: float = 0.0) -> None:
+    def __init__(self, intrinsics: Intrinsics, alpha: float | None = None) -> None:
         self.intrinsics = intrinsics
         self.map1, self.map2, self.new_K = intrinsics.undistort_maps(alpha)
 
@@ -1720,6 +1733,33 @@ class DriftEstimate:
         return out
 
 
+def feature_homography(reference: np.ndarray, live: np.ndarray, *,
+                       min_inliers: int = 25) -> np.ndarray | None:
+    """Reference-to-live homography from matched SIFT features, or None.
+
+    Coarse, but found from anywhere: it matches distinctive points rather than
+    walking downhill in brightness, so it does not care how far the camera
+    moved between the shots. SIFT is patent-free since 2020 and Apache-2.0 in
+    OpenCV. Lowe's ratio test, then RANSAC, then a count of what agreed.
+    """
+    sift = cv2.SIFT_create(nfeatures=4000)
+    a, b = to_gray(reference), to_gray(live)
+    ka, da = sift.detectAndCompute(a, None)
+    kb, db = sift.detectAndCompute(b, None)
+    if da is None or db is None or len(ka) < min_inliers or len(kb) < min_inliers:
+        return None
+    pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(da, db, k=2)
+    good = [m for m, n in (p for p in pairs if len(p) == 2) if m.distance < 0.75 * n.distance]
+    if len(good) < min_inliers:
+        return None
+    src = np.float32([ka[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([kb[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+    if H is None or mask is None or int(mask.sum()) < min_inliers:
+        return None
+    return H / H[2, 2]
+
+
 class DriftTracker:
     """Per-frame pose correction against a region that never changes.
 
@@ -1772,11 +1812,26 @@ class DriftTracker:
         x, y, w, h = self.roi
         return to_gray(img)[y : y + h, x : x + w].astype(np.float32)
 
-    def measure(self, live_camera_frame: np.ndarray) -> DriftEstimate:
+    def measure(self, live_camera_frame: np.ndarray,
+                init: np.ndarray | None = None) -> DriftEstimate:
+        """``init`` is a starting guess for the warp, 3x3, in full-frame pixels.
+
+        ECC refines; it does not search. Started from nothing, it follows the
+        brightness downhill from where the camera was, and a phone aimed a sixth
+        of the frame away between shots sent it to a wrong alignment that it
+        then reported as converged. A guess from matched features
+        (:func:`feature_homography`) puts it in the right basin first.
+        """
         live = self._crop(live_camera_frame)
         homography = self.motion == cv2.MOTION_HOMOGRAPHY
         warp = (np.eye(3, 3, dtype=np.float32) if homography
                 else np.eye(2, 3, dtype=np.float32))
+        if init is not None:
+            x, y, _, _ = self.roi
+            T = np.array([[1, 0, x], [0, 1, y], [0, 0, 1]], dtype=np.float64)
+            local = np.linalg.inv(T) @ np.asarray(init, np.float64) @ T
+            local /= local[2, 2]
+            warp = (local if homography else local[:2]).astype(np.float32)
         try:
             cc, warp = cv2.findTransformECC(
                 self.reference,

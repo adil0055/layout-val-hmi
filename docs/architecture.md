@@ -485,6 +485,27 @@ removal was considered and rejected for the measurement path: it returns a
 plausible image, and a measurement of a plausible image is a measurement of the
 model. `--keep-glare` turns all of this off.
 
+**Framing.** The display's right side kept coming back black, more on each
+attempt and in every calibration mode. Undistortion was cropping each photo to
+its all-valid region (`alpha=0`), and with a hand-held lens solve whose centre
+is a little off that crop is lopsided: 6% of each edge strip for a good solve,
+up to a quarter of one side for a loose one, gone before any other step ran.
+The capture server now keeps the whole photograph (`alpha=1`), and the setting
+is stored with the solve (`Intrinsics.alpha`) so a saved calibration stays true
+to the frame it was solved in. What a photograph genuinely leaves out is said
+rather than failed: the reference reports how much of the display is out of
+frame and on which side, and at Validate an element outside the test shot is
+not measured -- it would otherwise come back FAIL, missing, which it is not --
+but named, with a REVIEW, so a partial photo cannot pass as a whole one.
+
+The hand-held pose re-solve also starts from matched SIFT features now
+(`feature_homography`, RANSAC over Lowe-ratio matches) before ECC refines it.
+ECC walks downhill in brightness from wherever it starts, and a phone aimed a
+sixth of the frame away between shots sent it to a wrong alignment that it
+reported as converged -- every element FAIL. Seeded, shifts of 60, 160 and
+260 px align. A mounted camera is not seeded: one that moved that far should be
+caught, not followed.
+
 **Camera shake.** Moving the phone *between* shots is the pose re-solve's job;
 blur *within* a shot is `blur.py`'s. The two aligned, de-glared frames are
 related, to a good approximation, by one convolution, and with the sharp one

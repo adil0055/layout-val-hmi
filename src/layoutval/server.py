@@ -44,6 +44,7 @@ secure context.
 
 from __future__ import annotations
 
+import copy
 import json
 import secrets
 import socket
@@ -87,12 +88,13 @@ from layoutval.calibration import (
     homography_from_marked_corners,
     homography_from_screen_content,
     board_points_for_intrinsics,
+    feature_homography,
     solve_intrinsics,
 )
 from layoutval.pipeline import Pipeline, PipelineOptions
 from layoutval.profile import LayoutProfile
 from layoutval.report import annotate
-from layoutval.types import RunReport, Verdict
+from layoutval.types import RunReport, Verdict, resolve_value
 
 #: Biggest upload accepted.  A phone photograph is a few megabytes; anything an
 #: order of magnitude past that is not a photograph.
@@ -100,6 +102,11 @@ MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
 #: Longest side the hand-held pose is solved at. See ``_validate``.
 TRACK_SIDE = 2000
+
+#: Undistortion keeps the whole photograph (``Intrinsics.alpha``). Cropping to
+#: the all-valid region cut the display's right side off, more with each
+#: re-solve of the lens, whatever the calibration mode.
+KEEP_WHOLE_PHOTO = 1.0
 
 ACTIONS = ("intrinsics", "calibrate", "propose", "corners", "rebind",
            "reference", "validate")
@@ -366,6 +373,8 @@ class CaptureSession:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.profile = profile
         self.calibration = calibration
+        if calibration is not None and calibration.intrinsics is not None:
+            calibration.intrinsics.alpha = KEEP_WHOLE_PHOTO
         self.pattern_size = pattern_size
         self.square_px = square_px
         self.pattern_origin = pattern_origin
@@ -937,6 +946,7 @@ class CaptureSession:
                 self._intrinsic_frame_size,
                 min_views=want,
             )
+            intrinsics.alpha = KEEP_WHOLE_PHOTO
         except (RuntimeError, cv2.error) as exc:
             rec.verdict = "FAILED"
             rec.detail = f"the solve did not converge: {exc}. Shoot more views."
@@ -1325,8 +1335,14 @@ class CaptureSession:
         # the edge of the photograph leave empty border in the rectified frame,
         # and the photograph's edge against it is a long straight line that
         # segments like an element and cannot be measured.
-        seen = self.calibration.geometry.rectify(
-            np.full(undistorted.shape[:2], 255, np.uint8)) > 250
+        seen = self._coverage(frame.shape)
+        outside = _outside(seen)
+        if outside:
+            rec.detail += (
+                f". {outside} is outside this photo, and nothing there will be "
+                "checked. Step back or re-aim so the whole display is in the "
+                "picture, and take the reference again"
+            )
 
         # With no authored inventory, take one from the frame itself rather than
         # having nothing to measure. Only ever replaces an inventory this made
@@ -1348,6 +1364,11 @@ class CaptureSession:
                 "cluster in the state it is in now"
             )
         return rec
+
+    def _coverage(self, shape: tuple[int, ...], H: np.ndarray | None = None) -> np.ndarray:
+        """The part of display space a photograph of this size actually shows."""
+        ones = np.full(shape[:2], 255, np.uint8)
+        return self.calibration.geometry.rectify(self._undistort(ones), H) > 250
 
     def _validate(self, frame: np.ndarray, base: str) -> CaptureRecord:
         rec = CaptureRecord(name=f"{base}.jpg", action="validate",
@@ -1416,7 +1437,11 @@ class CaptureSession:
 
         H = self.calibration.geometry.H
         if tracker is not None:
-            est = tracker.measure(live_view)
+            # A rough start from matched features when the phone moved a lot;
+            # ECC then refines it. Only for the hand-held re-solve: a mounted
+            # camera that moved that far should be caught, not followed.
+            init = None if self.fixed_camera else feature_homography(ref_view, live_view)
+            est = tracker.measure(live_view, init=init)
             if scale < 1.0:
                 est = est.rescaled(scale)
             report.metadata["pose_shift_px"] = round(est.magnitude_px, 2)
@@ -1464,6 +1489,32 @@ class CaptureSession:
                         spread_px=round(shake.spread_px, 2),
                         detail="one photo was smeared by camera shake; the other was "
                                "blurred to match before comparing")
+        # Only what this photo actually shows is measured. An element outside
+        # it would come back FAIL, "missing", which it is not -- it is simply
+        # not in the picture -- so it is left out and named instead.
+        seen = self._coverage(frame.shape, H)
+        inside = cv2.erode(seen.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        missed = []
+        for spec in self.profile:
+            x, y, w, h = spec.expected_bbox(resolve_value(spec, self.values))
+            x0, y0 = max(0, int(np.floor(x))), max(0, int(np.floor(y)))
+            x1, y1 = int(np.ceil(x + w)), int(np.ceil(y + h))
+            if (x1 > inside.shape[1] or y1 > inside.shape[0]
+                    or not inside[y0:y1, x0:x1].all()):
+                missed.append(spec.id)
+        if missed:
+            checked = copy.copy(self.profile)
+            checked.elements = [s for s in self.profile if s.id not in missed]
+            pipeline.profile = checked
+            report.flag(
+                "outside_photo", severity="review", elements=missed,
+                detail=(
+                    f"{len(missed)} element(s) were outside this photo and were "
+                    "not checked" + (f" -- {_outside(seen)[:-1]} is out of frame"
+                                     if _outside(seen) else "") +
+                    ". Step back or re-aim so the whole display is in the picture."
+                ),
+            )
         report = pipeline.measure_frame(
             live_m, values=self.values, reference=ref_m, report=report,
         )
@@ -2073,6 +2124,20 @@ class _Handler(BaseHTTPRequestHandler):
         if not self.server.quiet:  # type: ignore[attr-defined]
             print(f"  {action}: {record.verdict} — {record.detail}")
         self._json(HTTPStatus.OK, payload)
+
+
+def _outside(seen: np.ndarray, *, allow: float = 0.01) -> str:
+    """"12% of the display, mostly on the right," -- or "" when it is all there."""
+    missing = 1.0 - float(seen.mean())
+    if missing <= allow:
+        return ""
+    h, w = seen.shape[:2]
+    bw, bh = max(1, w // 10), max(1, h // 10)
+    sides = {
+        "left": seen[:, :bw].mean(), "right": seen[:, -bw:].mean(),
+        "top": seen[:bh, :].mean(), "bottom": seen[-bh:, :].mean(),
+    }
+    return f"{100 * missing:.0f}% of the display, mostly on the {min(sides, key=sides.get)},"
 
 
 def _distort_points(points: np.ndarray, intrinsics: Any, new_k: np.ndarray) -> np.ndarray:

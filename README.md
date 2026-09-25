@@ -299,6 +299,13 @@ so it can blur an element but never move one. Streaks up to 12 px pass cleanly
 and a 2 px fault under them still measures 1.56–1.77 px. A 20 px streak, a
 visibly blurred photo, can leave a few elements marginal: retake it.
 
+Keep the whole display in the photo. Undistortion keeps every pixel of the
+photograph, and if a shot still leaves part of the display out, Reference says
+how much and on which side, and Validate skips the elements that are out of
+frame and names them instead of failing them. Aiming the phone differently
+between shots is fine: the pose is found from matched features first, so even
+a large change lines up.
+
 Two more things a phone brings with it. Its photos carry an EXIF orientation
 rather than rotated pixels, which is handled — a frame that came in on its side
 would calibrate and measure perfectly happily and be wrong about everything.
