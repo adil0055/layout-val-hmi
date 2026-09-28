@@ -144,8 +144,13 @@ class Pipeline:
         values: dict[str, float] | None = None,
         reference: np.ndarray | None = None,
         report: RunReport | None = None,
+        compare: np.ndarray | None = None,
     ) -> RunReport:
-        """Locate, score and assemble the record for one rectified frame."""
+        """Locate, score and assemble the record for one rectified frame.
+
+        ``compare`` marks where the two frames can be compared pixel for pixel,
+        for the residual check; None for everywhere.
+        """
         reference = self.profile.reference() if reference is None else reference
         report = report or RunReport(screen=self.profile.screen, theme=self.profile.theme)
 
@@ -178,6 +183,7 @@ class Pipeline:
                 values=values,
                 dissimilarity_threshold=self.options.residual_threshold,
                 min_area_px=self.options.residual_min_area_px,
+                valid=compare,
             )
             report.residual_score = score
             report.residual_findings = findings

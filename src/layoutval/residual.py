@@ -51,6 +51,7 @@ def residual_check(
     blur_sigma: float = 1.0,
     max_findings: int = 20,
     min_difference: float = 40.0,
+    valid: np.ndarray | None = None,
 ) -> tuple[float, list[ResidualFinding]]:
     """SSIM residual over the whole rectified frame.
 
@@ -71,6 +72,9 @@ def residual_check(
     both passing on all 80 elements, came back REVIEW for it. Something drawn or
     erased changes the brightness by a hundred levels or more; those changes are
     a few to a few tens.
+
+    ``valid`` marks where the two frames can be compared at all -- where both
+    photographs actually saw the display; nothing outside it is a finding.
     """
     ref = to_gray(reference).astype(np.float32)
     lv = to_gray(live).astype(np.float32)
@@ -82,6 +86,8 @@ def residual_check(
 
     score, diff_map = ssim(ref, lv, data_range=255.0, full=True)
     dissim = (1.0 - diff_map).astype(np.float32)
+    if valid is not None and valid.shape == dissim.shape:
+        dissim[~valid.astype(bool)] = 0.0
 
     mask = (dissim > dissimilarity_threshold).astype(np.uint8) * 255
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -203,3 +209,94 @@ def check_occlusions(
                     ElementResult(check_id, Verdict.PASS, None, m, spec.tolerance, spec.source)
                 )
     return results
+
+
+DISPLACED_MATCH = 0.8
+"""ZNCC at which a region is the same thing as in the reference, found nearby."""
+
+
+def displaced(reference: np.ndarray, live: np.ndarray,
+              bbox: tuple[int, int, int, int], reach: int) -> bool:
+    """Whether ``bbox`` of the reference is in ``live`` within ``reach`` px, unchanged.
+
+    That is a region moved or re-lit, not something drawn or gone: the same
+    content, a little way off. Of the display's own elements, a move is the
+    element checks' to measure; anything else that does it is not on the
+    display's plane -- trim, a bezel, the wall behind a screen -- and slides
+    against the display whenever the camera moves. A flat region matches
+    nothing and is never set aside here.
+    """
+    ref = to_gray(reference).astype(np.float32)
+    lv = to_gray(live).astype(np.float32)
+    x, y, w, h = (int(v) for v in bbox)
+    patch = ref[y:y + h, x:x + w]
+    if patch.size == 0 or float(patch.std()) < 4.0:
+        return False
+    H, W = lv.shape[:2]
+    x0, y0 = max(0, x - reach), max(0, y - reach)
+    x1, y1 = min(W, x + w + reach), min(H, y + h + reach)
+    area = lv[y0:y1, x0:x1]
+    if area.shape[0] < h or area.shape[1] < w:
+        return False
+    score = cv2.matchTemplate(area, patch, cv2.TM_CCOEFF_NORMED)
+    return float(score.max()) >= DISPLACED_MATCH
+
+
+def set_aside_displaced(report, reference: np.ndarray, live: np.ndarray,
+                        reach: int) -> int:
+    """Move residual findings that are the same content, moved or re-lit, into a note.
+
+    See :func:`displaced`. On a bench, display corners that took in part of the
+    laptop's lid and the wall behind it gave two such findings with every
+    element passing, and REVIEW. Returns how many were moved.
+    """
+    kept, moved = [], []
+    for finding in report.residual_findings:
+        (moved if displaced(reference, live, finding.bbox, reach) else kept).append(finding)
+    if moved:
+        report.residual_findings = kept
+        report.flag(
+            "residual_displaced", severity="note",
+            findings=[f.to_dict() for f in moved],
+            detail=(
+                f"{len(moved)} whole-frame difference(s) that are the same content "
+                "as the reference, shifted or re-lit -- not something drawn or gone. "
+                "Usually trim or background, off the display's plane, that moved "
+                "with the camera."
+            ),
+        )
+    return len(moved)
+
+
+def set_aside_beyond(report, reference: np.ndarray, drawn: np.ndarray,
+                     detail_min: float = 6.0) -> int:
+    """Move residual findings off the cluster's drawing, over something, into a note.
+
+    ``drawn`` is where the cluster draws: its elements' span, with a margin. A
+    finding mostly outside it, where the reference itself showed detail, is
+    not the display's: display corners a little wide take in the edge of a
+    laptop's lid, a cable, the wall behind, and those slide against the screen
+    whenever the camera moves. On a bench that put REVIEW on a run with all 109
+    elements passing. A finding outside the drawing where the reference was
+    plain background is kept -- something drawn where nothing was.
+    """
+    gray = to_gray(reference).astype(np.float32)
+    kept, moved = [], []
+    for finding in report.residual_findings:
+        x, y, w, h = (int(v) for v in finding.bbox)
+        inside = float(drawn[y:y + h, x:x + w].mean()) if w and h else 1.0
+        busy = float(gray[y:y + h, x:x + w].std()) >= detail_min if w and h else False
+        (moved if inside < 0.5 and busy else kept).append(finding)
+    if moved:
+        report.residual_findings = kept
+        report.flag(
+            "residual_beyond", severity="note",
+            findings=[f.to_dict() for f in moved],
+            detail=(
+                f"{len(moved)} whole-frame difference(s) beyond what the cluster "
+                "draws, where the reference showed something else -- trim, a lid, "
+                "the wall behind -- that moves with the camera. Check the display "
+                "corners if this is inside the screen."
+            ),
+        )
+    return len(moved)

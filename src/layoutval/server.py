@@ -64,6 +64,7 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
+from layoutval.anchor import can_anchor, element_correction
 from layoutval.autoprofile import profile_from_reference
 from layoutval import edgecheck, glare
 from layoutval.blur import match_shake
@@ -94,6 +95,7 @@ from layoutval.calibration import (
 from layoutval.pipeline import Pipeline, PipelineOptions
 from layoutval.profile import LayoutProfile
 from layoutval.report import annotate
+from layoutval.residual import set_aside_beyond, set_aside_displaced
 from layoutval.types import RunReport, Verdict, resolve_value
 
 #: Biggest upload accepted.  A phone photograph is a few megabytes; anything an
@@ -102,6 +104,11 @@ MAX_UPLOAD_BYTES = 40 * 1024 * 1024
 
 #: Longest side the hand-held pose is solved at. See ``_validate``.
 TRACK_SIDE = 2000
+
+#: A hand-held pose that the elements will finish (layoutval.anchor) is solved
+#: on a smaller copy, and briefly.
+COARSE_SIDE = 1000
+COARSE_ITERATIONS = 60
 
 #: Undistortion keeps the whole photograph (``Intrinsics.alpha``). Cropping to
 #: the all-valid region cut the display's right side off, more with each
@@ -1381,6 +1388,188 @@ class CaptureSession:
             )
         return rec
 
+    def _solve_pose(self, undistorted: np.ndarray, side: int, iterations: int,
+                    init: np.ndarray | None = None):
+        """The camera's move since the reference, solved on a copy ``side`` px long.
+
+        ``init`` is a starting warp in full-size pixels; without one, a hand-held
+        pose starts from matched features. The estimate comes back full size.
+        """
+        # Lined up on a reduced copy. The pose is eight numbers fitted to the
+        # whole frame, and a phone's full 24 MP bought nothing for them but
+        # 13-19 s and 3.4 GB -- enough to have the laptop kill the server or
+        # the phone give up waiting. Only the alignment is reduced; the
+        # measurement still rectifies from the full photograph.
+        h0, w0 = undistorted.shape[:2]
+        scale = min(1.0, side / max(h0, w0))
+        ref_view, live_view = self.reference_camera, undistorted
+        if ref_view.shape != live_view.shape:
+            scale = 1.0     # left as it was; ECC says it cannot line them up
+        if scale < 1.0:
+            size = (round(w0 * scale), round(h0 * scale))
+            ref_view = cv2.resize(ref_view, size, interpolation=cv2.INTER_AREA)
+            live_view = cv2.resize(live_view, size, interpolation=cv2.INTER_AREA)
+            scale = size[0] / w0
+        h, w = live_view.shape[:2]
+        seen = None
+        if self.deglare and live_view.ndim == 3 and ref_view.shape == live_view.shape:
+            # And on the frames with their reflections taken out. ECC
+            # matches brightness, and a reflection that moved between the
+            # two shots is a brightness change it explains as the camera
+            # moving: with the camera still, glare alone was read as
+            # 0.5-11 px of motion, which then dragged every element with it.
+            seen = glare.deglare_pair(ref_view, live_view, bright=self.glare_bright)
+            ref_view, live_view = seen.reference, seen.live
+        picture = on_screen = None
+        if not self.fixed_camera:
+            picture, on_screen = self._pose_masks(undistorted.shape, (w, h), scale)
+            if seen is not None and seen.footprint.shape == on_screen.shape:
+                # Nor on a reflection: it lies on the glass, not in the
+                # picture, and what the subtraction leaves of a compact lamp
+                # pulled the pose 0.5 px once it was a larger part of what
+                # the pose was fitted to. Unless it covers most of the screen:
+                # then what is left is too little to fit.
+                clear = on_screen & ~seen.footprint
+                if clear.sum() >= 0.4 * on_screen.sum():
+                    on_screen = clear
+        tracker = DriftTracker(
+            ref_view,
+            (0, 0, w, h),
+            alarm_px=self.drift_alarm_px * scale,
+            motion=(cv2.MOTION_EUCLIDEAN if self.fixed_camera
+                    else cv2.MOTION_HOMOGRAPHY),
+            mask=on_screen,
+            max_iterations=iterations,
+        )
+        if init is not None:
+            S = np.diag([scale, scale, 1.0])
+            init = S @ init @ np.linalg.inv(S)
+        elif not self.fixed_camera:
+            # A rough start from matched features when the phone moved a lot;
+            # ECC then refines it. Only for the hand-held re-solve: a mounted
+            # camera that moved that far should be caught, not followed.
+            init = feature_homography(ref_view, live_view)
+        est = tracker.measure(live_view, init=init, live_mask=picture)
+        if on_screen is not None and not est.converged:
+            # Too little on the screen itself to line up on: the whole frame,
+            # as before, rather than no answer.
+            tracker.mask = None
+            est = tracker.measure(live_view, init=init)
+        return est.rescaled(scale) if scale < 1.0 else est
+
+    def _measure_at(self, undistorted: np.ndarray, shape: tuple[int, ...],
+                    H: np.ndarray, report: RunReport) -> tuple[RunReport, np.ndarray]:
+        """Rectify through ``H`` and measure everything; the report and the frame."""
+        # Stages 4-6 only: there is one frame rather than a live source, and
+        # the pose is resolved by the caller, so the pipeline is handed an
+        # already rectified frame.
+        pipeline = Pipeline(
+            self.calibration,
+            self.profile,
+            options=PipelineOptions(settle=False, frames_per_measurement=1),
+        )
+        live = self.calibration.geometry.rectify(undistorted, H)
+        pair = None
+        if self.deglare and live.ndim == 3 and live.shape == self.reference.shape:
+            pair = glare.deglare_pair(self.reference, live, bright=self.glare_bright)
+        ref_m, live_m = (pair.reference, pair.live) if pair else (self.reference, live)
+        # A photo smeared by the hand moving during the exposure is compared
+        # with the reference smeared the same way. See layoutval.blur.
+        shake = match_shake(ref_m, live_m)
+        ref_m, live_m = shake.reference, shake.live
+        if shake.kernel is not None:
+            report.flag("shake_matched", severity="note", blurred=shake.applied_to,
+                        spread_px=round(shake.spread_px, 2),
+                        detail="one photo was smeared by camera shake; the other was "
+                               "blurred to match before comparing")
+        # Only what this photo actually shows is measured. An element outside
+        # it would come back FAIL, "missing", which it is not -- it is simply
+        # not in the picture -- so it is left out and named instead.
+        seen = self._coverage(shape, H)
+        inside = cv2.erode(seen.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        missed = []
+        for spec in self.profile:
+            x, y, w, h = spec.expected_bbox(resolve_value(spec, self.values))
+            x0, y0 = max(0, int(np.floor(x))), max(0, int(np.floor(y)))
+            x1, y1 = int(np.ceil(x + w)), int(np.ceil(y + h))
+            if (x1 > inside.shape[1] or y1 > inside.shape[0]
+                    or not inside[y0:y1, x0:x1].all()):
+                missed.append(spec.id)
+        if missed:
+            checked = copy.copy(self.profile)
+            checked.elements = [s for s in self.profile if s.id not in missed]
+            pipeline.profile = checked
+            report.flag(
+                "outside_photo", severity="review", elements=missed,
+                detail=(
+                    f"{len(missed)} element(s) were outside this photo and were "
+                    "not checked" + (f" -- {_outside(seen)[:-1]} is out of frame"
+                                     if _outside(seen) else "") +
+                    ". Step back or re-aim so the whole display is in the picture."
+                ),
+            )
+        report = pipeline.measure_frame(
+            live_m, values=self.values, reference=ref_m, report=report,
+            compare=self._comparable(inside),
+        )
+        if pair is not None:
+            # Glare is taken out, never reported on: it is the room, not the
+            # display, and a verdict is about the display. What was subtracted
+            # is kept in the saved report as a note.
+            glare.recheck_under_glare(report, self.profile, ref_m, live_m,
+                                      pair.footprint, pair.clipped, values=self.values)
+            glare.set_aside_residual(report, pair.footprint, ref_m, live_m)
+        set_aside_displaced(report, ref_m, live_m,
+                            reach=round(0.04 * max(self.reference.shape[:2])))
+        set_aside_beyond(report, ref_m, self._drawn_area(ref_m.shape))
+        if pair is not None and pair.subtracted >= 20:
+            report.flag(
+                "glare_subtracted", severity="note",
+                peak_levels=pair.subtracted,
+                area_pct=round(100 * float(pair.footprint.mean()), 1),
+                clipped_pct=round(100 * float(pair.clipped.mean()), 2),
+                detail="a reflection on the glass was measured and subtracted",
+            )
+        return report, live
+
+    def _comparable(self, live_seen: np.ndarray) -> np.ndarray:
+        """Where the two photos can be compared pixel for pixel, in display space.
+
+        Only where both photos saw the display, and not its outer rim. A part of
+        the display outside the test photo is empty there, and read as
+        "something gone"; the rim is where the corners are least certain and
+        where trim, bezel or whatever is behind the screen shows through when
+        the camera moves -- the same rim the inventory leaves out.
+        """
+        ok = live_seen & self._reference_seen()
+        h, w = ok.shape[:2]
+        rim = round(0.02 * min(h, w))
+        ok[:rim] = False
+        ok[h - rim:] = False
+        ok[:, :rim] = False
+        ok[:, w - rim:] = False
+        return ok
+
+    def _drawn_area(self, shape: tuple[int, ...]) -> np.ndarray:
+        """The part of display space the cluster draws in: its elements' span, padded."""
+        h, w = shape[:2]
+        corners = []
+        for spec in self.profile:
+            x, y, bw, bh = spec.expected_bbox(resolve_value(spec, self.values))
+            corners += [(x, y), (x + bw, y), (x + bw, y + bh), (x, y + bh)]
+        if len(corners) < 3:
+            return np.ones((h, w), bool)
+        drawn = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(drawn, cv2.convexHull(np.float32(corners)).astype(np.int32), 1)
+        pad = 2 * round(0.03 * min(h, w)) + 1
+        return cv2.dilate(drawn, np.ones((pad, pad), np.uint8)) > 0
+
+    def _reference_seen(self) -> np.ndarray:
+        if self.reference_camera is None:
+            return np.ones(self.reference.shape[:2], bool)
+        seen = self._coverage(self.reference_camera.shape)
+        return cv2.erode(seen.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+
     def _check_edges(self, report: RunReport, undistorted: np.ndarray,
                      warp: np.ndarray) -> None:
         """The whole layout against the display's edges. See layoutval.edgecheck."""
@@ -1469,73 +1658,18 @@ class CaptureSession:
         undistorted = self._undistort(frame)
         report = RunReport(screen=self.profile.screen, theme=self.profile.theme)
 
-        tracker = None
-        if self.reference_camera is not None:
-            # Lined up on a reduced copy. The pose is eight numbers fitted to the
-            # whole frame, and a phone's full 24 MP bought nothing for them but
-            # 13-19 s and 3.4 GB -- enough to have the laptop kill the server or
-            # the phone give up waiting. Only the alignment is reduced; the
-            # measurement still rectifies from the full photograph.
-            h0, w0 = undistorted.shape[:2]
-            scale = min(1.0, TRACK_SIDE / max(h0, w0))
-            ref_view, live_view = self.reference_camera, undistorted
-            if ref_view.shape != live_view.shape:
-                scale = 1.0     # left as it was; ECC says it cannot line them up
-            if scale < 1.0:
-                size = (round(w0 * scale), round(h0 * scale))
-                ref_view = cv2.resize(ref_view, size, interpolation=cv2.INTER_AREA)
-                live_view = cv2.resize(live_view, size, interpolation=cv2.INTER_AREA)
-                scale = size[0] / w0
-            h, w = live_view.shape[:2]
-            seen = None
-            if self.deglare and live_view.ndim == 3 and ref_view.shape == live_view.shape:
-                # And on the frames with their reflections taken out. ECC
-                # matches brightness, and a reflection that moved between the
-                # two shots is a brightness change it explains as the camera
-                # moving: with the camera still, glare alone was read as
-                # 0.5-11 px of motion, which then dragged every element with it.
-                seen = glare.deglare_pair(ref_view, live_view, bright=self.glare_bright)
-                ref_view, live_view = seen.reference, seen.live
-            picture = on_screen = None
-            if not self.fixed_camera:
-                picture, on_screen = self._pose_masks(undistorted.shape, (w, h), scale)
-                if seen is not None and seen.footprint.shape == on_screen.shape:
-                    # Nor on a reflection: it lies on the glass, not in the
-                    # picture, and what the subtraction leaves of a compact lamp
-                    # pulled the pose 0.5 px once it was a larger part of what
-                    # the pose was fitted to.
-                    on_screen = on_screen & ~seen.footprint
-            tracker = DriftTracker(
-                ref_view,
-                (0, 0, w, h),
-                alarm_px=self.drift_alarm_px * scale,
-                motion=(cv2.MOTION_EUCLIDEAN if self.fixed_camera
-                        else cv2.MOTION_HOMOGRAPHY),
-                mask=on_screen,
-            )
-        # Stages 4-6 only: there is one frame rather than a live source, and
-        # the pose below is resolved here, so the pipeline is handed an already
-        # rectified frame.
-        pipeline = Pipeline(
-            self.calibration,
-            self.profile,
-            options=PipelineOptions(settle=False, frames_per_measurement=1),
-        )
-
+        hand_held = self.reference_camera is not None and not self.fixed_camera
+        # With enough elements to anchor on, the screen-wide pose only has to be
+        # close: the elements finish it (layoutval.anchor). So it is solved
+        # coarse and quick -- which also serves it better. Under a haze on the
+        # glass, ECC on a 2000 px copy settled 4.6 px from a camera that had not
+        # moved, and took 54 s to do it; on 1000 px it was within 0.6 px in 2 s.
+        anchored = hand_held and can_anchor(self.profile)
         H = self.calibration.geometry.H
-        if tracker is not None:
-            # A rough start from matched features when the phone moved a lot;
-            # ECC then refines it. Only for the hand-held re-solve: a mounted
-            # camera that moved that far should be caught, not followed.
-            init = None if self.fixed_camera else feature_homography(ref_view, live_view)
-            est = tracker.measure(live_view, init=init, live_mask=picture)
-            if on_screen is not None and not est.converged:
-                # Too little on the screen itself to line up on: the whole frame,
-                # as before, rather than no answer.
-                tracker.mask = None
-                est = tracker.measure(live_view, init=init)
-            if scale < 1.0:
-                est = est.rescaled(scale)
+        est = None
+        if self.reference_camera is not None:
+            est = (self._solve_pose(undistorted, COARSE_SIDE, COARSE_ITERATIONS) if anchored
+                   else self._solve_pose(undistorted, TRACK_SIDE, 200))
             report.metadata["pose_shift_px"] = round(est.magnitude_px, 2)
             if not est.converged:
                 rec.verdict = "FAILED"
@@ -1544,7 +1678,7 @@ class CaptureSession:
                     "has moved too far, or it is not looking at the same screen."
                 )
                 return rec
-            H = tracker.corrected_homography(self.calibration.geometry, est)
+            H = est.warp_camera @ self.calibration.geometry.H
             if self.fixed_camera and est.exceeds:
                 report.flag(
                     "camera_moved", severity="review",
@@ -1566,68 +1700,44 @@ class CaptureSession:
                     ),
                 )
 
-        live = self.calibration.geometry.rectify(undistorted, H)
+        flags = list(report.flags)
+        report, live = self._measure_at(undistorted, frame.shape, H, report)
+        if anchored:
+            # The last step of a hand-held pose: from the elements themselves,
+            # then measured again. See layoutval.anchor.
+            fine = False
+            for _ in range(3):
+                fix = element_correction(report, self.profile, self.values)
+                if fix is not None and fix.largest_px < 0.25:
+                    break
+                if fix is None:
+                    if fine:
+                        break
+                    # No one mapping explains the elements -- too many out of
+                    # reach of a coarse pose, or too few found. The screen-wide
+                    # pose, solved fine from where the coarse one left it.
+                    fine = True
+                    est = self._solve_pose(
+                        undistorted, TRACK_SIDE, 200,
+                        init=H @ np.linalg.inv(self.calibration.geometry.H))
+                    if not est.converged:
+                        break
+                    H = est.warp_camera @ self.calibration.geometry.H
+                    step = {"fine": True}
+                else:
+                    H = H @ fix.G
+                    step = {"used": fix.used, "inliers": fix.inliers,
+                            "largest_px": round(fix.largest_px, 2)}
+                fresh = RunReport(screen=self.profile.screen, theme=self.profile.theme)
+                fresh.flags = list(flags)
+                fresh.metadata = dict(report.metadata)
+                fresh.metadata.setdefault("pose_steps", []).append(step)
+                report, live = self._measure_at(undistorted, frame.shape, H, fresh)
         self._store(f"{base}-rectified.png", live)
-        pair = None
-        if self.deglare and live.ndim == 3 and live.shape == self.reference.shape:
-            pair = glare.deglare_pair(self.reference, live, bright=self.glare_bright)
-        ref_m, live_m = (pair.reference, pair.live) if pair else (self.reference, live)
-        # A photo smeared by the hand moving during the exposure is compared
-        # with the reference smeared the same way. See layoutval.blur.
-        shake = match_shake(ref_m, live_m)
-        ref_m, live_m = shake.reference, shake.live
-        if shake.kernel is not None:
-            report.flag("shake_matched", severity="note", blurred=shake.applied_to,
-                        spread_px=round(shake.spread_px, 2),
-                        detail="one photo was smeared by camera shake; the other was "
-                               "blurred to match before comparing")
-        # Only what this photo actually shows is measured. An element outside
-        # it would come back FAIL, "missing", which it is not -- it is simply
-        # not in the picture -- so it is left out and named instead.
-        seen = self._coverage(frame.shape, H)
-        inside = cv2.erode(seen.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
-        missed = []
-        for spec in self.profile:
-            x, y, w, h = spec.expected_bbox(resolve_value(spec, self.values))
-            x0, y0 = max(0, int(np.floor(x))), max(0, int(np.floor(y)))
-            x1, y1 = int(np.ceil(x + w)), int(np.ceil(y + h))
-            if (x1 > inside.shape[1] or y1 > inside.shape[0]
-                    or not inside[y0:y1, x0:x1].all()):
-                missed.append(spec.id)
-        if missed:
-            checked = copy.copy(self.profile)
-            checked.elements = [s for s in self.profile if s.id not in missed]
-            pipeline.profile = checked
-            report.flag(
-                "outside_photo", severity="review", elements=missed,
-                detail=(
-                    f"{len(missed)} element(s) were outside this photo and were "
-                    "not checked" + (f" -- {_outside(seen)[:-1]} is out of frame"
-                                     if _outside(seen) else "") +
-                    ". Step back or re-aim so the whole display is in the picture."
-                ),
-            )
-        report = pipeline.measure_frame(
-            live_m, values=self.values, reference=ref_m, report=report,
-        )
-        if pair is not None:
-            # Glare is taken out, never reported on: it is the room, not the
-            # display, and a verdict is about the display. What was subtracted
-            # is kept in the saved report as a note.
-            glare.recheck_under_glare(report, self.profile, ref_m, live_m,
-                                      pair.footprint, pair.clipped, values=self.values)
-            glare.set_aside_residual(report, pair.footprint, ref_m, live_m)
-            if pair.subtracted >= 20:
-                report.flag(
-                    "glare_subtracted", severity="note",
-                    peak_levels=pair.subtracted,
-                    area_pct=round(100 * float(pair.footprint.mean()), 1),
-                    clipped_pct=round(100 * float(pair.clipped.mean()), 2),
-                    detail="a reflection on the glass was measured and subtracted",
-                )
 
-        if self.edge_check and tracker is not None and not self.fixed_camera:
-            self._check_edges(report, undistorted, est.warp_camera)
+        if self.edge_check and hand_held:
+            self._check_edges(report, undistorted,
+                              H @ np.linalg.inv(self.calibration.geometry.H))
 
         overlay = annotate(live, report, self.profile, values=self.values)
         self._store(f"{base}-overlay.png", overlay)

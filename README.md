@@ -275,6 +275,17 @@ pose fitted to the whole photo was right for none of it: moved 3 cm sideways at
 Now it passes, and a 2 px fault still reads 1.7–2.1 px, for the camera turned,
 rolled, moved sideways, closer or further.
 
+The pose is then finished on the elements themselves: after a first
+measurement, the one smooth mapping that explains where they were found
+corrects it, fitted so that an element that really moved is left out and still
+reported. A haze of room light on the glass pulled the screen-wide pose far
+enough that a good screen failed with the phone moved; finished on the
+elements, it passes, for any cluster with 8 or more elements.
+
+Differences outside what the cluster draws, where the reference showed trim, a
+lid or the wall behind, no longer make a passing run REVIEW. Something drawn
+where the screen was empty still does.
+
 `--edges` also checks the whole layout against the display's own edges, which
 do not move with what is drawn: each edge is carried into the test photo by the
 pose and lined up with what is there. On two bench photos a 2 px shift of the

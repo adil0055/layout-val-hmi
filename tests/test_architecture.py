@@ -24,6 +24,7 @@ MEASUREMENT_PATH = [
     "glare.py",
     "blur.py",
     "edgecheck.py",
+    "anchor.py",
     "capture.py",
     "residual.py",
     "repeatability.py",

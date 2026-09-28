@@ -249,8 +249,31 @@ sideways at 50 cm put every element of a good screen 6-11 px out; fitted to the
 screen, the worst was 0.6 px. The empty border left by undistortion stays put
 when the camera moves and was read as the scene staying put -- 0.8-1 px of pose
 error for a camera turned 3 degrees or 10% closer. A reflection lies on the
-glass, not in the picture. If too little is left to fit, the whole frame is
-used as before.
+glass, not in the picture -- unless it covers most of the screen, as a haze of
+room light does: left out then, what remained was too little to fit, and a
+good screen came back FAIL with the phone moved 4 degrees (5-6.5 px). It is now
+left out only while 40% of the screen remains. If too little is left to fit,
+the whole frame is used as before.
+
+**The pose is finished on the elements** (`anchor.py`). The screen-wide pose is
+fitted to brightness, and whatever changes brightness without moving the
+screen pulls it. The elements lie on the display's plane and are each located
+on their own detail, so after a first measurement the pose is corrected by the
+one homography that best explains where they were found -- RANSAC, 1 px, so an
+element that really moved is left out of the fit and still reports its move --
+and everything is measured again. A homography needs 20 elements that shift
+(icons, text, telltales, regions; not needles), an affine map 8; below that
+the pose is left to ECC. With the elements to finish it, ECC runs coarse --
+1000 px, 60 iterations -- which under haze was both better and faster than
+2000 px (4.6 px off in 54 s with the camera not moved; 0.6 px in 2 s). If no
+mapping explains most elements, ECC is run fine from the coarse pose and the
+elements are tried again.
+
+Measured on a simulated bench -- the user's cluster in a laptop window, a wall
+behind at 1.5x the distance, a haze on the glass that moves with the phone:
+turned 4 degrees, moved 4 cm sideways, or closer and tilted, a good screen
+passes (worst 0.2-0.4 px) and a 2 px move of one text block reads 1.97-2.14 px,
+on that block alone.
 
 `--edges` (`edgecheck.py`) measures what the re-solve cannot: the drawing
 against the display's edges. The edges are proposed in the reference; at
@@ -418,6 +441,25 @@ photographs of one screen came back "80 pass, 0 review, 0 fail" under the word
 REVIEW for it. A region is now a finding only if the brightness there changed
 by 40 grey levels or more (the 90th percentile of the difference); something
 drawn or erased changes it by a hundred or more, those by a few to a few tens.
+
+**Only where there is something to compare, and something to find.** With the
+phone moved between shots, a bench run came back REVIEW with all 109 elements
+passing: the display corners took in a strip of the laptop's lid and the wall
+behind, which slide against the screen when the camera moves. Three rules, all
+about what is not the display:
+
+- the comparison covers only what both photos saw of the display, less its
+  outer 2% -- the rim the inventory also leaves out;
+- a finding that is the reference's own content found nearby (ZNCC 0.8 within
+  4% of the display) is something moved or re-lit, not drawn or gone: the
+  element checks measure moves, and anything else that moves is off the
+  display's plane;
+- a finding mostly outside the cluster's drawing -- its elements' span, padded
+  3% -- where the reference itself showed detail is trim, lid or background.
+  Outside the drawing on plain background it is kept: something drawn where
+  nothing was is exactly what this check is for.
+
+Set-aside findings go to a note in the saved report.
 
 ---
 
@@ -681,6 +723,7 @@ src/layoutval/
 ├── calibration.py    stages 2–3: intrinsics, six homography routes, drift
 ├── displayfind.py    proposes the display's corners from an ordinary photograph
 ├── edgecheck.py      --edges: the whole layout against the display's own edges
+├── anchor.py         the hand-held pose, finished on the elements themselves
 ├── glare.py          reflections off the glass, subtracted
 ├── blur.py           camera shake, matched between the two photos
 ├── measure.py        stage 4: estimators, per-kind measurement, guards
