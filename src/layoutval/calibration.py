@@ -1795,6 +1795,7 @@ class DriftTracker:
         eps: float = 1e-6,
         gauss_filt_size: int = 5,
         motion: int = cv2.MOTION_EUCLIDEAN,
+        mask: np.ndarray | None = None,
     ) -> None:
         x, y, w, h = static_roi
         self.roi = (int(x), int(y), int(w), int(h))
@@ -1807,13 +1808,21 @@ class DriftTracker:
         )
         self._gauss = int(gauss_filt_size)
         self.reference = self._crop(reference_camera_frame)
+        # Which pixels of the reference frame to line up on; None for all of them.
+        self.mask = None if mask is None else (
+            np.asarray(mask)[y : y + h, x : x + w] > 0).astype(np.uint8)
 
     def _crop(self, img: np.ndarray) -> np.ndarray:
         x, y, w, h = self.roi
         return to_gray(img)[y : y + h, x : x + w].astype(np.float32)
 
+    def _crop_mask(self, mask: np.ndarray) -> np.ndarray:
+        x, y, w, h = self.roi
+        return np.asarray(mask)[y : y + h, x : x + w]
+
     def measure(self, live_camera_frame: np.ndarray,
-                init: np.ndarray | None = None) -> DriftEstimate:
+                init: np.ndarray | None = None,
+                live_mask: np.ndarray | None = None) -> DriftEstimate:
         """``init`` is a starting guess for the warp, 3x3, in full-frame pixels.
 
         ECC refines; it does not search. Started from nothing, it follows the
@@ -1821,6 +1830,10 @@ class DriftTracker:
         of the frame away between shots sent it to a wrong alignment that it
         then reported as converged. A guess from matched features
         (:func:`feature_homography`) puts it in the right basin first.
+
+        ``live_mask`` marks the part of the live frame that is picture, as
+        ``mask`` does for the reference. ECC takes a mask for one frame only,
+        so this one is carried over to the reference through ``init``.
         """
         live = self._crop(live_camera_frame)
         homography = self.motion == cv2.MOTION_HOMOGRAPHY
@@ -1832,6 +1845,14 @@ class DriftTracker:
             local = np.linalg.inv(T) @ np.asarray(init, np.float64) @ T
             local /= local[2, 2]
             warp = (local if homography else local[:2]).astype(np.float32)
+        mask = self.mask
+        if live_mask is not None:
+            lm = (self._crop_mask(live_mask) > 0).astype(np.uint8)
+            h, w = self.reference.shape[:2]
+            W = warp if homography else np.vstack([warp, [0, 0, 1]])
+            back = cv2.warpPerspective(lm, W.astype(np.float64), (w, h),
+                                       flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP)
+            mask = back if mask is None else mask & back
         try:
             cc, warp = cv2.findTransformECC(
                 self.reference,
@@ -1839,7 +1860,7 @@ class DriftTracker:
                 warp,
                 self.motion,
                 self._criteria,
-                None,
+                mask,
                 self._gauss,
             )
             converged = True

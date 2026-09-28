@@ -65,7 +65,7 @@ import cv2
 import numpy as np
 
 from layoutval.autoprofile import profile_from_reference
-from layoutval import glare
+from layoutval import edgecheck, glare
 from layoutval.blur import match_shake
 from layoutval.displayfind import propose_display_corners
 from layoutval.calibration import (
@@ -360,8 +360,12 @@ class CaptureSession:
         board_display_size: tuple[int, int] | None = None,
         deglare: bool = True,
         board_candidates: list[dict] | None = None,
+        edge_check: bool = False,
     ) -> None:
         self.lock = threading.Lock()
+        #: Also check the whole layout against the display's own edges, which
+        #: a hand-held pose cannot see. Opt-in. See :mod:`layoutval.edgecheck`.
+        self.edge_check = edge_check
         #: Subtract reflections off the cover glass before measuring. Never
         #: changes a verdict on its own. See :mod:`layoutval.glare`.
         self.deglare = deglare
@@ -440,6 +444,7 @@ class CaptureSession:
             self.set_mode(calib_mode)
         self.reference: np.ndarray | None = None
         self.reference_camera: np.ndarray | None = None
+        self.reference_edges: np.ndarray | None = None
         self.history: list[CaptureRecord] = []
 
         if profile is not None and profile.reference_path:
@@ -495,6 +500,7 @@ class CaptureSession:
                     drift_alarm_px=self.drift_alarm_px)
                 self.reference = None
                 self.reference_camera = None
+                self.reference_edges = None
                 if self._profile_is_auto:
                     self.profile = None
                     self._profile_is_auto = False
@@ -858,6 +864,7 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
+        self.reference_edges = None
 
     def _note_sampling_ratio(self, rec: CaptureRecord, geometry: Any) -> None:
         ratio = geometry.sampling_ratio()
@@ -1094,6 +1101,7 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
+        self.reference_edges = None
         return rec
 
     def _propose(self, frame: np.ndarray, base: str) -> CaptureRecord:
@@ -1270,6 +1278,7 @@ class CaptureSession:
             )
         self.reference = None
         self.reference_camera = None
+        self.reference_edges = None
         return rec
 
     def _why_no_board(self, frame: np.ndarray, saved_as: str) -> str:
@@ -1325,6 +1334,13 @@ class CaptureSession:
             f"rectified to {self.reference.shape[1]}x{self.reference.shape[0]} "
             "display px and kept as the reference"
         )
+        if self.edge_check:
+            self.reference_edges = edgecheck.reference_corners(undistorted)
+            if self.reference_edges is None:
+                rec.detail += (
+                    ". The display's edges were not found in this photo, so a shift "
+                    "of the whole layout will not be checked"
+                )
         # Elements are found on the frame with its reflections taken off, or a
         # reflection's edge is found as an element and its hill merges real ones.
         segment_from = self.reference
@@ -1364,6 +1380,66 @@ class CaptureSession:
                 "cluster in the state it is in now"
             )
         return rec
+
+    def _check_edges(self, report: RunReport, undistorted: np.ndarray,
+                     warp: np.ndarray) -> None:
+        """The whole layout against the display's edges. See layoutval.edgecheck."""
+        drawn = [(r.measurement.dx, r.measurement.dy) for r in report.results
+                 if r.measurement.dx is not None and r.measurement.dy is not None
+                 and not r.measurement.element_absent]
+        shift = None
+        if self.reference_edges is not None and len(drawn) >= 3:
+            sides = edgecheck.edge_offsets(self.reference_camera, undistorted,
+                                           self.reference_edges, warp)
+            shift = edgecheck.layout_shift(self.calibration.geometry.H, sides,
+                                           tuple(np.median(np.array(drawn), axis=0)))
+        if shift is None or (shift.dx is None and shift.dy is None):
+            report.flag("layout_vs_edges", severity="note", checked=False,
+                        detail="whole-layout shift not checked: the display's edges "
+                               "could not be lined up between the two photos")
+            return
+        tol = self.profile.defaults
+        moved = shift.magnitude
+        severity = ("fail" if moved > tol.tol_fail else
+                    "review" if moved > tol.tol_warn else "note")
+        parts = [f"{name} {v:+.2f}" for name, v in (("x", shift.dx), ("y", shift.dy))
+                 if v is not None]
+        unchecked = [name for name, v in (("x", shift.dx), ("y", shift.dy)) if v is None]
+        detail = (f"whole layout moved {moved:.2f} px against the display's edges"
+                  if severity != "note" else
+                  f"whole layout in place against the display's edges ({moved:.2f} px)")
+        detail += f" ({', '.join(parts)})"
+        if unchecked:
+            detail += f"; {unchecked[0]} not checked"
+        report.flag("layout_vs_edges", severity=severity, checked=True,
+                    dx=None if shift.dx is None else round(shift.dx, 2),
+                    dy=None if shift.dy is None else round(shift.dy, 2),
+                    detail=detail)
+
+    def _pose_masks(self, shape: tuple[int, ...], size: tuple[int, int],
+                    scale: float) -> tuple[np.ndarray, np.ndarray]:
+        """Where a hand-held pose is solved: (picture, screen) at tracking size.
+
+        *Picture* is what of a photograph is photograph: undistortion leaves an
+        empty border that stays put when the camera moves, and ECC read it as
+        the scene staying put -- 0.8-1 px of pose error on a camera moved 3
+        degrees or 10% closer. *Screen* is the display, in the reference: the
+        only thing in the photograph that lies in the display's plane. A desk,
+        a keyboard or a dashboard at another depth moves differently when the
+        camera moves (parallax), and a pose fitted to all of it is right for
+        none of it.
+        """
+        w, h = size
+        ones = np.full(shape[:2], 255, np.uint8)
+        picture = cv2.resize(self._undistort(ones), (w, h), interpolation=cv2.INTER_AREA) > 250
+        picture = cv2.erode(picture.astype(np.uint8), np.ones((9, 9), np.uint8))
+        dw, dh = self.calibration.geometry.display_size
+        quad = cv2.perspectiveTransform(
+            np.float64([[[0, 0]], [[dw, 0]], [[dw, dh]], [[0, dh]]]),
+            self.calibration.geometry.H) * scale
+        screen = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(screen, np.round(quad.reshape(-1, 2)).astype(np.int32), 1)
+        return picture, screen & picture
 
     def _coverage(self, shape: tuple[int, ...], H: np.ndarray | None = None) -> np.ndarray:
         """The part of display space a photograph of this size actually shows."""
@@ -1411,6 +1487,7 @@ class CaptureSession:
                 live_view = cv2.resize(live_view, size, interpolation=cv2.INTER_AREA)
                 scale = size[0] / w0
             h, w = live_view.shape[:2]
+            seen = None
             if self.deglare and live_view.ndim == 3 and ref_view.shape == live_view.shape:
                 # And on the frames with their reflections taken out. ECC
                 # matches brightness, and a reflection that moved between the
@@ -1419,12 +1496,22 @@ class CaptureSession:
                 # 0.5-11 px of motion, which then dragged every element with it.
                 seen = glare.deglare_pair(ref_view, live_view, bright=self.glare_bright)
                 ref_view, live_view = seen.reference, seen.live
+            picture = on_screen = None
+            if not self.fixed_camera:
+                picture, on_screen = self._pose_masks(undistorted.shape, (w, h), scale)
+                if seen is not None and seen.footprint.shape == on_screen.shape:
+                    # Nor on a reflection: it lies on the glass, not in the
+                    # picture, and what the subtraction leaves of a compact lamp
+                    # pulled the pose 0.5 px once it was a larger part of what
+                    # the pose was fitted to.
+                    on_screen = on_screen & ~seen.footprint
             tracker = DriftTracker(
                 ref_view,
                 (0, 0, w, h),
                 alarm_px=self.drift_alarm_px * scale,
                 motion=(cv2.MOTION_EUCLIDEAN if self.fixed_camera
                         else cv2.MOTION_HOMOGRAPHY),
+                mask=on_screen,
             )
         # Stages 4-6 only: there is one frame rather than a live source, and
         # the pose below is resolved here, so the pipeline is handed an already
@@ -1441,7 +1528,12 @@ class CaptureSession:
             # ECC then refines it. Only for the hand-held re-solve: a mounted
             # camera that moved that far should be caught, not followed.
             init = None if self.fixed_camera else feature_homography(ref_view, live_view)
-            est = tracker.measure(live_view, init=init)
+            est = tracker.measure(live_view, init=init, live_mask=picture)
+            if on_screen is not None and not est.converged:
+                # Too little on the screen itself to line up on: the whole frame,
+                # as before, rather than no answer.
+                tracker.mask = None
+                est = tracker.measure(live_view, init=init)
             if scale < 1.0:
                 est = est.rescaled(scale)
             report.metadata["pose_shift_px"] = round(est.magnitude_px, 2)
@@ -1533,6 +1625,9 @@ class CaptureSession:
                     clipped_pct=round(100 * float(pair.clipped.mean()), 2),
                     detail="a reflection on the glass was measured and subtracted",
                 )
+
+        if self.edge_check and tracker is not None and not self.fixed_camera:
+            self._check_edges(report, undistorted, est.warp_camera)
 
         overlay = annotate(live, report, self.profile, values=self.values)
         self._store(f"{base}-overlay.png", overlay)
@@ -2182,6 +2277,9 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
     # The one note that is about what was *not* checked, so it is shown.
     out["flags"] += [f.get("detail", "") for f in report.get("flags", [])
                      if f.get("flag") == "identity_unconfirmed"]
+    # Asked for with --edges, so its answer is shown either way.
+    out["flags"] += [f.get("detail", "") for f in report.get("flags", [])
+                     if f.get("flag") == "layout_vs_edges" and f.get("severity") == "note"]
     found = report.get("residual", {}).get("findings", [])
     if found:
         # The one thing that makes a run REVIEW with every element passing, so

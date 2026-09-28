@@ -23,6 +23,7 @@ MEASUREMENT_PATH = [
     "displayfind.py",
     "glare.py",
     "blur.py",
+    "edgecheck.py",
     "capture.py",
     "residual.py",
     "repeatability.py",

@@ -127,9 +127,11 @@ is still being built — see the README. It is genuinely useful for shaking out
 the geometry and the profile, and it is not a measurement rig:
 
 - **The pose changes every shot.** Handled by re-solving each frame against the
-  reference, which works for per-element faults and silently absorbs a fault
-  where the whole layout moved. `--fixed-camera` turns the re-solve off once the
-  phone is clamped, and then the pose change is reported instead of corrected.
+  reference, fitted to the screen alone so the desk or dashboard around it does
+  not drag it. That works for per-element faults and absorbs a fault where the
+  whole layout moved; `--edges` checks that one against the display's own
+  edges. `--fixed-camera` turns the re-solve off once the phone is clamped, and
+  then the pose change is reported instead of corrected.
 - **Sampling ratio is usually poor.** A phone at arm's length covers a cluster
   at close to 1:1, where the honest floor is about ±1 display pixel. The
   calibrate step reports the ratio; believe it.

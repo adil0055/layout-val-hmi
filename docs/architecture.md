@@ -241,6 +241,28 @@ absorbs a fault in which *everything* moved together. Per-element faults survive
 it because the rest of the frame dominates the fit; a whole-layout shift does
 not. `--fixed-camera` checks pose without re-solving.
 
+The hand-held re-solve fits the screen only (`CaptureSession._pose_masks`): the
+display's quadrilateral in the reference, less the photo's undistortion border
+and any reflection's footprint. A homography is exact for one plane. Fitted to
+a whole photo with a backdrop at 1.4x the screen's distance, a camera moved 3 cm
+sideways at 50 cm put every element of a good screen 6-11 px out; fitted to the
+screen, the worst was 0.6 px. The empty border left by undistortion stays put
+when the camera moves and was read as the scene staying put -- 0.8-1 px of pose
+error for a camera turned 3 degrees or 10% closer. A reflection lies on the
+glass, not in the picture. If too little is left to fit, the whole frame is
+used as before.
+
+`--edges` (`edgecheck.py`) measures what the re-solve cannot: the drawing
+against the display's edges. The edges are proposed in the reference; at
+Validate each is carried into the test photo through the solved pose and a
+strip across it is lined up with the same strip in the reference (ZNCC over
+1-D profiles, groups of 8 along the side, median). An edge that moved against
+the pose means the drawing moved against the edge. Lining up needs no clean
+step -- no side of two bench photos had one -- and the strip reaches only
+0.15 of its width inside the edge, or the drawing there pulls the answer to
+zero (0.35 px read for a 2 px shift). Opposite sides must agree within 0.5 px;
+the shift is the elements' median movement against the pose less the edges'.
+
 ---
 
 ## 6. Measurement (stage 4)
@@ -658,6 +680,7 @@ src/layoutval/
 ├── capture.py        stage 1: frames, median stacking, settling detection
 ├── calibration.py    stages 2–3: intrinsics, six homography routes, drift
 ├── displayfind.py    proposes the display's corners from an ordinary photograph
+├── edgecheck.py      --edges: the whole layout against the display's own edges
 ├── glare.py          reflections off the glass, subtracted
 ├── blur.py           camera shake, matched between the two photos
 ├── measure.py        stage 4: estimators, per-kind measurement, guards
@@ -722,3 +745,10 @@ Stated plainly, because the alternative is someone discovering them later:
   different places, aligned in display space, and the darkest value each pixel
   takes across them -- reflections move with the camera and the content does
   not, and a reflection only ever adds light.
+- **`--edges` is validated on photographs moved in software, not re-taken.**
+  Two bench photographs warped to new poses, with the drawing shifted inside
+  its edges, keep the edge in the plane of the pixels by construction. A real
+  camera move sees trim or cover glass standing proud of the pixels shift
+  against them by roughly that depth times the change in viewing angle -- a few
+  tenths of a pixel for millimetres and a few degrees, more for a deep hood.
+  That is why it is opt-in.

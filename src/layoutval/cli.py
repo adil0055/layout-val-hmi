@@ -546,6 +546,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         calib_mode=getattr(args, "calib_mode", ""),
         board_display_size=board_canvas,
         deglare=not getattr(args, "keep_glare", False),
+        edge_check=getattr(args, "edges", False),
         board_candidates=(
             [hmi_board(*canvas) for canvas in HMI_CANVASES]
             if getattr(args, "hmi_boards", False) else None
@@ -747,6 +748,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--keep-glare", action="store_true",
                    help="measure photographs as taken, without subtracting "
                         "reflections off the glass")
+    c.add_argument("--edges", action="store_true",
+                   help="also check the whole layout against the display's own "
+                        "edges, which a hand-held camera cannot otherwise see")
     c.set_defaults(func=cmd_go)
 
     c = sub.add_parser(
@@ -814,6 +818,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--keep-glare", action="store_true",
                    help="measure photographs as taken, without subtracting "
                         "reflections off the glass")
+    c.add_argument("--edges", action="store_true",
+                   help="also check the whole layout against the display's own "
+                        "edges, which a hand-held camera cannot otherwise see")
     c.add_argument("--drift-alarm-px", type=float, default=2.0)
     c.add_argument("--quiet", action="store_true")
     c.add_argument("--no-qr", action="store_true",

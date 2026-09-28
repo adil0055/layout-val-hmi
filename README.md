@@ -268,6 +268,21 @@ which every element moved together.** Per-element faults survive it — the rest
 of the frame dominates the fit — but a whole-layout shift does not. Clamp the
 phone and pass `--fixed-camera`, and the pose is checked rather than re-solved.
 
+The pose is fitted to the screen alone. A desk, a keyboard or a dashboard sits
+at another depth and slides against the screen when the camera moves, so a
+pose fitted to the whole photo was right for none of it: moved 3 cm sideways at
+50 cm in front of a backdrop, a good screen came back FAIL on every element.
+Now it passes, and a 2 px fault still reads 1.7–2.1 px, for the camera turned,
+rolled, moved sideways, closer or further.
+
+`--edges` also checks the whole layout against the display's own edges, which
+do not move with what is drawn: each edge is carried into the test photo by the
+pose and lined up with what is there. On two bench photos a 2 px shift of the
+whole drawing read 1.97–2.08 px, and under 0.3 px unshifted. It is opt-in
+because it trusts the edge to be in the plane of the pixels; trim or cover glass
+standing proud of them moves when the camera does. Opposite edges that disagree
+make it say it could not check rather than guess.
+
 **Reflections off the glass are subtracted before anything is compared.** A
 reflection is light *added* to what the display emits, large and smooth or large
 and flat-sided, where the artwork is small strokes. A morphological opening
