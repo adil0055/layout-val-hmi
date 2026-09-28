@@ -246,37 +246,75 @@ def element_fraction(mask: np.ndarray, bbox: tuple[float, float, float, float]) 
     return float(mask[y0:y1, x0:x1].mean())
 
 
-def set_aside_residual(report, footprint: np.ndarray) -> int:
-    """Move whole-frame residual findings that sit on a reflection into a note.
+SOFT_EDGE = 0.15
+"""Steepest slope of a difference over its size, below which it is out of focus.
 
-    Subtracting a reflection takes its light away but not its noise -- photon
-    noise grows with the light that arrived, whoever sent it -- so the dark
-    ground where a reflection was comes out several times noisier than
-    elsewhere, and the residual check, which compares texture, finds it every
-    time. That is a finding about the room, not the display. The findings stay
-    in the report under the note; the elements there were still measured.
-    Returns how many it moved.
+The camera is focused on the screen; a reflection is an image of the room, a
+metre or more further away, and comes out blurred. Measured: reflected room
+objects 0.07-0.08, a stray mark drawn on the display 0.26-0.33 -- 0.26 with
+the camera itself out of focus."""
+
+
+def edge_sharpness(reference: np.ndarray, live: np.ndarray,
+                   bbox: tuple[int, int, int, int], pad: int = 6) -> float:
+    """How sharp the edges of what changed are: steepest slope over size of the change."""
+    x, y, w, h = (int(v) for v in bbox)
+    H, W = reference.shape[:2]
+    sl = (slice(max(0, y - pad), min(H, y + h + pad)), slice(max(0, x - pad), min(W, x + w + pad)))
+    d = _top(to_linear(live[sl])) - _top(to_linear(reference[sl]))
+    d = cv2.GaussianBlur(d, (0, 0), 0.8)          # finer than this is noise, not an edge
+    amp = float(np.percentile(np.abs(d), 98))
+    gy, gx = np.gradient(d)
+    return float(np.percentile(np.hypot(gx, gy), 98)) / max(amp, 1e-6)
+
+
+def set_aside_residual(report, footprint: np.ndarray, reference: np.ndarray | None = None,
+                       live: np.ndarray | None = None) -> int:
+    """Move whole-frame residual findings that are the room, not the display, into a note.
+
+    Two kinds. Where a large reflection was subtracted, its light goes but its
+    photon noise stays, and the dark ground there comes out several times
+    noisier than elsewhere. And a reflected room object smaller than the
+    opening's square -- a shelf, a lamp, a window -- is not subtracted at all,
+    and shows as a patch of added light; but it is out of focus, where anything
+    the display draws is sharp (:data:`SOFT_EDGE`). On glared bench photographs
+    those came back REVIEW with every element passing. The findings stay in the
+    report under the note; the elements there were still measured. Returns how
+    many it moved.
     """
-    if not report.residual_findings or not footprint.any():
+    if not report.residual_findings:
         return 0
     kept, moved = [], []
     for finding in report.residual_findings:
-        if element_fraction(footprint, finding.bbox) > 0.5:
-            moved.append(finding)
-        else:
-            kept.append(finding)
+        lit = footprint.any() and element_fraction(footprint, finding.bbox) > 0.5
+        soft = (reference is not None and live is not None
+                and edge_sharpness(reference, live, finding.bbox) < SOFT_EDGE)
+        (moved if lit or soft else kept).append(finding)
     if moved:
         report.residual_findings = kept
         report.flag(
             "glare_residual", severity="note",
             findings=[f.to_dict() for f in moved],
             detail=(
-                f"{len(moved)} whole-frame difference(s) where a reflection was "
-                "subtracted -- the reflection's own noise, most likely. Every "
-                "element there was still measured."
+                f"{len(moved)} whole-frame difference(s) that are reflections -- "
+                "noise where one was subtracted, or an out-of-focus object from "
+                "the room. Every element there was still measured."
             ),
         )
     return len(moved)
+
+
+FADE_MAX = 0.6
+"""Contrast an element under glare may keep, as a share of the reference's,
+before what it shows can no longer be told from something else."""
+
+
+def _contrast(patch: np.ndarray) -> float:
+    """Contrast at the scale of strokes: a light blur against a wider one."""
+    from layoutval.capture import to_gray
+
+    g = to_gray(patch).astype(np.float32)
+    return float((cv2.GaussianBlur(g, (0, 0), 0.7) - cv2.GaussianBlur(g, (0, 0), 4.0)).std())
 
 
 def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray,
@@ -308,6 +346,7 @@ def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray
     lost = cv2.dilate(clipped.astype(np.uint8) * 255, np.ones((5, 5), np.uint8))
     lit = footprint.astype(np.uint8) * 255
     changed: list[str] = []
+    unconfirmed: list[str] = []
     for i, result in enumerate(report.results):
         m = result.measurement
         if result.reason != WRONG_CONTENT or m.dx is None or m.dy is None:
@@ -321,25 +360,48 @@ def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray
         if not ((subpixel_crop(lit, here) > 0).any() or (subpixel_crop(lit, there) > 0).any()):
             continue
         keep = ~((subpixel_crop(lost, here) > 0) | (subpixel_crop(lost, there) > 0))
-        if keep.mean() < 0.3 or keep.sum() < 30:
-            continue
-        sigma = max(1.5, min(w, h) / 6.0)
+        ref_patch, live_patch = subpixel_crop(reference, here), subpixel_crop(live, there)
+        if keep.mean() >= 0.3 and keep.sum() >= 30:
+            sigma = max(1.5, min(w, h) / 6.0)
 
-        def detail(patch: np.ndarray) -> np.ndarray:
-            g = to_gray(patch).astype(np.float32)
-            return (g - cv2.GaussianBlur(g, (0, 0), sigma)).astype(np.float64)[keep]
+            def detail(patch: np.ndarray) -> np.ndarray:
+                g = to_gray(patch).astype(np.float32)
+                return (g - cv2.GaussianBlur(g, (0, 0), sigma)).astype(np.float64)[keep]
 
-        a = detail(subpixel_crop(reference, here))
-        b = detail(subpixel_crop(live, there))
-        a, b = a - a.mean(), b - b.mean()
-        den = float(np.sqrt((a * a).sum() * (b * b).sum()))
-        if den <= 0:
-            continue
-        score = float((a * b).sum()) / den
-        if score < result.tolerance.identity_min:
-            continue
-        m.zncc = score
-        m.method += " (detail, under glare)"
-        report.results[i] = evaluate(spec, m)
-        changed.append(spec.id)
+            a, b = detail(ref_patch), detail(live_patch)
+            a, b = a - a.mean(), b - b.mean()
+            den = float(np.sqrt((a * a).sum() * (b * b).sum()))
+            score = float((a * b).sum()) / den if den > 0 else 0.0
+            if score >= result.tolerance.identity_min:
+                m.zncc = score
+                m.method += " (detail, under glare)"
+                report.results[i] = evaluate(spec, m)
+                changed.append(spec.id)
+                continue
+        # Faded past telling: a reflection plus the phone's own processing --
+        # local tone mapping flattens contrast where it is bright, noise
+        # reduction smears what is faint -- can leave an element a ghost of
+        # itself. Measured on two bench photographs, such elements kept 5-57% of
+        # their contrast, and at that point the same symbol and a different one
+        # score alike: no comparison can say which it is. A wrong symbol that
+        # is still visible keeps all its contrast (161-172%, with or without a
+        # lamp on it) and stays a failure. A faded one is judged on where it is,
+        # which is still measured to a fraction of a pixel, and the report says
+        # what it is showing could not be confirmed.
+        fade = _contrast(live_patch) / max(_contrast(ref_patch), 1e-6)
+        if fade < FADE_MAX:
+            m.method += f" (faded to {fade:.0%} by glare; identity unconfirmed, zncc {m.zncc:.2f})"
+            m.zncc = None
+            report.results[i] = evaluate(spec, m)
+            changed.append(spec.id)
+            unconfirmed.append(spec.id)
+    if unconfirmed:
+        report.flag(
+            "identity_unconfirmed", severity="note", elements=unconfirmed,
+            detail=(
+                f"{len(unconfirmed)} element(s) under glare were too faded to confirm "
+                "what they show, so they were checked for position only. Retake "
+                "without the reflection to check them fully."
+            ),
+        )
     return changed

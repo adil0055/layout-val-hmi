@@ -469,6 +469,23 @@ strokes. So:
   for what the rig is for.) Residual-check findings that sit on a subtracted
   reflection become a note: the reflection's photon noise stays behind after its
   light is removed. How much light was taken off is a note in the saved report.
+- **What a phone does on top.** A phone does not record the added light and
+  stop: under a bright glow its local tone mapping flattens contrast, and its
+  noise reduction smears what is faint. Two bench photographs put through a
+  glow and that processing came back FAIL on 19 elements that were still
+  visible, "wrong content" at 0.19-0.78, positions exact. At that point no
+  comparison can decide identity -- the same symbol, faded, and a different
+  one scored alike -- so an element under a reflection whose contrast has
+  fallen below 60% of the reference's is judged on position, which is still
+  measured to a fraction of a pixel, and one line says what it shows could
+  not be confirmed. A wrong symbol that is still visible keeps its contrast
+  (161-172%, lamp or not) and stays a failure. The same photographs also came
+  back REVIEW for reflected room objects -- a shelf, a lamp -- smaller than the
+  opening's square and so not subtracted. They are out of focus, where
+  anything the display draws is sharp: steepest slope over size of change,
+  0.07-0.08 for the reflections, 0.26-0.33 for a stray mark drawn on the
+  display, cut at 0.15. With both, the 16 photographs went from 8 FAIL and 3
+  REVIEW to 16 PASS, and every injected fault was still found.
 - **What is left.** An element a reflection turned completely white carries
   nothing; the camera recorded no content there, and its result is whatever
   measuring that white patch gives -- usually wrong content. The fix is to move

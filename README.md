@@ -279,7 +279,11 @@ to passing every scene where nothing clipped, while a 2 px fault still measured
 
 Glare never produces a verdict of its own. A compact lamp, which the
 subtraction only partly removes, is handled by re-checking the element under it
-on its fine detail alone; a wrong symbol under the same lamp still fails. The
+on its fine detail alone; a wrong symbol under the same lamp still fails. An
+element the glare and the phone's own processing have faded past recognition is
+judged on its position, which is still exact, and the phone says in one line
+that what it shows could not be confirmed. Reflected room objects are told
+from real changes by being out of focus. The
 one thing no software can do is see through a reflection that turned an element
 completely white: the camera recorded nothing there. Learned reflection-removal
 models are not used: they paint in a plausible picture, and measuring that

@@ -1524,7 +1524,7 @@ class CaptureSession:
             # is kept in the saved report as a note.
             glare.recheck_under_glare(report, self.profile, ref_m, live_m,
                                       pair.footprint, pair.clipped, values=self.values)
-            glare.set_aside_residual(report, pair.footprint)
+            glare.set_aside_residual(report, pair.footprint, ref_m, live_m)
             if pair.subtracted >= 20:
                 report.flag(
                     "glare_subtracted", severity="note",
@@ -2179,6 +2179,9 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
     # the saved report.
     out["flags"] = [f.get("detail") or f.get("flag", "") for f in report.get("flags", [])
                     if f.get("severity") != "note"]
+    # The one note that is about what was *not* checked, so it is shown.
+    out["flags"] += [f.get("detail", "") for f in report.get("flags", [])
+                     if f.get("flag") == "identity_unconfirmed"]
     found = report.get("residual", {}).get("findings", [])
     if found:
         # The one thing that makes a run REVIEW with every element passing, so

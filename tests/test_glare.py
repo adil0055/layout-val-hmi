@@ -203,3 +203,71 @@ def test_the_phone_says_why_a_run_with_every_element_passing_is_review():
                         report={"flags": [], "elements": [],
                                 "residual": {"findings": [{"bbox": [1, 2, 3, 4]}]}})
     assert any("boxed in yellow" in f for f in _payload(rec)["flags"])
+
+
+# -- what a phone does to glare: faded elements, reflected room objects --------
+
+
+def _one_element_report(ref, live, box, zncc=0.4):
+    from layoutval.types import ElementSpec, Measurement, PositionModel, RunReport
+    from layoutval.profile import LayoutProfile
+    from layoutval.verdict import evaluate
+
+    spec = ElementSpec(id="digit", bbox=box, position=PositionModel(origin=box[:2]))
+    profile = LayoutProfile(screen="t", display_size=(ref.shape[1], ref.shape[0]))
+    profile.add(spec)
+    m = Measurement(element_id="digit", method="zncc", dx=0.03, dy=-0.02, zncc=zncc)
+    report = RunReport(screen="t")
+    report.results.append(evaluate(spec, m))
+    return report, profile
+
+
+def test_an_element_glare_has_faded_past_telling_is_judged_on_position():
+    """Glare plus the phone's tone mapping and noise reduction left elements at
+    5-57% of their contrast, where the same symbol and a different one score
+    alike. Its position is still measured; what it shows cannot be confirmed."""
+    ref = np.full((120, 200, 3), 30, np.uint8)
+    cv2.putText(ref, "20", (70, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (230, 230, 230), 2)
+    faded = cv2.addWeighted(ref, 0.15, np.full_like(ref, 190), 0.85, 0).astype(np.float32)
+    # What noise reduction and the glare's own noise leave of it.
+    faded = cv2.GaussianBlur(faded, (0, 0), 1.2) + np.random.default_rng(0).normal(0, 6, ref.shape)
+    faded = np.clip(faded, 0, 255).astype(np.uint8)
+    footprint = np.ones(ref.shape[:2], bool)
+    report, profile = _one_element_report(ref, faded, (60.0, 45.0, 60.0, 40.0))
+    assert report.results[0].reason == "wrong_content"
+    glare.recheck_under_glare(report, profile, ref, faded, footprint,
+                              np.zeros(ref.shape[:2], bool))
+    assert report.results[0].verdict.value == "PASS"
+    assert report.results[0].measurement.zncc is None
+    note = next(f for f in report.flags if f["flag"] == "identity_unconfirmed")
+    assert note["severity"] == "note" and note["elements"] == ["digit"]
+
+
+def test_a_wrong_symbol_that_is_still_visible_under_glare_still_fails():
+    ref = np.full((120, 200, 3), 30, np.uint8)
+    live = ref.copy()
+    cv2.putText(ref, "20", (70, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (230, 230, 230), 2)
+    cv2.putText(live, "57", (70, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (230, 230, 230), 2)
+    live = glare.to_encoded(glare.to_linear(live) + 0.05)          # under a glow
+    report, profile = _one_element_report(ref, live, (60.0, 45.0, 60.0, 40.0))
+    glare.recheck_under_glare(report, profile, ref, live, np.ones(ref.shape[:2], bool),
+                              np.zeros(ref.shape[:2], bool))
+    assert (report.results[0].verdict.value, report.results[0].reason) == ("FAIL", "wrong_content")
+
+
+def test_a_reflected_room_object_is_not_a_finding_and_a_drawn_one_is():
+    """Out of focus against in focus: the camera is focused on the screen."""
+    from layoutval.types import ResidualFinding, RunReport
+
+    ref = np.full((300, 500, 3), 20, np.uint8)
+    shelf = np.zeros(ref.shape[:2], np.float32)
+    cv2.rectangle(shelf, (60, 100), (180, 140), 0.12, -1)
+    shelf = cv2.GaussianBlur(shelf, (0, 0), 8)                    # a reflection: blurred
+    live = glare.to_encoded(glare.to_linear(ref) + shelf[..., None])
+    cv2.rectangle(live, (320, 120), (366, 142), (230, 230, 230), -1)   # something drawn: sharp
+    report = RunReport(screen="t")
+    report.residual_findings = [ResidualFinding(bbox=(50, 90, 140, 60), mean_dissimilarity=0.8, area_px=4000),
+                                ResidualFinding(bbox=(316, 116, 54, 30), mean_dissimilarity=0.9, area_px=1300)]
+    moved = glare.set_aside_residual(report, np.zeros(ref.shape[:2], bool), ref, live)
+    assert moved == 1
+    assert [f.bbox for f in report.residual_findings] == [(316, 116, 54, 30)]
