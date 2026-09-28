@@ -42,3 +42,26 @@ def test_a_soft_lit_patch_of_a_bar_is_not_an_element():
     # ...and it carries no fine detail to measure, so it is left out.
     ids = [e.id for e in profile_from_reference(frame)]
     assert ids == ["auto@61,76", "auto@202,76", "auto@332,76"]
+
+
+def test_tick_marks_are_elements_and_hairlines_are_not():
+    """A speedometer's ticks (48-66 px) fell under the old 80 px floor; ticks a
+    few pixels thick are narrower than a hand-held photo's smear, and stay out."""
+    frame = np.full((400, 600, 3), 20, np.uint8)
+    cv2.putText(frame, "88", (250, 220), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (230, 230, 230), 3)
+    for x in (100, 180, 420):
+        cv2.rectangle(frame, (x, 100), (x + 11, 115), (220, 220, 220), -1)    # 12x16: a chunky tick
+    for x in (300, 500):
+        cv2.rectangle(frame, (x, 300), (x + 3, 322), (220, 220, 220), -1)     # 4x23: a hairline tick
+    boxes = [tuple(map(int, e.bbox)) for e in profile_from_reference(frame)]
+    assert sum(1 for b in boxes if b[1] == 100) == 3
+    assert not any(b[1] == 300 for b in boxes)
+
+
+def test_what_hugs_the_frame_edge_is_not_an_element():
+    """The display's rim, or a laptop's status icons: 1.6-2.7 px off under shake."""
+    frame = np.full((400, 600, 3), 20, np.uint8)
+    cv2.putText(frame, "88", (250, 220), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (230, 230, 230), 3)
+    cv2.rectangle(frame, (570, 3), (590, 20), (230, 230, 230), -1)             # a corner icon
+    boxes = [tuple(map(int, e.bbox)) for e in profile_from_reference(frame)]
+    assert len(boxes) == 1 and boxes[0][0] > 200

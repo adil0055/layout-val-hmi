@@ -347,6 +347,8 @@ def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray
     lit = footprint.astype(np.uint8) * 255
     changed: list[str] = []
     unconfirmed: list[str] = []
+    unmeasured: list[str] = []
+    skipped: list[int] = []
     for i, result in enumerate(report.results):
         m = result.measurement
         if result.reason != WRONG_CONTENT or m.dx is None or m.dy is None:
@@ -392,15 +394,33 @@ def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray
         if fade < FADE_MAX:
             m.method += f" (faded to {fade:.0%} by glare; identity unconfirmed, zncc {m.zncc:.2f})"
             m.zncc = None
-            report.results[i] = evaluate(spec, m)
+            judged = evaluate(spec, m)
+            # Faded far enough, the position goes too -- and the measurement
+            # says so itself: its two estimators stop agreeing. Out of
+            # tolerance with them apart, it is not measured at all; out of
+            # tolerance with them together, it moved, and it fails.
+            apart = m.estimator_disagreement_px is None or m.estimator_disagreement_px > 1.0
+            if judged.verdict.value != "PASS" and apart:
+                skipped.append(i)
+                unmeasured.append(spec.id)
+            else:
+                report.results[i] = judged
+                unconfirmed.append(spec.id)
             changed.append(spec.id)
-            unconfirmed.append(spec.id)
-    if unconfirmed:
+    for i in reversed(skipped):
+        del report.results[i]
+    if unconfirmed or unmeasured:
+        parts = []
+        if unconfirmed:
+            parts.append(f"{len(unconfirmed)} were checked for position only")
+        if unmeasured:
+            parts.append(f"{len(unmeasured)} could not be measured and were skipped")
         report.flag(
-            "identity_unconfirmed", severity="note", elements=unconfirmed,
+            "identity_unconfirmed", severity="note",
+            elements=unconfirmed, skipped=unmeasured,
             detail=(
-                f"{len(unconfirmed)} element(s) under glare were too faded to confirm "
-                "what they show, so they were checked for position only. Retake "
+                f"{len(unconfirmed) + len(unmeasured)} element(s) under glare were too "
+                f"faded to confirm what they show: {' and '.join(parts)}. Retake "
                 "without the reflection to check them fully."
             ),
         )

@@ -40,11 +40,22 @@ def segment_reference(
     reference: np.ndarray,
     *,
     threshold: int | None = None,
-    min_area_px: int = 80,
+    min_area_px: int = 40,
+    min_thickness_px: int = 9,
     max_area_fraction: float = 0.25,
     close_kernel: int = 5,
 ) -> list[tuple[int, int, int, int, int]]:
     """Lit regions of a rectified frame, as ``(x, y, w, h, area)``.
+
+    **Size is set by what a hand-held photograph can measure.** ``min_area_px``
+    was 80, which left out a speedometer's tick marks (48-66 px) that a person
+    plainly sees. Taken down to 30 they all came in, and so did elements a few
+    pixels thick that a slightly shaken photo smears past recognition: under a
+    12 px shake streak, 19 of 127 elements of 30-80 px failed at least once,
+    against none above 200 px. What decides it is thickness against the
+    smear, so a region must also be ``min_thickness_px`` across its narrower
+    side: at 9, shake failures were back to the level of the old rule while
+    most tick marks stay in.
 
     ``max_area_fraction`` drops anything covering more than that much of the
     frame: an "element" the size of the cluster measures nothing and hides
@@ -105,11 +116,12 @@ def segment_reference(
             area = int(stats[i, cv2.CC_STAT_AREA])
             if not (min_area_px <= area <= ceiling):
                 continue
-            # A hairline -- a box outline 223 px long and 2 high, on a bench
-            # photograph -- has the area and none of the height: its template
-            # would be under the 3 px the correlator needs, and it came back
-            # as a measurement error on a frame compared with itself.
-            if min(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]) < 3:
+            # Thinner than a hand's smear cannot be measured from a hand-held
+            # photo (above). It also covers the hairline -- a box outline 223 px
+            # long and 2 high -- whose template was under the 3 px the
+            # correlator needs, and came back as a measurement error on a
+            # frame compared with itself.
+            if min(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]) < min_thickness_px:
                 continue
             found.append((
                 int(stats[i, cv2.CC_STAT_LEFT]),
@@ -160,22 +172,25 @@ def structure(gray: np.ndarray, box: tuple[int, int, int, int], pad: int = 3) ->
 
 
 def crispness(gray: np.ndarray, box: tuple[int, int, int, int], pad: int = 3) -> float:
-    """How much fine detail a region carries: contrast at the scale of strokes.
+    """How crisp a region's sharpest detail is: contrast at the scale of strokes.
 
     A light blur against a wider one, so neither pixel noise nor a smooth
-    gradient counts. Text and icons are crisp; a faint patch of a bar's
-    gradient fill, or a stretch of a panel's soft edge, is not -- and those are
-    exactly what glare changed the look of and the matcher slid along: on a
-    bench photograph, 5-8 px "wrong content" on a screen that had not changed.
-    Measured there, those regions scored 8-15 and the screen's text 35-47;
-    across two other bench photographs every element that measured well scored
-    at least 35% of its frame's median, and the cut is set there.
+    gradient counts, and the 98th percentile of it over the region -- its
+    sharpest detail, not its average, or a speedometer's crisp ticks are
+    averaged away over the soft glow round them and the whole dial goes. (It
+    did, measured as a standard deviation.) Text and icons are crisp; a faint
+    patch of a bar's gradient fill is not -- and those are exactly what glare
+    changed the look of and the matcher slid along: on a bench photograph,
+    5-8 px "wrong content" on a screen that had not changed. Measured there,
+    those patches scored 24-26 and the screen's text 78-103; the dial and the
+    gauges 44-60.
     """
     x, y, w, h = box
     H, W = gray.shape[:2]
     p = gray[max(0, y - pad):min(H, y + h + pad), max(0, x - pad):min(W, x + w + pad)]
     p = p.astype(np.float32)
-    return float((cv2.GaussianBlur(p, (0, 0), 0.7) - cv2.GaussianBlur(p, (0, 0), 4.0)).std())
+    detail = np.abs(cv2.GaussianBlur(p, (0, 0), 0.7) - cv2.GaussianBlur(p, (0, 0), 4.0))
+    return float(np.percentile(detail, 98))
 
 
 def profile_from_reference(
@@ -185,10 +200,10 @@ def profile_from_reference(
     theme: str | None = None,
     display_size: tuple[int, int] | None = None,
     defaults: Tolerance | None = None,
-    max_elements: int = 80,
+    max_elements: int = 200,
     valid: np.ndarray | None = None,
     min_structure: float = 0.10,
-    min_crispness: float = 0.35,
+    min_crispness: float = 0.40,
     **segment_kw,
 ) -> LayoutProfile:
     """Build a measurable inventory out of a reference frame.
@@ -212,6 +227,13 @@ def profile_from_reference(
     )
     regions = segment_reference(reference, **segment_kw)
     gray = to_gray(reference)
+    # Nothing hugging the frame's edge: that is the display's rim, or a desktop
+    # status icon on a laptop under test, not the HMI -- and the frame's
+    # corners are where a hand-held pose is least certain. Status icons in the
+    # top-right corner of a bench photograph read 1.6-2.7 px off under shake.
+    edge = round(0.02 * min(height, width))
+    regions = [r for r in regions if r[0] >= edge and r[1] >= edge
+               and r[0] + r[2] <= width - edge and r[1] + r[3] <= height - edge]
     if valid is not None:
         seen = cv2.erode(valid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         regions = [r for r in regions if seen[r[1]:r[1] + r[3], r[0]:r[0] + r[2]].all()]

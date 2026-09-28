@@ -271,3 +271,20 @@ def test_a_reflected_room_object_is_not_a_finding_and_a_drawn_one_is():
     moved = glare.set_aside_residual(report, np.zeros(ref.shape[:2], bool), ref, live)
     assert moved == 1
     assert [f.bbox for f in report.residual_findings] == [(316, 116, 54, 30)]
+
+
+def test_a_faded_element_whose_position_cannot_be_trusted_is_skipped_not_failed():
+    """Faded far enough, the position goes too, and its two estimators disagree."""
+    ref = np.full((120, 200, 3), 30, np.uint8)
+    cv2.putText(ref, "20", (70, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (230, 230, 230), 2)
+    faded = cv2.addWeighted(ref, 0.15, np.full_like(ref, 190), 0.85, 0).astype(np.float32)
+    faded = cv2.GaussianBlur(faded, (0, 0), 1.2) + np.random.default_rng(0).normal(0, 6, ref.shape)
+    faded = np.clip(faded, 0, 255).astype(np.uint8)
+    report, profile = _one_element_report(ref, faded, (60.0, 45.0, 60.0, 40.0))
+    m = report.results[0].measurement
+    m.dx, m.dy, m.estimator_disagreement_px = 2.9, 0.4, 1.36        # read off, and not agreed on
+    glare.recheck_under_glare(report, profile, ref, faded, np.ones(ref.shape[:2], bool),
+                              np.zeros(ref.shape[:2], bool))
+    assert report.results == []
+    note = next(f for f in report.flags if f["flag"] == "identity_unconfirmed")
+    assert note["skipped"] == ["digit"] and "skipped" in note["detail"]

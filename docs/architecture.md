@@ -361,6 +361,18 @@ touching the part of the rectified frame the camera never saw -- corners placed
 past the photograph's edge leave empty border -- is the photograph's edge, not
 an element. Neither kind was ever measurable; both used to be FAIL.
 
+What is kept is set by what a hand-held photograph can measure. A region must
+be at least 40 px and 9 px across its narrower side -- a speedometer's tick
+marks (48-66 px) came in when the floor dropped from 80 px, and so did marks a
+few pixels thick that a slightly shaken photo smears past recognition (19 of
+127 elements of 30-80 px failed at least once under a 12 px shake streak;
+thickness decides it). It must carry crisp detail somewhere -- the 98th
+percentile of stroke-scale contrast, at least 0.4 of the frame's median, so a
+dial's sharp ticks count against the soft glow round them while a faint patch of
+a bar's gradient fill does not. And it must keep 2% clear of the frame's edge,
+where the display's rim and a laptop's status icons live and a hand-held pose
+is least certain. Up to 200 elements are kept.
+
 ---
 
 ## 10. The residual check
