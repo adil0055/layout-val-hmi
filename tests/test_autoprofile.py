@@ -26,3 +26,19 @@ def test_nothing_touching_the_edge_of_the_photograph_is_an_element():
     valid[:, :40] = False               # the corners were set past the photo's edge here
     ids = [e.id for e in profile_from_reference(frame, valid=valid)]
     assert len(ids) == 1 and ids[0].startswith("auto@25")
+
+
+def test_a_soft_lit_patch_of_a_bar_is_not_an_element():
+    """Glare changed the look of such patches and the matcher slid along the bar:
+    5-8 px "wrong content" on a bench photograph of a screen that had not changed."""
+    frame = np.full((300, 700, 3), 20, np.uint8)
+    for label, x in (("88", 60), ("km", 200), ("PRND", 330)):
+        cv2.putText(frame, label, (x, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (230, 230, 230), 3)
+    yy, xx = np.mgrid[0:300, 0:700].astype(np.float32)
+    patch = 200 * np.exp(-(((xx - 520) / 22) ** 2 + ((yy - 207) / 7) ** 2))   # bright, but soft
+    frame = np.clip(frame + patch[..., None], 0, 255).astype(np.uint8)
+    # Bright enough to be segmented -- the old rule kept it...
+    assert len(profile_from_reference(frame, min_structure=0.05, min_crispness=0.0)) == 4
+    # ...and it carries no fine detail to measure, so it is left out.
+    ids = [e.id for e in profile_from_reference(frame)]
+    assert ids == ["auto@61,76", "auto@202,76", "auto@332,76"]

@@ -145,7 +145,8 @@ def structure(gray: np.ndarray, box: tuple[int, int, int, int], pad: int = 3) ->
     compared with itself, a 370 px edge on a bench photograph matched 8 px
     down its own length and came back FAIL. Measured on two bench photographs,
     lines score under 0.02, a long bar 0.07, and every tick mark, digit and
-    icon 0.12 or more.
+    icon 0.12 or more. The cut was 0.05 until a long bar under glare slid
+    along its own length on a screen that had not changed; it is 0.10.
     """
     x, y, w, h = box
     H, W = gray.shape[:2]
@@ -158,6 +159,25 @@ def structure(gray: np.ndarray, box: tuple[int, int, int, int], pad: int = 3) ->
     return (half - root) / (half + root) if half + root > 0 else 0.0
 
 
+def crispness(gray: np.ndarray, box: tuple[int, int, int, int], pad: int = 3) -> float:
+    """How much fine detail a region carries: contrast at the scale of strokes.
+
+    A light blur against a wider one, so neither pixel noise nor a smooth
+    gradient counts. Text and icons are crisp; a faint patch of a bar's
+    gradient fill, or a stretch of a panel's soft edge, is not -- and those are
+    exactly what glare changed the look of and the matcher slid along: on a
+    bench photograph, 5-8 px "wrong content" on a screen that had not changed.
+    Measured there, those regions scored 8-15 and the screen's text 35-47;
+    across two other bench photographs every element that measured well scored
+    at least 35% of its frame's median, and the cut is set there.
+    """
+    x, y, w, h = box
+    H, W = gray.shape[:2]
+    p = gray[max(0, y - pad):min(H, y + h + pad), max(0, x - pad):min(W, x + w + pad)]
+    p = p.astype(np.float32)
+    return float((cv2.GaussianBlur(p, (0, 0), 0.7) - cv2.GaussianBlur(p, (0, 0), 4.0)).std())
+
+
 def profile_from_reference(
     reference: np.ndarray,
     *,
@@ -167,7 +187,8 @@ def profile_from_reference(
     defaults: Tolerance | None = None,
     max_elements: int = 80,
     valid: np.ndarray | None = None,
-    min_structure: float = 0.05,
+    min_structure: float = 0.10,
+    min_crispness: float = 0.35,
     **segment_kw,
 ) -> LayoutProfile:
     """Build a measurable inventory out of a reference frame.
@@ -179,6 +200,8 @@ def profile_from_reference(
     touching anything else is the edge of the photograph, not an element.
     Regions with less 2-D detail than ``min_structure`` (see :func:`structure`)
     are left out: their position along their own length cannot be measured.
+    So are regions with less fine detail than ``min_crispness`` of the frame's
+    typical element (see :func:`crispness`).
     """
     height, width = reference.shape[:2]
     profile = LayoutProfile(
@@ -193,6 +216,10 @@ def profile_from_reference(
         seen = cv2.erode(valid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         regions = [r for r in regions if seen[r[1]:r[1] + r[3], r[0]:r[0] + r[2]].all()]
     regions = [r for r in regions if structure(gray, r[:4]) >= min_structure]
+    if regions:
+        crisp = [crispness(gray, r[:4]) for r in regions]
+        floor = min_crispness * float(np.median(crisp))
+        regions = [r for r, c in zip(regions, crisp) if c >= floor]
     # Biggest first when there are too many: a cap that kept the top-left corner
     # of the screen and dropped the instruments would be the wrong forty.
     if len(regions) > max_elements:

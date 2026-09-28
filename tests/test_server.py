@@ -208,9 +208,13 @@ def test_the_rendered_code_still_scans():
     assert np.array_equal(parsed[: direct.shape[0]], direct)
 
     # And it decodes, which is the only claim that matters to a phone camera.
+    # With OpenCV's ArUco-based reader where there is one: the classic reader
+    # misses about 1 random token in 100 that the ArUco one, and any phone,
+    # reads at every size -- the test was failing on the reader, not the code.
     image = (~parsed).astype(np.uint8) * 255
     big = cv2.resize(image, None, fx=8, fy=8, interpolation=cv2.INTER_NEAREST)
-    assert cv2.QRCodeDetector().detectAndDecode(big)[0] == url
+    reader = getattr(cv2, "QRCodeDetectorAruco", cv2.QRCodeDetector)()
+    assert reader.detectAndDecode(big)[0] == url
 
 
 def test_the_code_carries_a_quiet_zone():
