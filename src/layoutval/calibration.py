@@ -603,7 +603,6 @@ def chessboard_display_points(
 #: The canvases the cluster's HMI draws on, one per skin, and the square size
 #: its calibration screen uses unless told otherwise (``hmi/backend/calibration.py``
 #: and the skins' ``designW``/``designH``).
-HMI_CANVASES = ((1790, 870), (1920, 720))
 HMI_SQUARE_PX = 100
 
 
@@ -614,9 +613,8 @@ def hmi_board(canvas_w: int, canvas_h: int, square_px: int = HMI_SQUARE_PX) -> d
     zone on every side, the board centred, its origin rounded to a whole pixel.
     Corners are in pixel-centre coordinates -- a board edge drawn at Qt
     coordinate X is at X - 0.5 here -- which is what the detector reports.
-    With it, the chessboard needs no exported file: the two skins' boards differ
-    in size (14x5 and 16x4 inner corners), neither fits inside the other, so the
-    grid the camera finds says which one it is, and with it every corner.
+    With it, the chessboard needs no exported file: the resolution typed in on
+    the phone says which board the HMI draws, and with it every corner.
     """
     cols = max(3, (canvas_w - 2 * square_px) // square_px)
     rows = max(3, (canvas_h - 2 * square_px) // square_px)

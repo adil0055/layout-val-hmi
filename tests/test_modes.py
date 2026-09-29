@@ -282,15 +282,13 @@ def hmi_screen(canvas_w, canvas_h, square=100):
 
 @pytest.mark.parametrize("canvas", [(1790, 870), (1920, 720)])
 def test_the_chessboard_needs_no_board_file(tmp_path, canvas):
-    """The grid the camera finds says which skin's board it is, and so every corner."""
-    from layoutval.calibration import HMI_CANVASES, hmi_board
-
+    """The resolution typed in on the phone says which board the HMI draws."""
     camera = VirtualCamera(display_size=canvas, sensor_size=(2600, 1600), sampling_ratio=1.3,
                            k1=0.0, k2=0.0, tilt_deg=5.0, roll_deg=-2.0)
-    session = CaptureSession(tmp_path, display_size=(1920, 1080), mark_corners=True,
-                             calib_mode="auto",
-                             board_candidates=[hmi_board(*c) for c in HMI_CANVASES])
+    session = CaptureSession(tmp_path, mark_corners=True, calib_mode="auto",
+                             size_from_phone=True, board_from_size=True)
     assert session.status()["modes"]["chessboard"] is True
+    session.set_size(*canvas)
     session.set_mode("chessboard")
     rec = session.handle("calibrate", jpeg(camera.shoot(hmi_screen(*canvas))))
     assert rec.verdict == "OK", rec.detail
@@ -305,12 +303,82 @@ def test_the_chessboard_needs_no_board_file(tmp_path, canvas):
 
 
 def test_no_hmi_chessboard_in_the_photo_says_so(tmp_path, rig):
-    from layoutval.calibration import HMI_CANVASES, hmi_board
-
-    session = CaptureSession(tmp_path, display_size=(1920, 1080), mark_corners=True,
-                             calib_mode="chessboard",
-                             board_candidates=[hmi_board(*c) for c in HMI_CANVASES])
+    session = CaptureSession(tmp_path, mark_corners=True, calib_mode="chessboard",
+                             size_from_phone=True, board_from_size=True)
+    session.set_size(1920, 720)
     rig.show("main")
     rec = session.handle("calibrate", jpeg(rig.read()))
     assert rec.verdict == "FAILED"
     assert "calibration screen" in rec.detail
+
+
+# -- the resolution, typed in on the phone ----------------------------------------
+
+
+def test_nothing_runs_until_the_resolution_is_entered(tmp_path, rig):
+    session = CaptureSession(tmp_path, mark_corners=True, calib_mode="auto",
+                             size_from_phone=True, board_from_size=True)
+    assert session.status()["display_size"] is None
+    rig.show("main")
+    for action in ("propose", "corners", "reference", "validate"):
+        rec = session.handle(action, jpeg(rig.read()), corners=[[0, 0]] * 4)
+        assert rec.verdict == "FAILED" and "resolution" in rec.detail
+    session.set_size(960, 360)
+    assert session.status()["display_size"] == [960, 360]
+    assert session.display_size == session.corner_display_size == (960, 360)
+
+
+def test_a_new_resolution_starts_the_calibration_again(tmp_path, rig):
+    session = make_session(tmp_path, rig, board=False)
+    frame = rig.read()
+    data = jpeg(frame)
+    h, w = frame.shape[:2]
+    corners = session.handle("propose", data).proposal["corners"]
+    session.handle("corners", data, corners=[[x * w, y * h] for x, y in corners])
+    session.handle("reference", data)
+    assert session.is_calibrated and session.reference is not None
+    session.set_size(960, 360)                  # the same: nothing lost
+    assert session.is_calibrated and session.reference is not None
+    session.set_size(1920, 720)
+    assert not session.is_calibrated and session.reference is None
+
+
+@pytest.mark.parametrize("size", [(0, 720), (1920, -1), ("wide", 720), (100000, 720)])
+def test_a_resolution_that_is_not_one_is_refused(tmp_path, size):
+    session = CaptureSession(tmp_path, mark_corners=True, calib_mode="auto", size_from_phone=True)
+    with pytest.raises(ValueError):
+        session.set_size(*size)
+    assert session.status()["display_size"] is None
+
+
+def test_a_board_file_for_another_screen_is_refused(tmp_path):
+    session = CaptureSession(tmp_path, mark_corners=True, calib_mode="chessboard",
+                             size_from_phone=True,
+                             display_points=chessboard_display_points(PATTERN, SQUARE_PX, ORIGIN),
+                             board_display_size=(960, 360))
+    with pytest.raises(ValueError, match="960 x 360"):
+        session.set_size(1920, 720)
+    session.set_size(960, 360)
+
+
+def test_the_phone_sets_the_resolution_over_http(tmp_path):
+    session = CaptureSession(tmp_path, mark_corners=True, calib_mode="auto", size_from_phone=True)
+    server = serve(session, host="127.0.0.1", port=0, quiet=True)
+    try:
+        host, port = server.server_address
+        base = f"http://{host}:{port}"
+        req = urllib.request.Request(f"{base}/size?t={server.token}", method="POST",
+                                     data=json.dumps({"width": 1920, "height": 720}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        status = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        assert status["display_size"] == [1920, 720]
+        bad = urllib.request.Request(f"{base}/size?t={server.token}", method="POST",
+                                     data=json.dumps({"width": 0, "height": 720}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with pytest.raises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(bad, timeout=10)
+        assert err.value.code == 400
+        page = urllib.request.urlopen(f"{base}/?t={server.token}", timeout=10).read().decode()
+        assert 'id="sz-w"' in page and "HMI resolution" in page
+    finally:
+        server.shutdown()

@@ -24,8 +24,10 @@ layoutval go                          # finds the display's corners itself
 layoutval go --board board.json       # also offers the cluster's own chessboard
 ```
 
-Scan the QR with a phone on the same network and follow the steps on the page:
-**Intrinsics → Calibrate → Reference → Validate**.
+Scan the QR with a phone on the same network, type the cluster's resolution in
+at the top of the page (e.g. 1920 × 720, from its spec), and follow the steps:
+**Intrinsics → Calibrate → Reference → Validate**. The resolution is never read
+from the computer: in use, the computer is not the cluster.
 
 The page has a switch for how the display is found, and it can be changed at
 any time:
@@ -34,7 +36,7 @@ any time:
 |---|---|
 | **Auto corners** (default) | shoot the cluster; four dots appear on its corners. Drag one if it is off, then confirm |
 | **Tap corners** | tap the four corners yourself |
-| **Chessboard** | put the cluster on its calibration screen and shoot it. No file needed: the grid it finds says which skin's board it is |
+| **Chessboard** | put the cluster on its calibration screen and shoot it. No file needed: the resolution you typed in says which board the HMI draws |
 
 Both corner modes ask the cluster for nothing, and either way the dots are
 snapped to the real panel edge sub-pixel, so rough is fine. Switching mode

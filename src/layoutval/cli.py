@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,7 +23,6 @@ import cv2
 import numpy as np
 
 from layoutval.calibration import (
-    HMI_CANVASES,
     Calibration,
     CharucoSpec,
     DisplayGeometry,
@@ -35,7 +33,6 @@ from layoutval.calibration import (
     chessboard_display_points,
     homography_from_display_edges,
     homography_from_display_pattern,
-    hmi_board,
 )
 from layoutval.capture import median_stack
 from layoutval.linearity import LinearityStudy, apply_linearity, best_estimator, run_linearity
@@ -349,35 +346,6 @@ def cmd_charuco_board(args: argparse.Namespace) -> int:
     return 0
 
 
-def detect_screen_size() -> tuple[int, int] | None:
-    """The resolution of the screen the HMI is filling, if it can be found.
-
-    The border route searches for a rectangle with the framebuffer's aspect
-    ratio, so this value is not cosmetic -- getting it wrong is the difference
-    between finding the display and finding something else the same shape.
-    Asking the machine beats asking the person.
-    """
-    try:
-        out = subprocess.run(["xrandr", "--current"], capture_output=True,
-                             text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        out = ""
-    for line in out.splitlines():
-        if "*" in line:
-            for token in line.split():
-                if "x" in token and token.replace("x", "").isdigit():
-                    w, _, h = token.partition("x")
-                    return (int(w), int(h))
-    for line in out.splitlines():
-        if " connected" in line:
-            for token in line.split():
-                geom = token.split("+")[0]
-                if "x" in geom and geom.replace("x", "").isdigit():
-                    w, _, h = geom.partition("x")
-                    return (int(w), int(h))
-    return None
-
-
 def cmd_go(args: argparse.Namespace) -> int:
     """Start capturing, working the rest out rather than asking for it.
 
@@ -388,14 +356,6 @@ def cmd_go(args: argparse.Namespace) -> int:
     """
     out = Path(args.out)
     using_board = bool(args.board)
-    # The corner modes map the screen's four corners, so they need the screen's
-    # resolution. The chessboard carries its own canvas size in the board file.
-    size = tuple(args.display_size) if args.display_size else detect_screen_size()
-    if size is None and not using_board:
-        raise SystemExit(
-            "error: could not work out the screen size. Pass it:\n"
-            "         layoutval go --display-size WIDTH HEIGHT"
-        )
 
     intrinsics = args.intrinsics
     reused = False
@@ -411,7 +371,10 @@ def cmd_go(args: argparse.Namespace) -> int:
     else:
         args.aperture, args.mark_corners = False, True
         args.calib_mode = args.mode or ("chessboard" if using_board else "auto")
-    args.display_size = list(size) if size else None
+    # The cluster's resolution is typed in on the phone, never read from this
+    # computer: in use, this computer is not the cluster.
+    args.display_size = None
+    args.size_from_phone = True
     args.intrinsics = intrinsics
     args.lens_board = args.lens_board or "9x6:30:22"
     args.charuco = None
@@ -426,7 +389,7 @@ def cmd_go(args: argparse.Namespace) -> int:
     args.drift_alarm_px = 2.0
     args.no_auto_profile = False
     args.display_inset = [0.0, 0.0]
-    args.hmi_boards = not using_board
+    args.board_from_size = not using_board
 
     lens = "not solved yet"
     if intrinsics:
@@ -437,8 +400,7 @@ def cmd_go(args: argparse.Namespace) -> int:
             raise
         except Exception:
             lens = intrinsics
-    shown = f"{size[0]}x{size[1]}" if size else "from the board"
-    print(f"screen {shown}   lens: {lens}")
+    print(f"resolution: enter it on the phone   lens: {lens}")
     print("modes on the phone: auto corners, tap corners, chessboard")
     if reused:
         print("Tap Intrinsics on the phone to re-shoot the lens.")
@@ -523,7 +485,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         calibration = Calibration(
             intrinsics=Intrinsics.from_dict(_read_json(args.intrinsics, "--intrinsics")),
             geometry=DisplayGeometry(H=np.eye(3), method=UNSOLVED,
-                                     display_size=tuple(args.display_size)),
+                                     display_size=display_size),
         )
 
     session = CaptureSession(
@@ -547,10 +509,8 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         board_display_size=board_canvas,
         deglare=not getattr(args, "keep_glare", False),
         edge_check=getattr(args, "edges", False),
-        board_candidates=(
-            [hmi_board(*canvas) for canvas in HMI_CANVASES]
-            if getattr(args, "hmi_boards", False) else None
-        ),
+        size_from_phone=getattr(args, "size_from_phone", False),
+        board_from_size=getattr(args, "board_from_size", False),
         lens_board=lens_board,
         display_inset_px=tuple(args.display_inset),
     )
@@ -722,9 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "detector needs to find the outer squares (default 10)")
     c.set_defaults(func=cmd_charuco_board)
 
-    c = sub.add_parser("go", help="start capturing; works the rest out itself")
-    c.add_argument("--display-size", nargs=2, type=int, default=None,
-                   help="the screen the HMI fills; detected when not given")
+    c = sub.add_parser("go", help="start capturing; the phone asks for the resolution")
     c.add_argument("--intrinsics", help="reused from --out automatically once solved")
     c.add_argument("--lens-board", default=None, help="default 9x6:30:22")
     c.add_argument("--board",

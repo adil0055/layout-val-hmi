@@ -90,6 +90,7 @@ from layoutval.calibration import (
     homography_from_screen_content,
     board_points_for_intrinsics,
     feature_homography,
+    hmi_board,
     solve_intrinsics,
 )
 from layoutval.pipeline import Pipeline, PipelineOptions
@@ -368,8 +369,18 @@ class CaptureSession:
         deglare: bool = True,
         board_candidates: list[dict] | None = None,
         edge_check: bool = False,
+        size_from_phone: bool = False,
+        board_from_size: bool = False,
     ) -> None:
         self.lock = threading.Lock()
+        #: The cluster's resolution is typed in on the phone, and nothing runs
+        #: until it is. It is not read from anywhere: the computer running this
+        #: is not the cluster, and its own screen says nothing about one.
+        self.size_from_phone = size_from_phone
+        self.size_set = not size_from_phone
+        #: Without a board file, the chessboard is the one the HMI draws for the
+        #: resolution typed in (see ``hmi_board``).
+        self.board_from_size = board_from_size
         #: Also check the whole layout against the display's own edges, which
         #: a hand-held pose cannot see. Opt-in. See :mod:`layoutval.edgecheck`.
         self.edge_check = edge_check
@@ -474,7 +485,8 @@ class CaptureSession:
             # export, or from the HMI's own layout, identified by the grid size
             # found. Guessing a board is how a smaller grid inside a bigger one
             # solves at the wrong scale.
-            "chessboard": self.display_points is not None or bool(self.board_candidates),
+            "chessboard": (self.display_points is not None or bool(self.board_candidates)
+                           or self.board_from_size),
         }
 
     def set_mode(self, mode: str) -> None:
@@ -512,6 +524,45 @@ class CaptureSession:
                     self.profile = None
                     self._profile_is_auto = False
 
+    def set_size(self, width: int, height: int) -> None:
+        """The cluster's resolution, as typed in on the phone.
+
+        Everything is measured in the cluster's own pixels, so a new size is a
+        new calibration: the mapping and anything measured through it are
+        dropped. The lens solve belongs to the phone and stays.
+        """
+        try:
+            size = (int(width), int(height))
+        except (TypeError, ValueError):
+            raise ValueError("the resolution is two whole numbers, width and height") from None
+        if not all(16 <= v <= 16384 for v in size):
+            raise ValueError("enter the cluster's resolution in pixels, e.g. 1920 x 720")
+        if (self.display_points is not None and self.board_display_size
+                and tuple(self.board_display_size) != size):
+            bw, bh = self.board_display_size
+            raise ValueError(
+                f"the board file is for a {bw} x {bh} screen, not {size[0]} x {size[1]}. "
+                "Enter the cluster's real resolution, or export the board again for it.")
+        with self.lock:
+            changed = not self.size_set or tuple(self.display_size) != size
+            self.size_set = True
+            self.display_size = self.corner_display_size = size
+            if self.board_from_size:
+                self.board_candidates = [hmi_board(*size)]
+                self.board_display_size = size
+            if changed:
+                intrinsics = self.calibration.intrinsics if self.calibration else None
+                self.calibration = None if intrinsics is None else Calibration(
+                    intrinsics=intrinsics,
+                    geometry=DisplayGeometry(H=np.eye(3), method=UNSOLVED, display_size=size),
+                    drift_alarm_px=self.drift_alarm_px)
+                self.reference = None
+                self.reference_camera = None
+                self.reference_edges = None
+                if self._profile_is_auto:
+                    self.profile = None
+                    self._profile_is_auto = False
+
     # -- helpers ------------------------------------------------------------
 
     def _undistort(self, frame: np.ndarray) -> np.ndarray:
@@ -526,7 +577,8 @@ class CaptureSession:
             "has_profile": self.profile is not None,
             "auto_inventory": self._profile_is_auto,
             "elements": len(self.profile) if self.profile else 0,
-            "display_size": list(self.display_size),
+            "display_size": list(self.display_size) if self.size_set else None,
+            "size_from_phone": self.size_from_phone,
             "fixed_camera": self.fixed_camera,
             "calibrates_from": self._calibrates_from(),
             "mode": self.calib_mode,
@@ -604,6 +656,11 @@ class CaptureSession:
         frame = decode_upload(data)
         stamp = datetime.now().strftime("%H%M%S")
         base = f"{stamp}-{action}"
+        if not self.size_set and action != "intrinsics":
+            return CaptureRecord(
+                name=f"{base}.jpg", action=action, verdict="FAILED",
+                when=datetime.now().isoformat(timespec="seconds"),
+                detail="enter the cluster's resolution first, at the top of the page")
         if action == "propose":
             # Read-only: nothing about the session changes until the dots are
             # confirmed and come back as "corners".
@@ -1805,11 +1862,30 @@ button.ghost{flex:1;background:#1E272C;color:#E3EAE8;border:1px solid #2B373D;
              border-radius:9px;padding:13px;font-size:15px;font-weight:600}
 button.ghost:disabled{color:#5C6B73}
 button.ghost#marksend:not(:disabled){background:#2F7D57;border-color:#2F7D57}
+.sizerow{display:flex;align-items:center;gap:8px;margin-top:8px}
+.sizerow input{flex:1;min-width:0;background:#0F1518;color:#E3EAE8;border:1px solid #2B373D;
+               border-radius:8px;padding:11px 10px;font-size:16px;font-variant-numeric:tabular-nums}
+.sizerow span{color:#8B9AA3}
+.sizerow button{flex:0 0 auto;background:#2F7D57;color:#fff;border:0;border-radius:8px;
+                padding:12px 16px;font-size:15px;font-weight:600}
+#sizecard.need{border-color:#3E8FD0}
+label.shoot.off{background:#3A4650;color:#9DADB5;pointer-events:none}
 </style>
 </head>
 <body>
 <h1>Cluster capture</h1>
 <p class="sub">Point at the cluster and shoot. The computer running layoutval does the measuring.</p>
+
+<div class="card" id="sizecard" style="display:none">
+  <b>HMI resolution</b>
+  <div class="sizerow">
+    <input id="sz-w" type="number" inputmode="numeric" placeholder="width" min="16">
+    <span>&times;</span>
+    <input id="sz-h" type="number" inputmode="numeric" placeholder="height" min="16">
+    <button id="sz-set">Set</button>
+  </div>
+  <div class="hint" id="sz-hint"></div>
+</div>
 
 <div class="modes" id="modebar" style="display:none">
   <button data-m="auto">Auto corners</button>
@@ -1857,6 +1933,7 @@ button.ghost#marksend:not(:disabled){background:#2F7D57;border-color:#2F7D57}
 <div class="card" id="result" style="display:none"></div>
 
 <div class="card">
+  <div class="stat"><span>Resolution</span><b id="s-size">—</b></div>
   <div class="stat"><span>Calibrated</span><b id="s-cal">—</b></div>
   <div class="stat"><span>Reference</span><b id="s-ref">—</b></div>
   <div class="stat"><span>Elements</span><b id="s-el">—</b></div>
@@ -1894,6 +1971,7 @@ function paintSteps() {
       : "First time only: the markers and the cluster's calibration screen, together in one frame.";
   }
   $("hint").textContent = hints[action];
+  paintSize();
 }
 
 document.querySelectorAll(".modes button").forEach(b => {
@@ -1911,6 +1989,45 @@ document.querySelectorAll(".modes button").forEach(b => {
     await refresh(); paintSteps();
   };
 });
+
+let SIZE = null, NEED_SIZE = false, SHOWN = "";
+$("sz-set").onclick = async () => {
+  const width = parseInt($("sz-w").value, 10), height = parseInt($("sz-h").value, 10);
+  if (!(width > 0 && height > 0)) {
+    $("sz-hint").textContent = "Enter the width and the height in pixels, e.g. 1920 \u00d7 720.";
+    return;
+  }
+  try {
+    const r = await fetch(`/size?t=${TOKEN}`, {method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({width, height})});
+    const s = await r.json();
+    if (!r.ok) { $("sz-hint").textContent = s.detail; return; }
+  } catch (e) { lost(e); return; }
+  $("marker").style.display = "none";
+  $("result").style.display = "none";
+  await refresh();
+};
+function paintSize() {
+  const card = $("sizecard");
+  card.style.display = NEED_SIZE ? "block" : "none";
+  card.classList.toggle("need", NEED_SIZE && !SIZE);
+  // Filled in only when the computer's value changes, so the 5 s refresh never
+  // overwrites a number half typed.
+  if (SIZE && String(SIZE) !== SHOWN) {
+    $("sz-w").value = SIZE[0]; $("sz-h").value = SIZE[1]; SHOWN = String(SIZE);
+  }
+  $("sz-hint").textContent = SIZE
+    ? "Set. Changing it starts the calibration again."
+    : "The cluster's screen in pixels, from its spec. Needed before anything else.";
+  const blocked = NEED_SIZE && !SIZE && action !== "intrinsics";
+  const label = $("shootLabel");
+  if (!label.classList.contains("busy")) {
+    label.classList.toggle("off", blocked);
+    label.textContent = blocked ? "Enter the HMI resolution first" : "Take photo";
+  }
+  $("s-size").textContent = SIZE ? `${SIZE[0]} \u00d7 ${SIZE[1]}` : "not set";
+}
 
 function paintModes() {
   const bar = $("modebar");
@@ -1931,6 +2048,8 @@ async function refresh() {
   try {
     const r = await fetch(`/status?t=${TOKEN}`);
     const s = await r.json();
+    SIZE = s.display_size; NEED_SIZE = !!s.size_from_phone;
+    paintSize();
     $("s-cal").textContent = s.calibrated ? "yes" : "no";
     $("s-ref").textContent = s.has_reference ? "yes" : "no";
     $("s-el").textContent = s.has_profile
@@ -2271,6 +2390,22 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"  mode: {mode}")
         self._json(HTTPStatus.OK, self.session.status())
 
+    def _set_size(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 4096:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"detail": "too large"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+            self.session.set_size(body.get("width"), body.get("height"))
+        except (ValueError, AttributeError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"detail": str(exc)})
+            return
+        if not self.server.quiet:  # type: ignore[attr-defined]
+            w, h = self.session.display_size
+            print(f"  resolution: {w} x {h}")
+        self._json(HTTPStatus.OK, self.session.status())
+
     def do_POST(self) -> None:  # noqa: N802
         url = urlparse(self.path)
         if not self._authorised(parse_qs(url.query)):
@@ -2278,6 +2413,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if url.path == "/mode":
             self._set_mode()
+            return
+        if url.path == "/size":
+            self._set_size()
             return
         if url.path != "/upload":
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")

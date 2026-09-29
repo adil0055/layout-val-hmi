@@ -497,12 +497,21 @@ Choosing the mode already on is not a switch. (Left calibrated across a switch,
 the page saw no reference, moved straight on to Reference, and the chessboard
 photograph meant to calibrate became the reference.) The chessboard mode needs
 the exact corners the cluster drew. With `--board` they come from the HMI's
-export; without it, `layoutval go` carries the HMI's own layout rule
+export; without it, `layoutval go` applies the HMI's own layout rule
 (`hmi_board`: 100 px squares, one square of quiet zone, centred, origin on a
-whole pixel) for each skin's canvas, and the grid the camera finds says which
-skin it is -- 14x5 inner corners on 1790x870, 16x4 on 1920x720, neither of which
-fits inside the other. Checked against the HMI's own `pattern_geometry`, corner
-for corner, and measured at 0.02-0.05 px against the simulator's true mapping.
+whole pixel) to the resolution typed in on the phone -- 14x5 inner corners on
+1790x870, 16x4 on 1920x720. Checked against the HMI's own `pattern_geometry`,
+corner for corner, and measured at 0.02-0.05 px against the simulator's true
+mapping.
+
+**The resolution is typed in on the phone,** at the top of the page, and
+nothing but the lens solve runs until it is. It is not read from anywhere: the
+computer running layoutval is not the cluster, so its own screen size (which
+`go` used to read) is right on a laptop test bench and wrong on a car. Every
+result is in the cluster's pixels, and a size of the wrong shape stretches one
+axis -- 1920x1200 applied to a 1920x720 cluster reads a 2 px move as 3.3 px.
+A board file for another size is refused, and a new size starts the
+calibration again, keeping the lens.
 With neither, the mode is refused: guessing a board is how a smaller grid
 inside a bigger one solves at the wrong scale.
 
