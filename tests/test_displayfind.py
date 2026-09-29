@@ -201,3 +201,54 @@ def test_the_proposal_calibrates_through_the_marked_corners_route():
     assert isinstance(geometry, DisplayGeometry)
     rect = geometry.rectify(img)
     assert rect.shape[:2] == (1200, 1920)
+
+
+# -- the screen's shape, from the resolution typed in ---------------------------
+
+
+def panel_scene(rng: np.random.Generator):
+    """The bench scene with a cluster that draws a big panel of its own.
+
+    A tall bright-edged panel down the middle, with text either side: the
+    innermost clean line on each side is then the panel's edge, and on a bench
+    photograph of such a cluster that picked a strip down the middle.
+    """
+    img, corners = bench_scene(rng)
+    (sx0, sy0), (sx1, sy1) = corners[0] + 0.5, corners[2] + 0.5
+    sx0, sy0, sx1, sy1 = int(sx0), int(sy0), int(sx1), int(sy1)
+    img[sy0:sy1, sx0:sx1] = (60, 45, 35)
+    sw, sh = sx1 - sx0, sy1 - sy0
+    px0, px1 = sx0 + int(0.42 * sw), sx0 + int(0.58 * sw)
+    cv2.rectangle(img, (px0, sy0 + int(0.12 * sh)), (px1, sy1 - int(0.12 * sh)), (110, 90, 70), -1)
+    cv2.rectangle(img, (px0, sy0 + int(0.12 * sh)), (px1, sy1 - int(0.12 * sh)), (200, 180, 150), 3)
+    for side in (0.12, 0.72):
+        for row in range(5):
+            cv2.putText(img, "88 km/h", (sx0 + int(side * sw), sy0 + int((0.25 + 0.12 * row) * sh)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (235, 235, 235), 2, cv2.LINE_AA)
+    img = cv2.GaussianBlur(img, (0, 0), 0.8)
+    return img, corners
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_the_resolution_picks_the_screen_over_a_panel_drawn_on_it(seed):
+    rng = np.random.default_rng(seed)
+    img, corners = panel_scene(rng)
+    img, corners = warped(img, corners, rng)
+    shape = float(np.hypot(*(corners[1] - corners[0])) / np.hypot(*(corners[3] - corners[0])))
+    found = propose_display_corners(img, aspect=shape)
+    assert found is not None
+    err = np.linalg.norm(found.corners - corners, axis=1).max()
+    assert err < 0.015 * np.hypot(*img.shape[:2]), err
+
+
+def test_the_screens_true_shape_is_recovered_through_perspective():
+    from layoutval.displayfind import rectangle_aspect
+
+    w, h = 2576, 1932
+    f = 2000.0
+    K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1.0]])
+    rect = np.array([[-0.8, -0.5, 0], [0.8, -0.5, 0], [0.8, 0.5, 0], [-0.8, 0.5, 0]])   # 1.6 : 1
+    for ax, ay in ((0, 0), (20, 0), (0, 25), (15, -20), (-25, 10)):
+        rvec = np.radians([ax, ay, 3.0])
+        pts, _ = cv2.projectPoints(rect, rvec, np.array([0.1, -0.05, 2.2]), K, None)
+        assert rectangle_aspect(pts.reshape(-1, 2), (w, h)) == pytest.approx(1.6, rel=0.02)

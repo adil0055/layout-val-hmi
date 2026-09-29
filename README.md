@@ -39,7 +39,10 @@ any time:
 | **Chessboard** | put the cluster on its calibration screen and shoot it. No file needed: the resolution you typed in says which board the HMI draws |
 
 Both corner modes ask the cluster for nothing, and either way the dots are
-snapped to the real panel edge sub-pixel, so rough is fine. Switching mode
+snapped to the real panel edge sub-pixel, so rough is fine. Auto corners uses
+the resolution typed in: it looks for the rectangle of the screen's own shape,
+so a cluster that draws big panels of its own is not mistaken for its screen.
+Switching mode
 starts calibration over — the new mode maps into a different display space — but
 keeps the lens solve. `--auto-border` keeps the older fully automatic border
 fit, which needs a clean scene.
@@ -144,9 +147,12 @@ It needs `--intrinsics`, and needs them harder than any other route: it fits
 straight lines to the display's edges, and lens distortion bows exactly those
 lines. Measured, 0.04–0.06 px undistorted on any lens against 1.3 px on a mild
 one and 4–8 px on a normal phone lens. Solve them once from the phone — pick
-**Intrinsics** on the capture page and shoot 12 views of a board
+**Intrinsics** on the capture page and shoot 15 views of a board
 (`--lens-board`), which never goes near the cluster because it is the camera
-being measured: print it, or open the PNG on any other screen.
+being measured: print it, or open the PNG on any other screen. The board has to
+appear in every part of the frame across the shots -- each corner, each edge,
+the middle -- and the page says which parts are still missing: a phone's lens
+bends most at the edges, and it is only measured where the board has been.
 
 `9x6:30:22` measured best (k1 error 0.0009 against a true −0.09), but the
 choice is not delicate — 7x5 and 16x3 both land inside 0.007. **What actually

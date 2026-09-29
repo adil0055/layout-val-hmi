@@ -283,7 +283,7 @@ def test_printed_size_follows_the_spec_not_the_dpi(tmp_path):
     assert sizes[120][0] == pytest.approx(2 * sizes[60][0], abs=2)
 
 
-def test_intrinsics_can_be_collected_from_the_phone(tmp_path):
+def test_intrinsics_can_be_collected_from_the_phone(tmp_path, monkeypatch):
     """The lens solve is reachable from the bench, not only from a shell.
 
     This is the whole reason the route no longer refuses at startup: the step
@@ -299,13 +299,16 @@ def test_intrinsics_can_be_collected_from_the_phone(tmp_path):
     rig.show("checkerboard")
     assert session.handle("calibrate", jpeg(rig.read())).verdict == "FAILED"
 
+    # The markers here sit in one band of the frame, so it is never covered
+    # all over; that rule has its own test. Solve at 15 regardless.
+    monkeypatch.setattr("layoutval.server.INTRINSIC_VIEWS_MAX", 15)
     poses = [(2.0, 0.7), (9.0, -4.0), (-6.0, 5.0), (13.0, 2.0), (-11.0, -3.0),
              (4.0, 9.0), (-2.0, -8.0), (7.0, 3.5), (-9.0, 1.0), (11.0, -6.0),
-             (0.5, 0.2), (-4.0, -2.0)]
+             (0.5, 0.2), (-4.0, -2.0), (5.0, -1.5), (-8.0, 2.5), (1.0, 6.0)]
     last = None
     for i, (tilt, roll) in enumerate(poses):
         _, _, shot = make_rig(tilt_deg=tilt, roll_deg=roll, seed=i,
-                              sampling_ratio=0.9 + 0.02 * i)
+                              sampling_ratio=0.9 + 0.02 * (i % 12))
         shot.show("main")
         last = session.handle("intrinsics", jpeg(shot.read()))
         assert last.verdict == "OK", last.detail
@@ -346,3 +349,27 @@ def test_a_view_without_the_board_is_not_counted(tmp_path):
     assert rec.verdict == "FAILED"
     assert "Not counted" in rec.detail
     assert session.status()["intrinsic_views"] == 0
+
+
+def test_the_lens_is_not_solved_until_the_board_has_been_all_over_the_frame(tmp_path):
+    """Distortion is strongest at the edges, and only measured where the board went."""
+    from layoutval import server as srv
+
+    session = CaptureSession(tmp_path, display_size=(960, 360),
+                             lens_board=CharucoSpec(9, 6, 30.0, 22.0))
+    w, h = 1200, 900
+    session._intrinsic_frame_size = (w, h)
+    obj = np.zeros((4, 1, 3), np.float32)
+
+    def view(x, y):
+        return obj, np.float32([[[x, y]], [[x + 20, y]], [[x, y + 20]], [[x + 20, y + 20]]])
+
+    session._intrinsic_views = [view(550, 400)] * 15          # all in the middle
+    missing = session._uncovered_areas()
+    assert "centre" not in missing and len(missing) == 8
+    assert "top-left" in missing and "bottom-right" in missing
+    for x in (50, 550, 1100):
+        for y in (50, 400, 820):
+            session._intrinsic_views.append(view(x, y))
+    assert session._uncovered_areas() == []
+    assert srv.INTRINSIC_VIEWS_WANTED == 15 and srv.INTRINSIC_VIEWS_MAX >= 2 * 15

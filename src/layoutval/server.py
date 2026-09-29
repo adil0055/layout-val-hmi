@@ -124,10 +124,23 @@ ACTIONS = ("intrinsics", "calibrate", "propose", "corners", "rebind",
 #: them. ``chessboard``: the cluster draws its calibration pattern.
 CALIBRATION_MODES = ("manual", "auto", "chessboard")
 
-#: Views wanted before the intrinsics solve is attempted.  Eight is the same
-#: floor the offline command uses: a calibration solved from three
-#: near-identical views is worse than none, because it looks fine.
-INTRINSIC_VIEWS_WANTED = 12
+#: Views wanted before the intrinsics solve is attempted. A calibration solved
+#: from three near-identical views is worse than none, because it looks fine.
+INTRINSIC_VIEWS_WANTED = 15
+"""Views of the lens board before the lens is solved -- and only once the board
+has been seen in every part of the frame (:data:`FRAME_AREAS`). Simulated with
+the distortion measured off a phone photograph of the board: 12 views spread
+over the frame left 0.12-0.83 px of warp, 15 left 0.08-0.36, 30 left
+0.05-0.30. Kept near the centre, as a board on a screen tends to be, 30 views
+still left 5-17 px at the frame's edges: where the board goes matters far more
+than how many shots."""
+
+#: The frame is split 3 x 3, and the board has to have appeared in each part.
+FRAME_AREAS = ("top-left", "top", "top-right", "left", "centre", "right",
+               "bottom-left", "bottom", "bottom-right")
+
+#: Past this many views the lens is solved with whatever coverage there is.
+INTRINSIC_VIEWS_MAX = 30
 
 #: How far the board is allowed to move in the frame before the anchor
 #: learned in the bind frame stops being the anchor for this one.  Measured,
@@ -463,6 +476,7 @@ class CaptureSession:
         self.reference: np.ndarray | None = None
         self.reference_camera: np.ndarray | None = None
         self.reference_edges: np.ndarray | None = None
+        self.screen_mask: np.ndarray | None = None
         self.history: list[CaptureRecord] = []
 
         if profile is not None and profile.reference_path:
@@ -519,7 +533,7 @@ class CaptureSession:
                     drift_alarm_px=self.drift_alarm_px)
                 self.reference = None
                 self.reference_camera = None
-                self.reference_edges = None
+                self.reference_edges = self.screen_mask = None
                 if self._profile_is_auto:
                     self.profile = None
                     self._profile_is_auto = False
@@ -558,7 +572,7 @@ class CaptureSession:
                     drift_alarm_px=self.drift_alarm_px)
                 self.reference = None
                 self.reference_camera = None
-                self.reference_edges = None
+                self.reference_edges = self.screen_mask = None
                 if self._profile_is_auto:
                     self.profile = None
                     self._profile_is_auto = False
@@ -589,6 +603,7 @@ class CaptureSession:
                 self.calibration and self.calibration.intrinsics),
             "intrinsic_views": len(self._intrinsic_views),
             "intrinsic_views_wanted": INTRINSIC_VIEWS_WANTED,
+            "intrinsic_missing": self._uncovered_areas() if self._intrinsic_views else [],
             "uses_intrinsics": self._uses_intrinsics(),
             "needs_intrinsics": (
                 self._uses_intrinsics()
@@ -928,7 +943,7 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
-        self.reference_edges = None
+        self.reference_edges = self.screen_mask = None
 
     def _note_sampling_ratio(self, rec: CaptureRecord, geometry: Any) -> None:
         ratio = geometry.sampling_ratio()
@@ -1004,10 +1019,16 @@ class CaptureSession:
 
         self._intrinsic_views.append((obj, img))
         got, want = len(self._intrinsic_views), INTRINSIC_VIEWS_WANTED
+        missing = self._uncovered_areas()
         rec.verdict = "OK"
-        rec.detail = (rec.detail or "") + (
-            f"view {got} of {want}. Change the angle between shots.")
-        if got < want:
+        rec.detail = (rec.detail or "") + f"view {got} of {want}. "
+        if missing:
+            rec.detail += (
+                "Not yet seen in the " + ", ".join(missing) + " of the frame -- aim "
+                "so the board sits there next, near the edge. ")
+        else:
+            rec.detail += "Change the angle between shots."
+        if got < want or (missing and got < INTRINSIC_VIEWS_MAX):
             return rec
 
         try:
@@ -1039,6 +1060,9 @@ class CaptureSession:
             f"lens solved from {got} views: {check.quality()}, "
             f"about {implied:.2f} px accuracy"
         )
+        if missing:
+            rec.detail += (" -- but the board never reached the " + ", ".join(missing)
+                           + " of the frame, so the lens is least certain there")
         if complaint is None:
             self.calibration = Calibration(
                 intrinsics=intrinsics,
@@ -1165,7 +1189,7 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
-        self.reference_edges = None
+        self.reference_edges = self.screen_mask = None
         return rec
 
     def _propose(self, frame: np.ndarray, base: str) -> CaptureRecord:
@@ -1173,8 +1197,12 @@ class CaptureSession:
         rec = CaptureRecord(name=f"{base}.jpg", action="propose",
                             when=datetime.now().isoformat(timespec="seconds"))
         intrinsics = self.calibration.intrinsics if self.calibration else None
+        # The resolution typed in says what shape the screen is, which picks it
+        # out from the panels a cluster draws inside it.
+        cw, ch = self.corner_display_size
+        aspect = cw / ch if self.size_set else None
         if intrinsics is None:
-            proposal = propose_display_corners(frame)
+            proposal = propose_display_corners(frame, aspect=aspect)
         else:
             # Found on the undistorted frame, where the display's edges are
             # straight. On the raw photograph lens distortion bows them, and
@@ -1183,7 +1211,7 @@ class CaptureSession:
             # The dots go back to the phone in the raw photograph's pixels,
             # since that is the picture it is showing.
             undistorter = Undistorter(intrinsics)
-            proposal = propose_display_corners(undistorter(frame))
+            proposal = propose_display_corners(undistorter(frame), aspect=aspect)
             if proposal is not None:
                 proposal.corners = _distort_points(
                     proposal.corners, intrinsics, undistorter.new_K)
@@ -1342,7 +1370,7 @@ class CaptureSession:
             )
         self.reference = None
         self.reference_camera = None
-        self.reference_edges = None
+        self.reference_edges = self.screen_mask = None
         return rec
 
     def _why_no_board(self, frame: np.ndarray, saved_as: str) -> str:
@@ -1416,7 +1444,11 @@ class CaptureSession:
         # and the photograph's edge against it is a long straight line that
         # segments like an element and cannot be measured.
         seen = self._coverage(frame.shape)
-        outside = _outside(seen)
+        # And only the screen, where corners were set a little past it.
+        self.screen_mask = self._find_screen(undistorted)
+        if self.screen_mask is not None:
+            seen = seen & self.screen_mask
+        outside = _outside(self._coverage(frame.shape))
         if outside:
             rec.detail += (
                 f". {outside} is outside this photo, and nothing there will be "
@@ -1599,6 +1631,8 @@ class CaptureSession:
         the camera moves -- the same rim the inventory leaves out.
         """
         ok = live_seen & self._reference_seen()
+        if self.screen_mask is not None and self.screen_mask.shape == ok.shape:
+            ok &= self.screen_mask
         h, w = ok.shape[:2]
         rim = round(0.02 * min(h, w))
         ok[:rim] = False
@@ -1620,6 +1654,32 @@ class CaptureSession:
         cv2.fillConvexPoly(drawn, cv2.convexHull(np.float32(corners)).astype(np.int32), 1)
         pad = 2 * round(0.03 * min(h, w)) + 1
         return cv2.dilate(drawn, np.ones((pad, pad), np.uint8)) > 0
+
+    def _find_screen(self, undistorted: np.ndarray) -> np.ndarray | None:
+        """The part of display space that is the screen, where the corners took in more.
+
+        Corners dragged a little past the screen take in its bezel, a laptop's
+        lid, the wall behind -- and those slide against the screen when the
+        camera moves, and read as "something drawn" or get counted as elements.
+        The screen is looked for inside the corners, by its shape; it is only
+        used to trim a margin (70-99.5% of the corners' rectangle), never to
+        overrule them.
+        """
+        dw, dh = self.calibration.geometry.display_size
+        cw, ch = self.corner_display_size
+        proposal = propose_display_corners(
+            undistorted, aspect=cw / ch if self.size_set else None)
+        if proposal is None or not proposal.confident:
+            return None
+        quad = cv2.perspectiveTransform(
+            np.asarray(proposal.corners, np.float64).reshape(-1, 1, 2),
+            np.linalg.inv(self.calibration.geometry.H)).reshape(-1, 2)
+        mask = np.zeros((dh, dw), np.uint8)
+        cv2.fillConvexPoly(mask, np.round(quad).astype(np.int32), 1)
+        share = float(mask.mean())
+        if not 0.70 <= share <= 0.995:
+            return None
+        return mask > 0
 
     def _reference_seen(self) -> np.ndarray:
         if self.reference_camera is None:
@@ -1661,6 +1721,23 @@ class CaptureSession:
                     dx=None if shift.dx is None else round(shift.dx, 2),
                     dy=None if shift.dy is None else round(shift.dy, 2),
                     detail=detail)
+
+    def _uncovered_areas(self) -> list[str]:
+        """Parts of the frame no lens-board view has reached yet (see FRAME_AREAS).
+
+        Distortion is strongest at the frame's edges and corners, and a solve
+        only knows it where the board has been.
+        """
+        if self._intrinsic_frame_size is None:
+            return list(FRAME_AREAS)
+        w, h = self._intrinsic_frame_size
+        seen = set()
+        for _, img in self._intrinsic_views:
+            pts = np.asarray(img, np.float64).reshape(-1, 2)
+            cols = np.clip((pts[:, 0] / w * 3).astype(int), 0, 2)
+            rows = np.clip((pts[:, 1] / h * 3).astype(int), 0, 2)
+            seen.update(zip(rows.tolist(), cols.tolist()))
+        return [FRAME_AREAS[3 * r + c] for r in range(3) for c in range(3) if (r, c) not in seen]
 
     def _pose_masks(self, shape: tuple[int, ...], size: tuple[int, int],
                     scale: float) -> tuple[np.ndarray, np.ndarray]:
@@ -1963,7 +2040,7 @@ function paintSteps() {
     corners: MODE === "auto"
       ? "Shoot the whole screen with a margin round it. The corners are found for you \u2014 check them, drag any that are off. Once per camera position."
       : "Shoot the cluster, then tap its four corners on the photo. Rough taps are fine \u2014 the edges get snapped to the panel. Once per camera position.",
-    intrinsics: "Shoot the board from a different angle and distance each time \u2014 near, far, tilted, and in each corner of the frame. Shots that all look alike cannot separate the lens from the pose."
+    intrinsics: "Shoot the board from a different angle each time, and put it in every part of the frame \u2014 each corner and each edge, not only the middle. The lens bends most at the edges, and it is only measured where the board has been."
   };
   if (BEZEL) {
     hints.calibrate = ANCHORED
@@ -2074,7 +2151,8 @@ async function refresh() {
     if (byHand && action === "calibrate") { action = "corners"; paintSteps(); }
     if (!byHand && action === "corners") { action = "calibrate"; paintSteps(); }
     $("intcount").textContent = s.intrinsic_views
-      ? `${s.intrinsic_views} of ${s.intrinsic_views_wanted} views`
+      ? `${s.intrinsic_views} of ${s.intrinsic_views_wanted} views` +
+        ((s.intrinsic_missing || []).length ? ` \u00b7 still to cover: ${s.intrinsic_missing.join(", ")}` : "")
       : (s.has_intrinsics ? "solved \u2014 tap to redo" : "the lens, once per phone");
     document.querySelector('[data-a="intrinsics"]').classList
       .toggle("done", !!s.has_intrinsics);

@@ -221,6 +221,22 @@ all with long straight edges. What it does:
   short stray segment cannot stand in for an edge.
 - **The winner is refitted at full resolution**, allowed to move at most 0.5% of
   the diagonal, and the proposal says whether it is `confident`.
+- **With the resolution typed in, the screen's shape picks it.** A cluster that
+  draws large panels of its own defeats "innermost clean line": on a bench
+  photograph of an EV cluster the proposal was a strip down the middle of the
+  screen, and on a second shot nothing at all -- and with it an inventory of 5
+  elements where there are 55. So every combination of the longest lines per
+  side (14 each) is tried, and kept only if its true proportions -- recovered
+  through the perspective by Zhang and He's whiteboard method, the principal
+  point at the image centre -- are within 8% of the resolution's, every side
+  covers its span, no side has more than 10% lit content beyond it, and the
+  step across every side -- just inside against just beyond -- is alike to
+  within 55 grey levels: one screen in one bezel steps alike all round, where a
+  rectangle of the right shape patched together from a window's edges and a
+  shelf on the wall behind stepped -10, -9, -11 and +118. Ranked by cleanest
+  bezel, then shape, then evenest step, then coverage, then innermost. On six
+  bench photographs it found all six screens, agreeing with the per-side answer
+  where that was right; where nothing fits, the per-side rule runs as before.
 
 Measured on the two bench photographs under 120 random warps -- perspective,
 rotation, exposure -- it found the screen every time, and was never confidently
@@ -449,7 +465,10 @@ behind, which slide against the screen when the camera moves. Three rules, all
 about what is not the display:
 
 - the comparison covers only what both photos saw of the display, less its
-  outer 2% -- the rim the inventory also leaves out;
+  outer 2% -- the rim the inventory also leaves out -- and, where the corners
+  were set past the screen, only the screen: at Reference the screen is looked
+  for inside the corners by its shape, and used when it trims a margin (70-99.5%
+  of the corners' rectangle), for the comparison and for the inventory alike;
 - a finding that is the reference's own content found nearby (ZNCC 0.8 within
   4% of the display) is something moved or re-lit, not drawn or gone: the
   element checks measure moves, and anything else that moves is off the
@@ -644,6 +663,20 @@ Design notes worth knowing:
 
 - **Intrinsics are collected as correspondences, not frames.** A phone
   photograph is tens of megabytes; its correspondences are a few kilobytes.
+- **The lens needs the board in every part of the frame, and 15 views.** A
+  phone photograph of the lens board, fitted as a flat plane, left 1.1 px
+  typical and 2 px worst in the middle of the frame; with radial distortion,
+  0.13 and 0.25 -- a phone's lens after its own correction still bends, in the
+  wavy "mustache" profile. That distortion is what made two bench photographs
+  of one unchanged cluster, taken from different places, disagree by up to
+  4.7 px at the dials' outer edges: corrected, 14-23 false flags per pair went
+  to none, and 86.2% to 98.8% of elements right on every moved-camera pair.
+  Simulated with that distortion, the lens solve depends on where the board
+  goes far more than on how many shots: kept near the centre, 30 views still
+  left 5-17 px at the edges; spread over the frame, 12 views left 0.12-0.83 px,
+  15 left 0.08-0.36 and 30 left 0.05-0.30. So the phone asks for 15, does not
+  solve until the board has appeared in each ninth of the frame (up to 30
+  views), and says which parts are still missing.
 - **The lens solve is gated on generalisation, not on fit.** Reprojection error
   measures how well the model fits the views it was given; a set of
   near-identical views is fitted beautifully and is wrong everywhere else, and

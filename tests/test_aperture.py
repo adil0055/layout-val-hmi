@@ -216,7 +216,7 @@ def test_border_route_refuses_without_intrinsics(tmp_path):
     assert "Intrinsics" in rec.detail  # names the step that fixes it
 
 
-def test_lens_board_is_independent_of_how_geometry_is_solved(tmp_path):
+def test_lens_board_is_independent_of_how_geometry_is_solved(tmp_path, monkeypatch):
     """Intrinsics belong to the camera, not to the rig's calibration route.
 
     Keeping them separate is what lets the border route -- which asks the
@@ -235,13 +235,16 @@ def test_lens_board_is_independent_of_how_geometry_is_solved(tmp_path):
     assert session.lens_board is not None
     assert session.charuco_spec is None
 
+    # The markers here sit in one band of the frame, so it is never covered
+    # all over; that rule has its own test. Solve at 15 regardless.
+    monkeypatch.setattr("layoutval.server.INTRINSIC_VIEWS_MAX", 15)
     poses = [(2.0, 0.7), (9.0, -4.0), (-6.0, 5.0), (13.0, 2.0), (-11.0, -3.0),
              (4.0, 9.0), (-2.0, -8.0), (7.0, 3.5), (-9.0, 1.0), (11.0, -6.0),
-             (0.5, 0.2), (-4.0, -2.0)]
+             (0.5, 0.2), (-4.0, -2.0), (5.0, -1.5), (-8.0, 2.5), (1.0, 6.0)]
     last = None
     for i, (tilt, roll) in enumerate(poses):
         _, _, shot_rig = rig_for(tilt_deg=tilt, roll_deg=roll, seed=i,
-                                 sampling_ratio=0.9 + 0.02 * i)
+                                 sampling_ratio=0.9 + 0.02 * (i % 12))
         shot_rig.show("main")
         last = session.handle("intrinsics", jpeg(shot_rig.read()))
         assert last.verdict == "OK", last.detail
@@ -270,7 +273,7 @@ def test_a_lens_solve_is_judged_on_generalisation_not_on_fit():
     sensor = (2400, 1500)
     poses = [(2.0, 0.7), (9.0, -4.0), (-6.0, 5.0), (13.0, 2.0), (-11.0, -3.0),
              (4.0, 9.0), (-2.0, -8.0), (7.0, 3.5), (-9.0, 1.0), (11.0, -6.0),
-             (0.5, 0.2), (-4.0, -2.0)]
+             (0.5, 0.2), (-4.0, -2.0), (5.0, -1.5), (-8.0, 2.5), (1.0, 6.0)]
     board = CharucoSpec.parse("9x6:30:22").board()
     target = cv2.cvtColor(
         board.generateImage((9 * 90, 6 * 90), marginSize=45), cv2.COLOR_GRAY2BGR)
@@ -305,18 +308,20 @@ def test_a_lens_solve_is_judged_on_generalisation_not_on_fit():
     assert "same angle" in alike.complaint()
 
 
-def test_a_lens_that_does_not_generalise_is_not_adopted(tmp_path):
+def test_a_lens_that_does_not_generalise_is_not_adopted(tmp_path, monkeypatch):
     """Worse than none: it beat skipping undistortion in exactly one direction."""
     from layoutval.calibration import CharucoSpec
+
+    monkeypatch.setattr("layoutval.server.INTRINSIC_VIEWS_MAX", 15)
 
     display, panel, rig = rig_for()
     spec = CharucoSpec(panel.squares[0], panel.squares[1], panel.square_length,
                        panel.square_length * panel.marker_ratio)
     session = CaptureSession(tmp_path, display_size=display.size,
                              aperture=True, lens_board=spec)
-    # Twelve views from almost the same place: the failure rms cannot see.
+    # Fifteen views from almost the same place: the failure rms cannot see.
     last = None
-    for i in range(12):
+    for i in range(15):
         _, _, shot_rig = rig_for(tilt_deg=2.0 + 0.1 * i, roll_deg=0.7,
                                  seed=i, sampling_ratio=0.95)
         shot_rig.show("main")
@@ -326,7 +331,7 @@ def test_a_lens_that_does_not_generalise_is_not_adopted(tmp_path):
     assert session.status()["needs_intrinsics"] is True
     assert not (tmp_path / "intrinsics.json").exists()
     # The work is not thrown away.
-    assert session.status()["intrinsic_views"] == 12
+    assert session.status()["intrinsic_views"] == 15
 
 
 def _windowed(display, outer_scale, bezel=70):

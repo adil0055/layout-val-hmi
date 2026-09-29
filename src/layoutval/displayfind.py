@@ -65,6 +65,25 @@ SPILL_TOLERANCE = 0.02
 #: Fraction of a side, between its neighbours, that a line has to cover.
 MIN_COVERAGE = 0.45
 
+#: How far a candidate's true shape may be from the resolution typed in.
+ASPECT_TOLERANCE = 0.08
+
+#: Most candidate lines per side the shape search combines, longest first.
+SHAPE_LINES = 14
+
+#: Grey levels by which the step across the four sides -- just inside against
+#: just beyond -- may differ. One screen in one bezel steps alike all round
+#: (spreads of 5-46 on four bench photographs); a rectangle patched together
+#: from a window's edges, the screen's and a shelf on the wall behind stepped
+#: -10, -9, -11 and +118.
+STEP_SPREAD = 55.0
+
+#: Most lit content the shape search tolerates beyond any side. Looser than
+#: :data:`SPILL_TOLERANCE`, which picks a side on its own: here the shape does
+#: most of the choosing, and the left side of four bench photographs carried
+#: 3-6% from glare and the window's edge.
+SHAPE_SPILL = 0.10
+
 
 @dataclass
 class _Line:
@@ -357,12 +376,143 @@ def _refit(gray: np.ndarray, corners: np.ndarray, band: float = 6.0,
 # --------------------------------------------------------------------------
 
 
-def propose_display_corners(frame: np.ndarray, *, passes: int = 3) -> CornerProposal | None:
+def rectangle_aspect(corners: np.ndarray, image_size: tuple[int, int]) -> float:
+    """Width over height of the rectangle photographed as ``corners`` (TL, TR, BR, BL).
+
+    Zhang and He's whiteboard method: the two vanishing points give the focal
+    length, with the principal point taken as the image centre, and with it the
+    rectangle's true proportions -- which the photographed quadrilateral's own
+    do not have once the camera is off-axis. Close to square-on the focal
+    length is unobservable, and the quadrilateral's own proportions are used.
+    """
+    w, h = image_size
+    pp = np.array([w / 2.0, h / 2.0])
+    m1, m2, m4, m3 = (np.append(np.asarray(p, float) - pp, 1.0) for p in corners)
+    k2 = np.cross(m1, m4) @ m3 / (np.cross(m2, m4) @ m3)
+    k3 = np.cross(m1, m4) @ m2 / (np.cross(m3, m4) @ m2)
+    n2, n3 = k2 * m2 - m1, k3 * m3 - m1
+    den = n2[2] * n3[2]
+    f2 = -(n2[0] * n3[0] + n2[1] * n3[1]) / den if abs(den) > 1e-12 else -1.0
+    if (0.3 * max(w, h)) ** 2 < f2 < (5.0 * max(w, h)) ** 2:
+        return float(np.sqrt((n2[0] ** 2 / f2 + n2[1] ** 2 / f2 + n2[2] ** 2)
+                             / (n3[0] ** 2 / f2 + n3[1] ** 2 / f2 + n3[2] ** 2)))
+    return float(np.hypot(n2[0], n2[1]) / np.hypot(n3[0], n3[1]))
+
+
+def _outward(line: _Line, side: str) -> np.ndarray:
+    axis = 1 if side in ("top", "bottom") else 0
+    sign = -1 if side in ("top", "left") else 1
+    n = np.array([-line.d[1], line.d[0]])
+    return n if n[axis] * sign > 0 else -n
+
+
+def _band_level(gray: np.ndarray, line: _Line, outward: np.ndarray, lo: int, hi: int,
+                span: tuple[float, float]) -> float:
+    """Median grey level in the band ``lo``-``hi`` px beyond ``line``, along ``span``."""
+    h, w = gray.shape
+    ts = np.linspace(span[0], span[1], 60)
+    depths = np.arange(lo, hi + 1)
+    pts = (line.p[None, None, :] + ts[:, None, None] * line.d[None, None, :]
+           + depths[None, :, None] * outward[None, None, :]).reshape(-1, 2)
+    pts = np.round(pts).astype(int)
+    ok = (pts[:, 0] >= 0) & (pts[:, 0] < w) & (pts[:, 1] >= 0) & (pts[:, 1] < h)
+    return float(np.median(gray[pts[ok, 1], pts[ok, 0]])) if ok.any() else 255.0
+
+
+def _by_shape(hor: list[_Line], ver: list[_Line], marks: np.ndarray, aspect: float,
+              image_size: tuple[int, int], scale: float, gray: np.ndarray | None = None):
+    """The four lines whose rectangle has the display's own shape, or None.
+
+    Picking each side on its own takes the innermost clean line, and on a
+    cluster that draws large panels of its own that is a panel's edge: on a
+    bench photograph of one, a strip down the middle of the screen. With the
+    resolution typed in, the display's proportions are known, and a panel is
+    almost never the same shape as the screen it sits on. So every combination
+    of long lines is tried, and the one kept has a clean band beyond every side,
+    covers each side, and has the screen's proportions -- the innermost of any
+    that tie, which is the screen's edge rather than its bezel's.
+    """
+    h, w = marks.shape
+    centre = np.array([w / 2.0, h / 2.0])
+
+    def side_lines(lines, side):
+        horizontal = side in ("top", "bottom")
+        axis = 1 if horizontal else 0
+        at = centre[0] if horizontal else centre[1]
+        dim = w if horizontal else h
+        sign = -1 if side in ("top", "left") else 1
+        found = [line for line in lines if line.support >= 0.15 * dim
+                 and (_crossing(line, axis, at) - centre[axis]) * sign > 0]
+        return sorted(found, key=lambda line: -line.support)[:SHAPE_LINES]
+
+    cand = {"top": side_lines(hor, "top"), "bottom": side_lines(hor, "bottom"),
+            "left": side_lines(ver, "left"), "right": side_lines(ver, "right")}
+    if any(not v for v in cand.values()):
+        return None
+    best, best_key = None, None
+    for top in cand["top"]:
+        for bottom in cand["bottom"]:
+            for left in cand["left"]:
+                for right in cand["right"]:
+                    corners = [_intersect(top, left), _intersect(top, right),
+                               _intersect(bottom, right), _intersect(bottom, left)]
+                    if any(c is None for c in corners):
+                        continue
+                    quad = np.array(corners, np.float32)
+                    area = cv2.contourArea(quad)
+                    if not cv2.isContourConvex(quad) or area < 0.04 * w * h:
+                        continue
+                    shape = rectangle_aspect(np.array(corners) / scale, image_size)
+                    miss = abs(shape / aspect - 1.0)
+                    if miss > ASPECT_TOLERANCE:
+                        continue
+                    lines = {"top": top, "bottom": bottom, "left": left, "right": right}
+                    nb = {"top": (left, right), "bottom": (left, right),
+                          "left": (top, bottom), "right": (top, bottom)}
+                    cover = {s: _coverage(ln, _between(ln, *nb[s])) for s, ln in lines.items()}
+                    if min(cover.values()) < MIN_COVERAGE:
+                        continue
+                    spill = {s: _spill(marks, ln, _outward(ln, s), 3, 12, _between(ln, *nb[s]))
+                             for s, ln in lines.items()}
+                    worst = max(spill.values())
+                    if worst > SHAPE_SPILL:
+                        continue
+                    # One boundary all the way round: the same step across every
+                    # side, from what the screen shows to its bezel.
+                    spread = 0.0
+                    if gray is not None:
+                        steps = [_band_level(gray, ln, -_outward(ln, s), 3, 10, _between(ln, *nb[s]))
+                                 - _band_level(gray, ln, _outward(ln, s), 3, 10, _between(ln, *nb[s]))
+                                 for s, ln in lines.items()]
+                        spread = max(steps) - min(steps)
+                        if spread > STEP_SPREAD:
+                            continue
+                    # Cleanest bezel first, then shape -- the resolution is
+                    # exact -- then the evenest boundary, then how fully the
+                    # sides are covered; among near-ties, the innermost.
+                    # Coverage before shape picked a rectangle 5% the wrong
+                    # shape, running down to the lid; under haze two shapes 1%
+                    # apart tied, and the evener boundary was the screen's.
+                    key = (round(worst / 0.05), round(miss / 0.02), round(spread / 15.0),
+                           round(-min(cover.values()), 1), area)
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best = (lines, cover, spill)
+    return best
+
+
+def propose_display_corners(frame: np.ndarray, *, passes: int = 3,
+                            aspect: float | None = None) -> CornerProposal | None:
     """The display's four corners in ``frame``, or None if no display is found.
 
     ``confident`` is False when any side had to fall back to its least-bad line
     rather than one with a clean bezel beyond it -- the proposal is still made,
     because a wrong guess is cheap to drag, but the page says to check it.
+
+    ``aspect`` is the display's width over its height, when known -- from the
+    resolution typed in. It is used to pick the rectangle of that shape
+    (:func:`_by_shape`); without one, or when no rectangle fits, each side is
+    picked on its own.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
     scale = WORK_SIZE / max(gray.shape)
@@ -370,6 +520,19 @@ def propose_display_corners(frame: np.ndarray, *, passes: int = 3) -> CornerProp
     h, w = small.shape
     marks = _lit_marks(small)
     hor, ver = _families(small)
+    if aspect:
+        shaped = _by_shape(hor, ver, marks, float(aspect), (gray.shape[1], gray.shape[0]), scale,
+                           gray=small)
+        if shaped is not None:
+            lines, cover, spill = shaped
+            corners = np.array([_intersect(lines["top"], lines["left"]),
+                                _intersect(lines["top"], lines["right"]),
+                                _intersect(lines["bottom"], lines["right"]),
+                                _intersect(lines["bottom"], lines["left"])]) / scale
+            corners = _refit(gray, corners)
+            sides = {s: {"coverage": round(float(cover[s]), 3), "spill": round(float(spill[s]), 3),
+                         "clean": bool(spill[s] <= SPILL_TOLERANCE)} for s in lines}
+            return CornerProposal(corners=corners, confident=True, sides=sides)
     centre = np.array([w / 2.0, h / 2.0])
     families = {"top": hor, "bottom": hor, "left": ver, "right": ver}
     dims = {"top": w, "bottom": w, "left": h, "right": h}
