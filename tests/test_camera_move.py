@@ -82,6 +82,23 @@ class DepthRig(BezelRig):
         self.camera = moved
 
 
+def tilt_screen(rig, up=0.25, out=0.10):
+    """The screen tilts on a hinge along its bottom edge -- a laptop's lid -- and
+    nothing else moves: the top edge comes up and widens, the backdrop stays."""
+    pw, ph = rig.panel.panel_size
+    cam = rig.camera
+    q = cv2.perspectiveTransform(
+        np.float64([[[0, 0]], [[pw, 0]], [[pw, ph]], [[0, ph]]]), cam.H_true).reshape(4, 2)
+    w, h = q[1, 0] - q[0, 0], q[3, 1] - q[0, 1]
+    n = q.copy()
+    n[0] += (-out * w, -up * h)
+    n[1] += (out * w, -up * h)
+    moved = copy.copy(cam)
+    moved._rng = np.random.default_rng(9)
+    moved.H_true = cv2.getPerspectiveTransform(q.astype(np.float32), n.astype(np.float32)) @ cam.H_true
+    rig.camera = moved
+
+
 @pytest.fixture()
 def rig():
     display = ClusterDisplay()
@@ -121,6 +138,26 @@ def test_moving_sideways_in_front_of_a_backdrop_still_measures_the_screen(tmp_pa
     hit = _nearest(report, OIL)
     assert hit["verdict"] != "PASS"
     assert 1.5 < hit["measurement"]["abs_delta"] < 2.5
+
+
+def test_a_screen_tilted_on_its_own_is_followed_not_the_room(tmp_path, rig):
+    """A laptop's lid tilted between the shots, the room behind it where it was.
+
+    Matched over the whole photograph, the backdrop's points agreed that
+    nothing had moved and the pose was solved from there: the hinge's corners
+    right and the top ones hundreds of pixels out, nearly every element failing.
+    """
+    session = _start(tmp_path, rig)
+    tilt_screen(rig)
+    report = session.handle("validate", jpeg(rig.read())).report
+    assert report["verdict"] == "PASS", [
+        (e["element_id"], e["reason"]) for e in report["elements"] if e["verdict"] != "PASS"]
+
+    rig.display.offsets["TELLTALE_OIL_PRESSURE"] = (2.0, 0.0)
+    report = session.handle("validate", jpeg(rig.read())).report
+    hit = _nearest(report, OIL)
+    assert hit["verdict"] != "PASS"
+    assert 1.4 < hit["measurement"]["abs_delta"] < 2.6
 
 
 def test_a_whole_layout_shift_is_found_against_the_edges_with_edges_on(tmp_path, rig):

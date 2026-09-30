@@ -1566,7 +1566,12 @@ class CaptureSession:
             # A rough start from matched features when the phone moved a lot;
             # ECC then refines it. Only for the hand-held re-solve: a mounted
             # camera that moved that far should be caught, not followed.
-            init = feature_homography(ref_view, live_view)
+            # Matched on the screen only: a laptop's lid tilts without the
+            # keyboard, and its keys matched as well as anything and said
+            # nothing had moved. The whole frame if the screen has too little.
+            init = feature_homography(ref_view, live_view, mask=on_screen)
+            if init is None:
+                init = feature_homography(ref_view, live_view)
         est = tracker.measure(live_view, init=init, live_mask=picture)
         if on_screen is not None and not est.converged:
             # Too little on the screen itself to line up on: the whole frame,

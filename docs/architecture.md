@@ -635,7 +635,14 @@ ECC walks downhill in brightness from wherever it starts, and a phone aimed a
 sixth of the frame away between shots sent it to a wrong alignment that it
 reported as converged -- every element FAIL. Seeded, shifts of 60, 160 and
 260 px align. A mounted camera is not seeded: one that moved that far should be
-caught, not followed.
+caught, not followed. The reference's points are taken from the screen only
+(the reference's screen quad), and the whole frame only when the screen has too
+few: with a laptop's lid tilted between the shots and the keyboard and room
+where they were, the keyboard's points matched as well as anything and agreed
+that nothing had moved -- the hinge's corners exact, the top ones 400 px out,
+and the pose solved from there, nearly every element failing. From the screen
+alone the seed was within 0.2-4 px, and 109-111 of 111 elements passed with the
+top edge lifted by 12-40% of the screen's height and widened by 4-16% each side.
 
 **Camera shake.** Moving the phone *between* shots is the pose re-solve's job;
 blur *within* a shot is `blur.py`'s. The two aligned, de-glared frames are

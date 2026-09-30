@@ -1732,17 +1732,25 @@ class DriftEstimate:
 
 
 def feature_homography(reference: np.ndarray, live: np.ndarray, *,
-                       min_inliers: int = 25) -> np.ndarray | None:
+                       min_inliers: int = 25,
+                       mask: np.ndarray | None = None) -> np.ndarray | None:
     """Reference-to-live homography from matched SIFT features, or None.
 
     Coarse, but found from anywhere: it matches distinctive points rather than
     walking downhill in brightness, so it does not care how far the camera
     moved between the shots. SIFT is patent-free since 2020 and Apache-2.0 in
     OpenCV. Lowe's ratio test, then RANSAC, then a count of what agreed.
+
+    ``mask`` limits the reference's points to where the display is. Only the
+    display's plane is wanted, and a keyboard is full of distinctive points:
+    with a laptop's lid tilted and the room and keyboard where they were, the
+    homography came from them -- the hinge's corners exact, the top corners
+    400 px off -- and the pose was solved from there.
     """
     sift = cv2.SIFT_create(nfeatures=4000)
     a, b = to_gray(reference), to_gray(live)
-    ka, da = sift.detectAndCompute(a, None)
+    ka, da = sift.detectAndCompute(
+        a, None if mask is None else (mask > 0).astype(np.uint8) * 255)
     kb, db = sift.detectAndCompute(b, None)
     if da is None or db is None or len(ka) < min_inliers or len(kb) < min_inliers:
         return None

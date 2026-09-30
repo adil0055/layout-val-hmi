@@ -362,8 +362,11 @@ Keep the whole display in the photo. Undistortion keeps every pixel of the
 photograph, and if a shot still leaves part of the display out, Reference says
 how much and on which side, and Validate skips the elements that are out of
 frame and names them instead of failing them. Aiming the phone differently
-between shots is fine: the pose is found from matched features first, so even
-a large change lines up.
+between shots is fine: the pose is found from features matched on the screen
+first, so even a large change lines up -- and so does a screen that moved on
+its own, like a laptop's lid tilted, while the room and keyboard stayed put.
+Tilted far, an LCD washes out and shows moire, and small elements can then
+fail their identity check though they are in place.
 
 Two more things a phone brings with it. Its photos carry an EXIF orientation
 rather than rotated pixels, which is handled — a frame that came in on its side
