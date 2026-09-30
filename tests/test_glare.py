@@ -258,6 +258,34 @@ def test_a_wrong_symbol_that_is_still_visible_under_glare_still_fails():
     assert (report.results[0].verdict.value, report.results[0].reason) == ("FAIL", "wrong_content")
 
 
+def test_a_symbol_on_a_slope_of_haze_passes_without_any_glare_found():
+    """Haze too faint to be found as glare still tilts the brightness across
+    an element; the same symbol on that slope is the same symbol."""
+    ref = np.full((120, 200, 3), 30, np.uint8)
+    cv2.putText(ref, "160", (55, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (150, 150, 150), 2)
+    slope = np.tile(np.linspace(0, 100, ref.shape[1], dtype=np.float32), (ref.shape[0], 1))
+    live = np.clip(ref + slope[..., None], 0, 255).astype(np.uint8)
+    report, profile = _one_element_report(ref, live, (50.0, 45.0, 90.0, 40.0))
+    none = np.zeros(ref.shape[:2], bool)
+    glare.recheck_under_glare(report, profile, ref, live, none, none)
+    assert report.results[0].verdict.value == "PASS"
+    assert "(detail)" in report.results[0].measurement.method
+
+
+def test_without_glare_a_wrong_or_missing_symbol_still_fails():
+    ref = np.full((120, 200, 3), 30, np.uint8)
+    cv2.putText(ref, "20", (70, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (230, 230, 230), 2)
+    wrong = np.full_like(ref, 30)
+    cv2.putText(wrong, "57", (70, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (230, 230, 230), 2)
+    blank = np.full_like(ref, 30) + np.random.default_rng(0).integers(0, 3, ref.shape, dtype=np.uint8)
+    none = np.zeros(ref.shape[:2], bool)
+    for live in (wrong, blank):
+        report, profile = _one_element_report(ref, live, (60.0, 45.0, 60.0, 40.0))
+        glare.recheck_under_glare(report, profile, ref, live, none, none)
+        assert (report.results[0].verdict.value, report.results[0].reason) == ("FAIL", "wrong_content")
+        assert not report.flags
+
+
 def test_a_reflected_room_object_is_not_a_finding_and_a_drawn_one_is():
     """Out of focus against in focus: the camera is focused on the screen."""
     from layoutval.types import ResidualFinding, RunReport

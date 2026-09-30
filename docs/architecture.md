@@ -221,7 +221,12 @@ all with long straight edges. What it does:
   short stray segment cannot stand in for an edge.
 - **The winner is refitted at full resolution**, allowed to move at most 0.5% of
   the diagonal, and the proposal says whether it is `confident`.
-- **With the resolution typed in, the screen's shape picks it.** A cluster that
+- **With the resolution typed in, the screen's shape checks it.** The
+  per-side answer is kept when its true proportions (below) are within 8% of
+  the resolution's. Searching first and ranking by shape put one side on a
+  laptop's lid in a real photograph: lid and screen together were nearer the
+  typed-in shape than the screen alone was through the lens. Only when the
+  per-side shape is wrong is the search below run. A cluster that
   draws large panels of its own defeats "innermost clean line": on a bench
   photograph of an EV cluster the proposal was a strip down the middle of the
   screen, and on a second shot nothing at all -- and with it an inventory of 5
@@ -236,7 +241,7 @@ all with long straight edges. What it does:
   shelf on the wall behind stepped -10, -9, -11 and +118. Ranked by cleanest
   bezel, then shape, then evenest step, then coverage, then innermost. On six
   bench photographs it found all six screens, agreeing with the per-side answer
-  where that was right; where nothing fits, the per-side rule runs as before.
+  where that was right; where nothing fits, the per-side answer is returned.
 
 Measured on the two bench photographs under 120 random warps -- perspective,
 rotation, exposure -- it found the screen every time, and was never confidently
@@ -556,15 +561,20 @@ strokes. So:
 - **Align on de-glared frames too.** The hand-held pose re-solve matches
   brightness, and with the camera perfectly still a moved reflection was read
   as 0.5-11 px of camera motion, dragging every element with it.
-- **Re-check identity on detail where a reflection lay.** A compact lamp is
+- **Re-check identity on detail.** A compact lamp is
   only partly subtracted -- the opening cannot follow the top of a hill much
   narrower than its square -- and leaves a slope of light, which correlation
-  reads as different content. An element that fails its identity check under a
-  reflection is compared again at the measured position on its fine detail
-  alone (each patch less a blur of itself) and without the pixels the
+  reads as different content; haze too faint to be found as glare, and the
+  phone's local tone mapping, do the same anywhere. An element that fails its
+  identity check is compared again at the measured position on its fine detail
+  alone (each patch less a blur of itself) and without the pixels a
   reflection clipped. Over a good screen that turned a FAIL into a PASS; a 2 px
   fault under the same lamp still measured 2.03 px, and a wrong symbol under it
-  still failed.
+  still failed. It does not let a different element through: of 406 pairs of
+  different elements from two real clusters, none that failed on the whole
+  patch passed on detail. Only under a reflection may
+  an element too faded to tell be judged on position alone; elsewhere a faded
+  or missing element is a failure.
 - **Never a verdict of its own.** Glare is the room, not the display. It is
   subtracted and the elements are measured; it does not put REVIEW on anything.
   (An earlier version did, for anything a reflection clipped and for every

@@ -1601,12 +1601,18 @@ class CaptureSession:
             live_m, values=self.values, reference=ref_m, report=report,
             compare=self._comparable(inside),
         )
+        # A smooth slope of light -- a reflection, or haze too faint to be found
+        # as one -- is not a different symbol: identity is checked again on
+        # detail alone wherever it failed.
+        none = np.zeros(ref_m.shape[:2], bool)
+        glare.recheck_under_glare(report, self.profile, ref_m, live_m,
+                                  pair.footprint if pair is not None else none,
+                                  pair.clipped if pair is not None else none,
+                                  values=self.values)
         if pair is not None:
             # Glare is taken out, never reported on: it is the room, not the
             # display, and a verdict is about the display. What was subtracted
             # is kept in the saved report as a note.
-            glare.recheck_under_glare(report, self.profile, ref_m, live_m,
-                                      pair.footprint, pair.clipped, values=self.values)
             glare.set_aside_residual(report, pair.footprint, ref_m, live_m)
         set_aside_displaced(report, ref_m, live_m,
                             reach=round(0.04 * max(self.reference.shape[:2])))

@@ -510,29 +510,43 @@ def propose_display_corners(frame: np.ndarray, *, passes: int = 3,
     because a wrong guess is cheap to drag, but the page says to check it.
 
     ``aspect`` is the display's width over its height, when known -- from the
-    resolution typed in. It is used to pick the rectangle of that shape
-    (:func:`_by_shape`); without one, or when no rectangle fits, each side is
-    picked on its own.
+    resolution typed in. Each side is picked on its own first, innermost, and
+    that answer stands if it has the screen's shape. Only when it does not --
+    a panel the cluster draws, taken for the screen -- is the rectangle of the
+    right shape searched for (:func:`_by_shape`). Searching first, and ranking
+    by shape, put one side on a laptop's lid: the lid is nearly the screen's
+    shape, and on a bench photograph it came out a little nearer.
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
     scale = WORK_SIZE / max(gray.shape)
     small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-    h, w = small.shape
     marks = _lit_marks(small)
     hor, ver = _families(small)
-    if aspect:
-        shaped = _by_shape(hor, ver, marks, float(aspect), (gray.shape[1], gray.shape[0]), scale,
-                           gray=small)
-        if shaped is not None:
-            lines, cover, spill = shaped
-            corners = np.array([_intersect(lines["top"], lines["left"]),
-                                _intersect(lines["top"], lines["right"]),
-                                _intersect(lines["bottom"], lines["right"]),
-                                _intersect(lines["bottom"], lines["left"])]) / scale
-            corners = _refit(gray, corners)
-            sides = {s: {"coverage": round(float(cover[s]), 3), "spill": round(float(spill[s]), 3),
-                         "clean": bool(spill[s] <= SPILL_TOLERANCE)} for s in lines}
-            return CornerProposal(corners=corners, confident=True, sides=sides)
+    size = (gray.shape[1], gray.shape[0])
+    per_side = _per_side(gray, small, scale, marks, hor, ver, passes)
+    if not aspect:
+        return per_side
+    if (per_side is not None
+            and abs(rectangle_aspect(per_side.corners, size) / aspect - 1.0) <= ASPECT_TOLERANCE):
+        return per_side
+    shaped = _by_shape(hor, ver, marks, float(aspect), size, scale, gray=small)
+    if shaped is None:
+        return per_side
+    lines, cover, spill = shaped
+    corners = np.array([_intersect(lines["top"], lines["left"]),
+                        _intersect(lines["top"], lines["right"]),
+                        _intersect(lines["bottom"], lines["right"]),
+                        _intersect(lines["bottom"], lines["left"])]) / scale
+    corners = _refit(gray, corners)
+    sides = {s: {"coverage": round(float(cover[s]), 3), "spill": round(float(spill[s]), 3),
+                 "clean": bool(spill[s] <= SPILL_TOLERANCE)} for s in lines}
+    return CornerProposal(corners=corners, confident=True, sides=sides)
+
+
+def _per_side(gray: np.ndarray, small: np.ndarray, scale: float, marks: np.ndarray,
+              hor: list[_Line], ver: list[_Line], passes: int) -> CornerProposal | None:
+    """Each side chosen on its own: the innermost strong line with a clean bezel beyond."""
+    h, w = small.shape
     centre = np.array([w / 2.0, h / 2.0])
     families = {"top": hor, "bottom": hor, "left": ver, "right": ver}
     dims = {"top": w, "bottom": w, "left": h, "right": h}

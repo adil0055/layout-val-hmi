@@ -319,7 +319,7 @@ def _contrast(patch: np.ndarray) -> float:
 
 def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray,
                         footprint: np.ndarray, clipped: np.ndarray, *, values=None) -> list[str]:
-    """Check identity again, on detail alone, for elements a reflection lay over.
+    """Check identity again, on detail alone, for elements that failed it.
 
     A compact, bright reflection -- a lamp rather than a window -- is only
     partly subtracted: the top of its hill is narrower than the opening can
@@ -327,22 +327,25 @@ def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray
     under it, and correlation, which forgives an even change of brightness but
     not a slope, reads a telltale on that slope as a different telltale. Over a
     good screen that was a FAIL, which is the reflection deciding the verdict.
+    Haze too faint to be found as glare, and the phone's local tone mapping,
+    leave the same kind of slope anywhere on the screen.
 
-    So an element whose identity check failed under a reflection is compared
-    again at the position that was measured, on its fine detail only -- each
-    patch less a blur of itself, which a smooth slope cannot survive and a
-    stroke does -- and without the pixels the reflection clipped, which carry
-    nothing (two pixels of margin for the bloom round a clip). The same element
-    matches; a different symbol still differs in its strokes and stays a
-    failure. Needs 30% of the element unclipped. Returns the ids it changed.
+    So an element whose identity check failed is compared again at the
+    position that was measured, on its fine detail only -- each patch less a
+    blur of itself, which a smooth slope cannot survive and a stroke does --
+    and without the pixels a reflection clipped, which carry nothing (two
+    pixels of margin for the bloom round a clip). The same element matches; a
+    different symbol still differs in its strokes and stays a failure: on 406
+    pairs of different elements from two real clusters, none that failed on
+    the whole patch passed on detail. Needs 30% of the element unclipped.
+    Only under the glare ``footprint`` may an element too faded to tell be
+    judged on position alone. Returns the ids it changed.
     """
     from layoutval.capture import to_gray
     from layoutval.measure import subpixel_crop
     from layoutval.types import resolve_value
     from layoutval.verdict import WRONG_CONTENT, evaluate
 
-    if not footprint.any():
-        return []
     lost = cv2.dilate(clipped.astype(np.uint8) * 255, np.ones((5, 5), np.uint8))
     lit = footprint.astype(np.uint8) * 255
     changed: list[str] = []
@@ -359,8 +362,7 @@ def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray
             continue
         x, y, w, h = spec.expected_bbox(resolve_value(spec, values))
         here, there = (x, y, w, h), (x + m.dx, y + m.dy, w, h)
-        if not ((subpixel_crop(lit, here) > 0).any() or (subpixel_crop(lit, there) > 0).any()):
-            continue
+        under = bool((subpixel_crop(lit, here) > 0).any() or (subpixel_crop(lit, there) > 0).any())
         keep = ~((subpixel_crop(lost, here) > 0) | (subpixel_crop(lost, there) > 0))
         ref_patch, live_patch = subpixel_crop(reference, here), subpixel_crop(live, there)
         if keep.mean() >= 0.3 and keep.sum() >= 30:
@@ -376,10 +378,12 @@ def recheck_under_glare(report, profile, reference: np.ndarray, live: np.ndarray
             score = float((a * b).sum()) / den if den > 0 else 0.0
             if score >= result.tolerance.identity_min:
                 m.zncc = score
-                m.method += " (detail, under glare)"
+                m.method += " (detail, under glare)" if under else " (detail)"
                 report.results[i] = evaluate(spec, m)
                 changed.append(spec.id)
                 continue
+        if not under:
+            continue
         # Faded past telling: a reflection plus the phone's own processing --
         # local tone mapping flattens contrast where it is bright, noise
         # reduction smears what is faint -- can leave an element a ghost of

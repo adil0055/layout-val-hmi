@@ -40,8 +40,9 @@ any time:
 
 Both corner modes ask the cluster for nothing, and either way the dots are
 snapped to the real panel edge sub-pixel, so rough is fine. Auto corners uses
-the resolution typed in: it looks for the rectangle of the screen's own shape,
-so a cluster that draws big panels of its own is not mistaken for its screen.
+the resolution typed in: it takes each side's innermost clean edge, checks the
+rectangle has the screen's own shape, and only when it does not -- a cluster
+that draws big panels of its own -- searches for the rectangle that does.
 Switching mode
 starts calibration over — the new mode maps into a different display space — but
 keeps the lens solve. `--auto-border` keeps the older fully automatic border
@@ -312,8 +313,10 @@ to passing every scene where nothing clipped, while a 2 px fault still measured
 1.70–1.78 px (1.77 px with no glare at all).
 
 Glare never produces a verdict of its own. A compact lamp, which the
-subtraction only partly removes, is handled by re-checking the element under it
-on its fine detail alone; a wrong symbol under the same lamp still fails. An
+subtraction only partly removes, or haze too faint to be found as glare, leaves
+a slope of light; an element that fails its identity check is checked again on
+its fine detail alone, which a slope does not survive; a wrong symbol still
+fails. An
 element the glare and the phone's own processing have faded past recognition is
 judged on its position, which is still exact, and the phone says in one line
 that what it shows could not be confirmed. Reflected room objects are told
