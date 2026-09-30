@@ -354,6 +354,9 @@ def cmd_go(args: argparse.Namespace) -> int:
     and the cluster's own chessboard -- from its export with ``--board``, or
     without one, identified from the HMI's own layout by the grid it shows.
     """
+    # A webcam is a different lens from the phone: its solve and its captures
+    # are kept apart, so neither is ever applied to the other's frames.
+    args.out = args.out or ("out/webcam" if args.webcam else "out/captures")
     out = Path(args.out)
     using_board = bool(args.board)
 
@@ -538,6 +541,18 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
             print()
     print(f"      {server.url}")
     print()
+    # A browser lends a page the webcam only on a secure origin, and
+    # localhost is one; the LAN address above is not.
+    host = args.host
+    local = (f"http://localhost:{server.server_address[1]}/?t={server.token}&cam=1"
+             if host in ("0.0.0.0", "::", "", "127.0.0.1", "localhost") else None)
+    if local:
+        print("  Or on this computer, with its webcam:")
+        print(f"      {local}")
+        print()
+        if getattr(args, "webcam", False):
+            import webbrowser
+            webbrowser.open(local)
     print(f"  Typing it in is fine too — the token is {server.token} and it is not")
     print("  case sensitive, with no letter O, letter l or letter i in it.")
     print()
@@ -698,7 +713,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "tapping its corners. Needs a clean scene")
     c.add_argument("--fresh-lens", action="store_true",
                    help="ignore a saved lens solve and shoot a new one")
-    c.add_argument("--out", default="out/captures")
+    c.add_argument("--webcam", action="store_true",
+                   help="capture with this computer's webcam: opens the page here, "
+                        "on localhost, with a live preview. Its lens solve and "
+                        "captures go to out/webcam unless --out says otherwise")
+    c.add_argument("--out", default=None,
+                   help="default out/captures, or out/webcam with --webcam")
     c.add_argument("--host", default="0.0.0.0")
     c.add_argument("--port", type=int, default=8000)
     c.add_argument("--quiet", action="store_true")

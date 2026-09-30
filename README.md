@@ -22,12 +22,30 @@ capture ──▶ undistort ──▶ rectify ──▶ locate ──▶ score �
 ```bash
 layoutval go                          # finds the display's corners itself
 layoutval go --board board.json       # also offers the cluster's own chessboard
+layoutval go --webcam                 # this computer's webcam instead of a phone
 ```
 
 Scan the QR with a phone on the same network, type the cluster's resolution in
 at the top of the page (e.g. 1920 × 720, from its spec), and follow the steps:
 **Intrinsics → Calibrate → Reference → Validate**. The resolution is never read
 from the computer: in use, the computer is not the cluster.
+
+**With a webcam.** `--webcam` opens the same page on this computer, at a
+`localhost` address (a browser only lends a page the camera there), with a live
+preview and a camera picker; the address is printed on every run too, and
+**Use this computer's webcam** on the page switches to it. Aim the webcam at
+the screen under test -- a second monitor, say -- and press **Capture from
+webcam**: each capture is the mean of 8 frames, which takes most of a
+webcam's noise out. The lens step is hands-free: show the ChArUco board on your
+phone (or a print), hold it in front of the webcam and turn on **Hands-free lens
+views**; a view is taken each time the board has been moved and then held
+still, and a repeat of an earlier view is not counted. The webcam's lens solve
+and captures go to `out/webcam`, apart from the phone's: a lens solve is in one
+camera's pixels, and a frame of any other size is refused rather than warped.
+Resolution is what limits a webcam: a 1080p one filling its frame with a
+1920-wide screen samples it at under 1 camera pixel per display pixel (the page
+shows this as the sampling ratio), where a phone gets 1.4-1.7. Get it close, or
+use a 4K webcam.
 
 The page has a switch for how the display is found, and it can be changed at
 any time:

@@ -695,6 +695,25 @@ Design notes worth knowing:
   was worse than skipping undistortion altogether. `LensCheck` therefore scores
   held-out reprojection and the spread of board angles, and a solve that fails
   is not adopted.
+- **A repeated lens view is not counted** (`SAME_VIEW`): one whose board
+  corners sit on average within 0.4% of the frame's diagonal of an earlier
+  view's. Kept that tight because a tilt, which the solve most needs, moves the
+  corners little -- distinct test poses 2-13 degrees apart were 0.54% apart at
+  the least.
+- **A lens solve is only applied to frames of its own size.** It is in one
+  camera's pixels; a webcam frame after a phone's solve, or a phone turned on its
+  side, is refused with a message rather than remapped into nonsense.
+- **This computer's webcam** (`go --webcam`). The same page, opened at
+  `localhost` -- a browser lends a page the camera only on a secure origin, which
+  localhost is and a LAN address is not, so a phone never sees the option. A
+  capture is the mean of 8 consecutive frames (`requestVideoFrameCallback`),
+  sent as PNG; lens views are single frames, since the board is hand-held, and
+  are taken hands-free: a 64x36 thumbnail of the live picture decides when the
+  board has moved since the last view (mean change over 6 levels) and is then
+  still (under 2.5 levels for 0.6 s). Its solve and captures go to `out/webcam`.
+  Tested in Chromium with a fake camera playing a bench photograph: corners on
+  the screen's edge, 108 elements, PASS; one lens view taken and no repeats
+  while the board stood still.
 - **The lens board is independent of the calibration route** (`--lens-board`).
   Intrinsics belong to the *camera*, so tying them to a rig route would mean the
   one route that asks the cluster for nothing could only get undistortion by

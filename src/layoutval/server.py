@@ -142,6 +142,15 @@ FRAME_AREAS = ("top-left", "top", "top-right", "left", "centre", "right",
 #: Past this many views the lens is solved with whatever coverage there is.
 INTRINSIC_VIEWS_MAX = 30
 
+SAME_VIEW = 0.004
+"""A lens view whose board corners are on average within this share of the
+frame's diagonal of an earlier view's is that view again and is not counted:
+the same shot sent twice, or a board held still through two of the webcam's
+hands-free captures. Near-identical views fit beautifully and say nothing about
+the rest of the frame (see LensCheck). Kept tight because a tilt, which is what
+the solve most needs, moves the corners little: poses 2-13 degrees apart on
+the test bench were 0.54% of the diagonal apart at the least."""
+
 #: How far the board is allowed to move in the frame before the anchor
 #: learned in the bind frame stops being the anchor for this one.  Measured,
 #: not guessed: with the anchor re-bound in the pose it is used in, bezel
@@ -676,6 +685,20 @@ class CaptureSession:
                 name=f"{base}.jpg", action=action, verdict="FAILED",
                 when=datetime.now().isoformat(timespec="seconds"),
                 detail="enter the cluster's resolution first, at the top of the page")
+        lens = self.calibration.intrinsics if self.calibration else None
+        if action != "intrinsics" and lens is not None and \
+                (frame.shape[1], frame.shape[0]) != lens.image_size:
+            # A lens solve is in the pixels of one camera at one resolution.
+            # Applied to another -- the webcam after the phone, or the phone
+            # turned on its side -- it warps the frame into nonsense.
+            return CaptureRecord(
+                name=f"{base}.jpg", action=action, verdict="FAILED",
+                when=datetime.now().isoformat(timespec="seconds"),
+                detail=(f"this frame is {frame.shape[1]}x{frame.shape[0]} but the lens "
+                        f"was solved for {lens.image_size[0]}x{lens.image_size[1]} -- "
+                        "another camera, or the same one at another resolution or "
+                        "turned on its side. Shoot Intrinsics with this camera, "
+                        "or go back to the one it was solved for."))
         if action == "propose":
             # Read-only: nothing about the session changes until the dots are
             # confirmed and come back as "corners".
@@ -1017,6 +1040,12 @@ class CaptureSession:
             )
             return rec
 
+        again = self._repeated_view(obj, img)
+        if again is not None:
+            rec.verdict = "FAILED"
+            rec.detail = (f"the same as view {again} -- not counted. Move the board "
+                          "somewhere new or tilt it, then hold it still.")
+            return rec
         self._intrinsic_views.append((obj, img))
         got, want = len(self._intrinsic_views), INTRINSIC_VIEWS_WANTED
         missing = self._uncovered_areas()
@@ -1728,6 +1757,26 @@ class CaptureSession:
                     dy=None if shift.dy is None else round(shift.dy, 2),
                     detail=detail)
 
+    def _repeated_view(self, obj: np.ndarray, img: np.ndarray) -> int | None:
+        """The number of an earlier lens view this one repeats (SAME_VIEW), or None."""
+        if self._intrinsic_frame_size is None:
+            return None
+        w, h = self._intrinsic_frame_size
+        limit = SAME_VIEW * float(np.hypot(w, h))
+        here = {tuple(np.round(o, 4)): p
+                for o, p in zip(obj.reshape(-1, 3), img.reshape(-1, 2))}
+        for n, (o2, i2) in enumerate(self._intrinsic_views, 1):
+            pairs = [(here[k], q) for k, q in
+                     ((tuple(np.round(o, 4)), q)
+                      for o, q in zip(o2.reshape(-1, 3), i2.reshape(-1, 2)))
+                     if k in here]
+            if len(pairs) < 0.5 * min(len(here), len(o2)):
+                continue                      # mostly different corners seen
+            a, b = np.float64([p for p, _ in pairs]), np.float64([q for _, q in pairs])
+            if float(np.linalg.norm(a - b, axis=1).mean()) < limit:
+                return n
+        return None
+
     def _uncovered_areas(self) -> list[str]:
         """Parts of the frame no lens-board view has reached yet (see FRAME_AREAS).
 
@@ -1953,6 +2002,12 @@ button.ghost#marksend:not(:disabled){background:#2F7D57;border-color:#2F7D57}
                 padding:12px 16px;font-size:15px;font-weight:600}
 #sizecard.need{border-color:#3E8FD0}
 label.shoot.off{background:#3A4650;color:#9DADB5;pointer-events:none}
+#cam{width:100%;border-radius:8px;border:1px solid #2B373D;display:block;background:#000}
+.camrow{display:flex;gap:8px;align-items:center;margin:8px 0 10px;font-size:12.5px;color:#8B9AA3}
+.camrow select{flex:1;min-width:0;background:#0F1518;color:#E3EAE8;border:1px solid #2B373D;
+               border-radius:8px;padding:8px;font-size:13px}
+button.wide{display:block;width:100%;margin-top:8px}
+button.ghost.live{background:#1D5B8A;border-color:#3E8FD0}
 </style>
 </head>
 <body>
@@ -1995,8 +2050,17 @@ label.shoot.off{background:#3A4650;color:#9DADB5;pointer-events:none}
 </div>
 
 <div class="card">
+  <div id="camwrap" style="display:none">
+    <video id="cam" autoplay playsinline muted></video>
+    <div class="camrow">
+      <select id="camsel" aria-label="Camera"></select>
+      <span id="camres"></span>
+    </div>
+  </div>
   <label class="shoot" id="shootLabel" for="shot">Take photo</label>
   <input id="shot" type="file" accept="image/*" capture="environment">
+  <button id="camauto" class="ghost wide" style="display:none"></button>
+  <button id="camtoggle" class="ghost wide" style="display:none"></button>
   <div class="hint" id="hint"></div>
 </div>
 
@@ -2030,7 +2094,15 @@ const TOKEN = new URLSearchParams(location.search).get("t") || "";
 let action = "calibrate";
 let BEZEL = false, ANCHORED = false;
 let MODE = "", MODES = {};
+let STATUS = null;
 const $ = id => document.getElementById(id);
+// This computer's own webcam, instead of a phone. Browsers only hand a page a
+// camera on a secure origin, which http://localhost is and a LAN address is
+// not -- so on a phone the option never shows.
+let CAM = null, AUTO = null;
+const CAN_CAM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+const WANT_CAM = new URLSearchParams(location.search).get("cam") === "1";
+const SHOOT = () => CAM ? "Capture from webcam" : "Take photo";
 
 document.querySelectorAll(".step").forEach(el => {
   el.onclick = () => { action = el.dataset.a; paintSteps(); };
@@ -2053,8 +2125,14 @@ function paintSteps() {
       ? "Get the whole bezel board in frame. The screen can show anything \u2014 the markers do the work."
       : "First time only: the markers and the cluster's calibration screen, together in one frame.";
   }
+  if (CAM) {
+    hints.intrinsics = "Show the lens board on your phone (or a print) and hold it in front of " +
+      "the webcam. Turn on hands-free: a view is taken each time you move the board somewhere " +
+      "new \u2014 every part of the frame, tilted different ways \u2014 and hold it still.";
+    hints.validate = "Show the same screen with whatever you are testing. Leave the webcam where it was.";
+  }
   $("hint").textContent = hints[action];
-  paintSize();
+  paintCam();
 }
 
 document.querySelectorAll(".modes button").forEach(b => {
@@ -2107,7 +2185,7 @@ function paintSize() {
   const label = $("shootLabel");
   if (!label.classList.contains("busy")) {
     label.classList.toggle("off", blocked);
-    label.textContent = blocked ? "Enter the HMI resolution first" : "Take photo";
+    label.textContent = blocked ? "Enter the HMI resolution first" : SHOOT();
   }
   $("s-size").textContent = SIZE ? `${SIZE[0]} \u00d7 ${SIZE[1]}` : "not set";
 }
@@ -2131,6 +2209,7 @@ async function refresh() {
   try {
     const r = await fetch(`/status?t=${TOKEN}`);
     const s = await r.json();
+    STATUS = s;
     SIZE = s.display_size; NEED_SIZE = !!s.size_from_phone;
     paintSize();
     $("s-cal").textContent = s.calibrated ? "yes" : "no";
@@ -2266,6 +2345,11 @@ $("marksend").onclick = async () => {
 $("shot").onchange = async ev => {
   const file = ev.target.files[0];
   if (!file) return;
+  await useShot(file);
+  ev.target.value = "";
+};
+
+async function useShot(file) {
   if (action === "corners") {
     // Nothing is calibrated until the corners are confirmed, so the photograph
     // is shown here and held until then. In auto mode the laptop proposes the
@@ -2275,7 +2359,6 @@ $("shot").onchange = async ev => {
     $("markimg").src = URL.createObjectURL(file);
     $("marker").style.display = "block";
     $("result").style.display = "none";
-    ev.target.value = "";
     $("marktitle").textContent = MODE === "auto" ? "Finding the display\u2026"
                                                  : "Tap the four corners of the display";
     if (MODE === "auto") {
@@ -2309,10 +2392,142 @@ $("shot").onchange = async ev => {
   } catch (e) {
     lost(e);
   }
-  label.textContent = "Take photo";
+  label.textContent = SHOOT();
   label.classList.remove("busy");
-  ev.target.value = "";
-  refresh();
+  await refresh();
+}
+
+// --- this computer's webcam ----------------------------------------------
+// Each capture is the mean of FRAMES consecutive frames: a webcam's frame is
+// small and noisy, and the noise, not the optics, is what limits where an
+// edge is found. The lens board is hand-held, so its views are single frames.
+const FRAMES = 8;
+function savedCam() {
+  try { return localStorage.getItem("layoutval.cam") || ""; } catch (e) { return ""; }
+}
+async function startCam(id) {
+  stopCam();
+  const video = {width: {ideal: 4096}, height: {ideal: 2160}};
+  if (id) video.deviceId = {exact: id};
+  try {
+    CAM = await navigator.mediaDevices.getUserMedia({video, audio: false});
+  } catch (e) {
+    CAM = null;
+    if (id) return startCam("");            // that camera has gone: the default
+    show({verdict: "FAILED", detail: "Couldn't open the webcam (" + e.name + "). Allow " +
+          "camera access for this page, and close any other app using the camera."});
+    return paintSteps();
+  }
+  const v = $("cam");
+  v.srcObject = CAM;
+  try { await v.play(); } catch (e) { /* autoplay is muted; it starts */ }
+  const st = CAM.getVideoTracks()[0].getSettings();
+  try { localStorage.setItem("layoutval.cam", st.deviceId || ""); } catch (e) { /* private window */ }
+  const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+  $("camsel").innerHTML = cams.map((d, i) =>
+    `<option value="${esc(d.deviceId)}">${esc(d.label || "Camera " + (i + 1))}</option>`).join("");
+  $("camsel").value = st.deviceId || "";
+  $("camres").textContent = `${st.width || v.videoWidth} \u00d7 ${st.height || v.videoHeight}`;
+  paintSteps();
+}
+function stopCam() {
+  stopAuto();
+  if (CAM) CAM.getTracks().forEach(t => t.stop());
+  CAM = null;
+}
+function paintCam() {
+  if (AUTO && (action !== "intrinsics" || !CAM)) stopAuto();
+  $("camwrap").style.display = CAM ? "block" : "none";
+  $("camtoggle").style.display = CAN_CAM ? "block" : "none";
+  $("camtoggle").textContent = CAM ? "Use a photo file instead" : "Use this computer's webcam";
+  $("camauto").style.display = CAM && action === "intrinsics" ? "block" : "none";
+  $("camauto").textContent = AUTO ? "Hands-free is on \u2014 tap to stop" : "Hands-free lens views";
+  $("camauto").classList.toggle("live", !!AUTO);
+  paintSize();
+}
+$("camsel").onchange = () => startCam($("camsel").value);
+$("camtoggle").onclick = () => { if (CAM) { stopCam(); paintSteps(); } else startCam(savedCam()); };
+
+function nextFrame(v) {
+  return new Promise(r => v.requestVideoFrameCallback
+    ? v.requestVideoFrameCallback(() => r()) : setTimeout(r, 50));
+}
+async function grab(frames) {
+  const v = $("cam"), w = v.videoWidth, h = v.videoHeight;
+  const cv = document.createElement("canvas");
+  cv.width = w; cv.height = h;
+  const g = cv.getContext("2d", {willReadFrequently: true});
+  let sum = null;
+  for (let k = 0; k < frames; k++) {
+    await nextFrame(v);
+    g.drawImage(v, 0, 0, w, h);
+    if (frames === 1) break;
+    const d = g.getImageData(0, 0, w, h).data;
+    if (!sum) sum = new Uint16Array(d.length);
+    for (let i = 0; i < d.length; i++) sum[i] += d[i];
+  }
+  if (sum) {
+    const out = g.createImageData(w, h);
+    for (let i = 0; i < sum.length; i++) out.data[i] = sum[i] / frames;
+    g.putImageData(out, 0, 0);
+  }
+  // PNG: lossless, and over localhost its size costs nothing.
+  const blob = await new Promise(r => cv.toBlob(r, "image/png"));
+  return new File([blob], "webcam.png", {type: "image/png"});
+}
+$("shootLabel").addEventListener("click", async ev => {
+  if (!CAM) return;                          // a phone: the file input opens
+  ev.preventDefault();
+  const label = $("shootLabel");
+  if (label.classList.contains("busy") || label.classList.contains("off")) return;
+  label.textContent = "Capturing\u2026";
+  label.classList.add("busy");
+  if (!$("cam").videoWidth) {
+    show({verdict: "FAILED", detail: "The webcam has not sent a picture yet. Wait for the preview."});
+    return;
+  }
+  let file;
+  try { file = await grab(action === "intrinsics" ? 1 : FRAMES); }
+  finally { label.classList.remove("busy"); label.textContent = SHOOT(); }
+  await useShot(file);
+});
+
+// Hands-free lens views: one each time the board has been moved and then held
+// still, judged on a small thumbnail of the live picture. A board held still
+// twice would be one view twice; the computer turns such repeats away too.
+const STILL = 2.5, MOVED = 6;
+function thumb(g) {
+  g.drawImage($("cam"), 0, 0, 64, 36);
+  const d = g.getImageData(0, 0, 64, 36).data, out = new Float32Array(64 * 36);
+  for (let i = 0, j = 0; i < d.length; i += 4, j++) out[j] = 0.3 * d[i] + 0.59 * d[i + 1] + 0.11 * d[i + 2];
+  return out;
+}
+const apart = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]); return s / a.length; };
+function stopAuto() {
+  if (AUTO) clearInterval(AUTO);
+  AUTO = null;
+}
+$("camauto").onclick = () => {
+  if (AUTO) { stopAuto(); paintCam(); return; }
+  const cv = document.createElement("canvas");
+  cv.width = 64; cv.height = 36;
+  const g = cv.getContext("2d", {willReadFrequently: true});
+  g.imageSmoothingQuality = "high";
+  let prev = null, shot = null, still = 0, busy = false, seen = false;
+  AUTO = setInterval(async () => {
+    if (busy || !CAM || action !== "intrinsics" || !$("cam").videoWidth) return;
+    const now = thumb(g);
+    still = prev && apart(now, prev) < STILL ? still + 1 : 0;
+    prev = now;
+    if (still < 3 || (shot && apart(now, shot) < MOVED)) return;
+    busy = true; shot = now;
+    try { await useShot(await grab(1)); } catch (e) { lost(e); }
+    busy = false;
+    // Solved: the computer has cleared the views it solved from.
+    if (STATUS && STATUS.intrinsic_views) seen = true;
+    if (seen && STATUS && !STATUS.intrinsic_views && STATUS.has_intrinsics) { stopAuto(); paintCam(); }
+  }, 200);
+  paintCam();
 };
 
 // The phone only uploads; the computer running layoutval does the work. When a
@@ -2341,6 +2556,10 @@ const esc = s => String(s).replace(/[<>&"]/g, c =>
 paintSteps();
 refresh();
 setInterval(refresh, 5000);
+if (WANT_CAM && CAN_CAM) startCam(savedCam());
+else if (WANT_CAM) show({verdict: "FAILED", detail: "A browser only lends a page the webcam at a " +
+  "localhost address. Open http://localhost:" + (location.port || "80") + location.pathname +
+  location.search + " on this computer."});
 </script>
 </body>
 </html>

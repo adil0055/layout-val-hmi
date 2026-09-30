@@ -313,6 +313,9 @@ def test_a_lens_that_does_not_generalise_is_not_adopted(tmp_path, monkeypatch):
     from layoutval.calibration import CharucoSpec
 
     monkeypatch.setattr("layoutval.server.INTRINSIC_VIEWS_MAX", 15)
+    # Views this alike are also turned away one by one as repeats; that rule
+    # has its own test, and this one is about the set as a whole.
+    monkeypatch.setattr("layoutval.server.SAME_VIEW", 0.0)
 
     display, panel, rig = rig_for()
     spec = CharucoSpec(panel.squares[0], panel.squares[1], panel.square_length,
@@ -332,6 +335,49 @@ def test_a_lens_that_does_not_generalise_is_not_adopted(tmp_path, monkeypatch):
     assert not (tmp_path / "intrinsics.json").exists()
     # The work is not thrown away.
     assert session.status()["intrinsic_views"] == 15
+
+
+def test_the_same_lens_view_twice_is_counted_once(tmp_path):
+    """A board held still through two hands-free webcam captures is one view."""
+    from layoutval.calibration import CharucoSpec
+
+    display, panel, rig = rig_for()
+    spec = CharucoSpec(panel.squares[0], panel.squares[1], panel.square_length,
+                       panel.square_length * panel.marker_ratio)
+    session = CaptureSession(tmp_path, display_size=display.size,
+                             aperture=True, lens_board=spec)
+    _, _, shot_rig = rig_for(tilt_deg=2.0, roll_deg=0.7, seed=0, sampling_ratio=0.95)
+    shot_rig.show("main")
+    frame = jpeg(shot_rig.read())
+    assert session.handle("intrinsics", frame).verdict == "OK"
+    again = session.handle("intrinsics", frame)
+    assert again.verdict == "FAILED" and "same as view 1" in again.detail
+    assert session.status()["intrinsic_views"] == 1
+    # Tilted, it is a new view.
+    _, _, tilted = rig_for(tilt_deg=9.0, roll_deg=-4.0, seed=1, sampling_ratio=0.95)
+    tilted.show("main")
+    assert session.handle("intrinsics", jpeg(tilted.read())).verdict == "OK"
+    assert session.status()["intrinsic_views"] == 2
+
+
+def test_a_lens_solved_for_another_camera_is_not_applied(tmp_path):
+    """Intrinsics are in one camera's pixels: a frame of another size is refused."""
+    from layoutval.calibration import Calibration, DisplayGeometry, Intrinsics
+
+    display, panel, rig = rig_for()
+    rig.show("main")
+    frame = rig.read()
+    h, w = frame.shape[:2]
+    other = Intrinsics(K=np.array([[1000.0, 0, 640], [0, 1000.0, 360], [0, 0, 1]]),
+                       dist=np.zeros(5), image_size=(1280, 720))
+    session = CaptureSession(
+        tmp_path, display_size=display.size, mark_corners=True,
+        calibration=Calibration(intrinsics=other, geometry=DisplayGeometry(
+            H=np.eye(3), method="unsolved", display_size=display.size)))
+    rec = session.handle("propose", jpeg(frame))
+    assert rec.verdict == "FAILED"
+    assert f"{w}x{h}" in rec.detail and "1280x720" in rec.detail
+    assert "Intrinsics" in rec.detail
 
 
 def _windowed(display, outer_scale, bezel=70):
