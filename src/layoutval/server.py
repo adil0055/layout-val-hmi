@@ -1922,6 +1922,8 @@ class CaptureSession:
                     H = H @ fix.G
                     step = {"used": fix.used, "inliers": fix.inliers,
                             "largest_px": round(fix.largest_px, 2)}
+                    if fix.grouped:
+                        step["moved_together"] = fix.grouped
                 fresh = RunReport(screen=self.profile.screen, theme=self.profile.theme)
                 fresh.flags = list(flags)
                 fresh.metadata = dict(report.metadata)

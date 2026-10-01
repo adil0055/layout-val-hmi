@@ -260,6 +260,59 @@ def test_the_elements_give_the_pose_error_and_leave_a_real_fault_out_of_it():
     assert np.linalg.norm(np.delete(left - points, 7, axis=0), axis=1).max() < 0.2
 
 
+def _two_dials(width=1920, height=1200):
+    """Element centres laid out like a cluster: a dial each side, a column of
+    text between them, a few status items along the top. True for the left dial."""
+    points, left = [], []
+    for cx, is_left in ((0.2 * width, True), (0.8 * width, False)):
+        for a in np.linspace(0.75 * np.pi, 2.25 * np.pi, 26):     # ticks and numbers
+            for r in (0.13 * width, 0.105 * width):
+                points.append((cx + r * np.cos(a), 0.55 * height - r * np.sin(a)))
+                left.append(is_left)
+        for dx, dy in ((0, 0), (0, 40), (-30, 90), (30, 90)):
+            points.append((cx + dx, 0.55 * height + dy))
+            left.append(is_left)
+    for y in np.linspace(0.35, 0.8, 9):
+        for x in (0.42, 0.55):
+            points.append((x * width, y * height))
+            left.append(False)
+    for x in (0.47, 0.5, 0.53, 0.97, 0.985):
+        points.append((x * width, 0.03 * height))
+        left.append(False)
+    return np.array(points), np.array(left)
+
+
+@pytest.mark.parametrize("seed", range(4))
+@pytest.mark.parametrize("move", [(4.0, 0.0), (0.0, 4.0), (-3.0, 3.0)])
+def test_a_dial_that_moved_as_a_whole_is_left_out_whole(move, seed):
+    """The whole left dial drawn a few pixels off, nothing else.
+
+    Nothing but the dial pins that side of the screen, so a homography can bend
+    to follow it; counting inliers preferred that, because it explains more
+    elements. Then half the dial or none of it failed, and elements elsewhere
+    failed instead -- on this layout 0-21 of the dial's 56 elements, and 2-33 of
+    the 79 that had not moved.
+    """
+    rng = np.random.default_rng(seed)
+    points, dial = _two_dials()
+    error = np.array([[1.002, 0.003, 1.5], [-0.002, 0.998, -0.8], [2e-6, -1e-6, 1.0]])
+    found = cv2.perspectiveTransform(points.reshape(-1, 1, 2), error).reshape(-1, 2)
+    noise = rng.normal(0, 0.25, points.shape)
+    shifts = found - points + noise
+    shifts[dial] += move
+    specs, report = _report_with(points, shifts)
+    fix = anchor.element_correction(report, specs)
+    assert fix is not None and fix.grouped == dial.sum()
+    seen = points + shifts
+    left = cv2.perspectiveTransform(seen.reshape(-1, 1, 2), np.linalg.inv(fix.G)).reshape(-1, 2)
+    # Every element of the dial shows the move and every other none, give or
+    # take its own measurement noise and what that noise leaves in a pose fitted
+    # to 135 elements (0.13-0.40 px here).
+    error = left - points - noise
+    assert np.linalg.norm(error[dial] - move, axis=1).max() < 0.5
+    assert np.linalg.norm(error[~dial], axis=1).max() < 0.5
+
+
 def test_too_few_elements_are_not_anchored_on():
     specs, report = _report_with([(100, 100), (500, 120), (300, 400)], [(1, 0)] * 3)
     assert anchor.element_correction(report, specs) is None

@@ -296,6 +296,23 @@ turned 4 degrees, moved 4 cm sideways, or closer and tilted, a good screen
 passes (worst 0.2-0.4 px) and a 2 px move of one text block reads 1.97-2.14 px,
 on that block alone.
 
+**A group that moved together is left out whole.** A homography can bend: at
+one side of the screen, where only a gauge pins it, it can follow part of a
+gauge that was drawn a few pixels off, and leave the rest of the gauge as the
+only failures. Counting inliers prefers that, because the bent mapping explains
+*more* elements than the right one. On the user's bench the right half of the
+moved left dial failed and its left half passed; on two bench photographs with
+the left dial moved 3-4 px, 66% of its elements were flagged and 86 elements
+elsewhere were flagged instead, some with the camera not moved at all. So each
+candidate mapping is scored by what it explains plus the largest set of the
+remaining elements that share one displacement of at least 2 px: under the
+right mapping the moved gauge is one such set, all of it; under a bent one its
+displacements differ element to element. The winner is refitted with that set
+taken as one rigid block with its own shift, so its shape helps pin the side
+of the screen nothing else does. On a two-dial layout with the left dial moved,
+the old fit flagged 0-21 of its 56 elements and 2-33 of the other 79; this one
+flags all 56 and none of the 79, the move recovered to within 0.4 px.
+
 `--edges` (`edgecheck.py`) measures what the re-solve cannot: the drawing
 against the display's edges. The edges are proposed in the reference; at
 Validate each is carried into the test photo through the solved pose and a
