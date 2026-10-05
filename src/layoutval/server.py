@@ -64,7 +64,8 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
-from layoutval.anchor import can_anchor, element_correction, far_correction
+from layoutval.anchor import (ROUGH_PX, can_anchor, element_correction, far_correction,
+                              far_votes, rough_correction)
 from layoutval.autoprofile import profile_from_reference
 from layoutval import edgecheck, glare
 from layoutval.blur import match_shake
@@ -90,6 +91,7 @@ from layoutval.calibration import (
     homography_from_screen_content,
     board_points_for_intrinsics,
     feature_homography,
+    feature_homographies,
     hmi_board,
     solve_intrinsics,
 )
@@ -98,6 +100,7 @@ from layoutval.profile import LayoutProfile
 from layoutval.report import annotate
 from layoutval.residual import set_aside_beyond, set_aside_displaced
 from layoutval.types import RunReport, Verdict, resolve_value
+from layoutval.viewpoint import allow_for_view, default_camera_matrix, recheck_from_afar
 
 #: Biggest upload accepted.  A phone photograph is a few megabytes; anything an
 #: order of magnitude past that is not a photograph.
@@ -142,6 +145,9 @@ FRAME_AREAS = ("top-left", "top", "top-right", "left", "centre", "right",
 LATER_ROUND_PX = 1.0
 """Largest correction, display px, a second or third round of element votes may
 make: the first brings the pose close, and later ones only refine it."""
+
+ROUGH_ROUNDS = 4
+"""Most times a rough pose is re-voted on as it settles (see ``_rough_pose``)."""
 
 #: Past this many views the lens is solved with whatever coverage there is.
 INTRINSIC_VIEWS_MAX = 30
@@ -488,6 +494,8 @@ class CaptureSession:
             self.set_mode(calib_mode)
         self.reference: np.ndarray | None = None
         self.reference_camera: np.ndarray | None = None
+        self._outline: tuple[np.ndarray | None, np.ndarray | None] = (None, None)
+        self._lens_K: tuple[Any, np.ndarray | None] = (None, None)
         self.reference_edges: np.ndarray | None = None
         self.screen_mask: np.ndarray | None = None
         self.history: list[CaptureRecord] = []
@@ -1586,16 +1594,110 @@ class CaptureSession:
 
     def _far_correction(self, undistorted: np.ndarray, H: np.ndarray, prior=None):
         """The pose correction every element votes on (anchor.far_correction)."""
-        live = self.calibration.geometry.rectify(undistorted, H)
-        ref = self.reference
-        if self.deglare and live.ndim == 3 and live.shape == ref.shape:
-            pair = glare.deglare_pair(ref, live, bright=self.glare_bright)
-            ref, live = pair.reference, pair.live
+        ref, live = self._vote_frames(undistorted, H)
         # Where the screen was when it was taught, relative to this pose: a
         # mounted webcam's screen has not moved, and of two explanations that
         # fit as well, the one that leaves it there is taken.
         home = np.linalg.inv(self.calibration.geometry.H) @ H
         return far_correction(ref, live, self.profile, self.values, prior, home)
+
+    def _camera_matrix(self, shape: tuple[int, ...]) -> np.ndarray:
+        """The undistorted frame's camera matrix: the lens solve's, or a typical one."""
+        if self.calibration and self.calibration.intrinsics:
+            lens = self.calibration.intrinsics
+            if self._lens_K[0] is not lens:
+                self._lens_K = (lens, Undistorter(lens).new_K)
+            return self._lens_K[1]
+        return default_camera_matrix(shape)
+
+    def _vote_frames(self, undistorted: np.ndarray, H: np.ndarray):
+        """Reference and live in display space under ``H``, reflections taken out."""
+        live = self.calibration.geometry.rectify(undistorted, H)
+        ref = self.reference
+        if self.deglare and live.ndim == 3 and live.shape == ref.shape:
+            pair = glare.deglare_pair(ref, live, bright=self.glare_bright)
+            ref, live = pair.reference, pair.live
+        return ref, live
+
+    def _rough_pose(self, undistorted: np.ndarray, H: np.ndarray) -> np.ndarray | None:
+        """A first pose the elements could not correct, replaced by one they agree with.
+
+        Matched features and ECC give the first pose, and from a steep view
+        they can miss the screen altogether: on photographs of a laptop's
+        cluster taken from well above it and from its left, too few features
+        matched to offer a start, ECC began from nowhere and settled on the
+        keyboard, and every element failed; on a blurred one the start was
+        right but 8-30 px out, each element's match was then 1-2.5 px loose,
+        and no mapping explained them to 1 px. Then several starts are tried --
+        the first pose, the homographies fewer matched features offer
+        (calibration.feature_homographies, at two sizes), and the screen's outline found the
+        same way in both photographs -- each is brought closer by the rough
+        mapping most elements agree with (anchor.rough_correction), voted on
+        again until it settles, and the one most elements agree with to
+        1.5 px is kept. The votes are what decide, so a start that is wrong
+        is outvoted rather than trusted. None when no start gathers a majority.
+        """
+        R = self.calibration.geometry.H
+        starts = [H]
+        h0, w0 = undistorted.shape[:2]
+        if self.reference_camera is not None and self.reference_camera.shape == undistorted.shape:
+            # At two sizes: a close-up against a view from the side matched
+            # too few features on the 1000 px copy and enough on a larger one.
+            for side in (COARSE_SIDE, TRACK_SIDE):
+                scale = min(1.0, side / max(h0, w0))
+                size = (round(w0 * scale), round(h0 * scale))
+                scale = size[0] / w0
+                ref_view = cv2.resize(self.reference_camera, size, interpolation=cv2.INTER_AREA)
+                live_view = cv2.resize(undistorted, size, interpolation=cv2.INTER_AREA)
+                _, on_screen = self._pose_masks(undistorted.shape, size, scale)
+                c = 0.5 * (scale - 1.0)        # pixel centres, as DriftEstimate.rescaled
+                S = np.array([[scale, 0.0, c], [0.0, scale, c], [0.0, 0.0, 1.0]])
+                for W in feature_homographies(ref_view, live_view, mask=on_screen):
+                    starts.append(np.linalg.inv(S) @ W @ S @ R)
+            outline = self._reference_outline()
+            if outline is not None:
+                cw, ch = self.corner_display_size
+                found = propose_display_corners(
+                    undistorted, aspect=cw / ch if self.size_set else None)
+                if found is not None:
+                    W = cv2.getPerspectiveTransform(
+                        outline.astype(np.float32),
+                        np.asarray(found.corners, np.float32).reshape(4, 2))
+                    starts.append(W @ R)
+        best, best_score = None, 0
+        for start in starts:
+            got = self._settle(undistorted, start)
+            if got is not None and got[1] > best_score:
+                best, best_score = got
+        return best
+
+    def _settle(self, undistorted: np.ndarray, H: np.ndarray):
+        """``H`` brought to where the elements' rough mapping settles: (H, agreeing to 1.5 px)."""
+        settled = None
+        for _ in range(ROUGH_ROUNDS):
+            ref, live = self._vote_frames(undistorted, H)
+            src, dst, _ = far_votes(ref, live, self.profile, self.values)
+            fit = rough_correction(src, dst)
+            if fit is None:
+                break
+            G = fit[0]
+            moved = cv2.perspectiveTransform(src.reshape(-1, 1, 2), G).reshape(-1, 2)
+            close = int((np.linalg.norm(moved - dst, axis=1) < 1.5).sum())
+            H = H @ G
+            settled = (H, close)
+            if float(np.linalg.norm(moved - src, axis=1).max()) < 0.5:
+                break
+        return settled
+
+    def _reference_outline(self) -> np.ndarray | None:
+        """The screen's corners in the reference photograph, found by shape (cached)."""
+        ref = self.reference_camera
+        if self._outline[0] is not ref:
+            cw, ch = self.corner_display_size
+            found = propose_display_corners(ref, aspect=cw / ch if self.size_set else None)
+            self._outline = (ref, None if found is None
+                             else np.asarray(found.corners, np.float64).reshape(4, 2))
+        return self._outline[1]
 
     def _measure_at(self, undistorted: np.ndarray, shape: tuple[int, ...],
                     H: np.ndarray, report: RunReport) -> tuple[RunReport, np.ndarray]:
@@ -1665,6 +1767,10 @@ class CaptureSession:
             # display, and a verdict is about the display. What was subtracted
             # is kept in the saved report as a note.
             glare.set_aside_residual(report, pair.footprint, ref_m, live_m)
+        if self.reference_camera is not None and not self.fixed_camera:
+            recheck_from_afar(report, self.profile, self.values, ref_m, live_m,
+                              self.calibration.geometry.H, H, self._camera_matrix(shape),
+                              self.calibration.geometry.display_size)
         set_aside_displaced(report, ref_m, live_m,
                             reach=round(0.04 * max(self.reference.shape[:2])))
         set_aside_beyond(report, ref_m, self._drawn_area(ref_m.shape))
@@ -1918,8 +2024,24 @@ class CaptureSession:
             # then the rest are too far off to be measured and have no say. The
             # votes are taken again under each correction until it settles.
             prior = None
+            rough = False
             for _ in range(3):
                 fix = self._far_correction(undistorted, H, prior)
+                if fix is None and prior is None and not rough:
+                    rough = True
+                    better = self._rough_pose(undistorted, H)
+                    if better is not None:
+                        H = better
+                        report.metadata.setdefault("pose_steps", []).append({"rough": True})
+                        fix = self._far_correction(undistorted, H, prior)
+                        if fix is None or fix.largest_px > ROUGH_PX:
+                            # Most elements agree with the rough pose to
+                            # ROUGH_PX; a fit that moves it further has lost
+                            # its way among loose votes -- on a blurred photo
+                            # with the speed band moved, 7 px, 17 unmoved
+                            # elements failing. The rough pose stands, rather
+                            # than the screen-wide ECC that missed to begin with.
+                            voted, fix = True, None
                 if fix is None:
                     break
                 voted = True
@@ -1972,6 +2094,13 @@ class CaptureSession:
                 fresh.metadata = dict(report.metadata)
                 fresh.metadata.setdefault("pose_steps", []).append(step)
                 report, live = self._measure_at(undistorted, frame.shape, H, fresh)
+        if hand_held:
+            # A screen a millimetre out of flat, seen from far round, shifts
+            # by more than a homography can follow. See layoutval.viewpoint.
+            allow_for_view(report, self.profile, self.values,
+                           self.calibration.geometry.H, H, self._camera_matrix(undistorted.shape),
+                           self.calibration.geometry.display_size,
+                           tol_fail=self.profile.defaults.tol_fail)
         self._store(f"{base}-rectified.png", live)
 
         if self.edge_check and hand_held:

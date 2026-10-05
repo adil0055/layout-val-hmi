@@ -390,6 +390,51 @@ things were behind it:
   went from 28 of 30 to none at 0.2 px of vote noise, 10 to 1 at 0.5 px; at
   0.7 px, 17 to 13 -- the measurement there is too coarse to tell.
 
+**A first pose that missed the screen.** Six phone photographs of a laptop's
+cluster, nothing on it changed, from in front, well above, below and either
+side. From well above and from the left, matched features offered no start
+(15-21 agreed on the right homography; 25 were asked for), ECC began from
+nowhere and settled on the keyboard, and every element failed. A blurred one
+started 8-30 px out; each element then matched 1-2.5 px loose and no mapping
+explained them to 1 px. So when the first round of votes finds no mapping,
+several starts are tried: the first pose, the homographies fewer matched
+features offer -- on 1000 and 2000 px copies, since a close-up against a view
+from the side matched enough only on the larger -- the same on
+contrast-equalised (CLAHE) copies -- which found the
+screen seen from the left where the plain match put a corner 130 px off -- and
+the screen's outline found by shape in both photographs. Each is brought closer
+by the homography most elements agree with to 3 px (`anchor.rough_correction`),
+voted on again until it settles, and the one most agree with to 1.5 px is kept;
+the usual fit then decides what moved. A start that is wrong is outvoted, not
+trusted. A first fit after that which moves the pose more than 3 px has lost
+its way among loose votes and is not taken. Failing elements on those three
+photographs: 32 of 32, 34 of 35 and 13 of 14 measured, to none of 35 --
+REVIEW, since from that far round the run cannot be judged at 2.5 px (below).
+
+**A screen not quite flat** (`viewpoint.py`). With the pose right -- from the
+screen's corners, fitted to every element -- the middle of the laptop's screen
+was still 3-3.5 px out against its sides, in four of five pairs along the way
+the camera had moved:
+3.5 px left with the camera moved left, 3 px down with it moved down. That is
+parallax off a lid about a millimetre out of flat, and no homography removes
+it. So each camera's position over the screen is recovered from its pose and a
+focal length (the lens solve's, or 0.6 of the frame diagonal: a phone's main
+camera, a laptop webcam), and at each element the shift a screen 0.4% of its
+width out of flat would show is worked out, with its direction. A position
+failure that is no more than that, along it, is REVIEW with the reason
+`position_view_angle`; across it, or by more, it fails as before, and nothing
+is passed this way. Labels seen from that far round were also compared
+softened (1.5 px blur): one photograph showed thin strokes on a hazy screen,
+the other the same strokes bold and edged by the phone's sharpening, scoring
+0.69-0.77 for the same "50". Softened, 16 of 24 matched, while of 399 pairs of
+different elements only one more reached 0.80 (from 0.78). When the
+unevenness at the screen's centre is more than the failure tolerance, the run
+is REVIEW and says how close to come: on that laptop, 13-14 degrees round
+(2.0-2.1 px) a 4 px move of the speed band was found whole; 25 degrees round
+(3.5-3.8 px) it was found as REVIEW at best, and once not at all. Below 1 px of
+allowance -- a camera that stayed put, or moved a little -- none of this
+applies.
+
 The page also fixes the webcam's exposure, white balance and focus once it
 has settled (2.5 s after it starts), where the browser and camera allow it --
 Chrome does, on most USB webcams -- and says which it locked, or that it could
@@ -901,6 +946,7 @@ src/layoutval/
 ├── displayfind.py    proposes the display's corners from an ordinary photograph
 ├── edgecheck.py      --edges: the whole layout against the display's own edges
 ├── anchor.py         the hand-held pose, finished on the elements themselves
+├── viewpoint.py      how far round the camera went, and what that alone can shift
 ├── glare.py          reflections off the glass, subtracted
 ├── blur.py           camera shake, matched between the two photos
 ├── measure.py        stage 4: estimators, per-kind measurement, guards

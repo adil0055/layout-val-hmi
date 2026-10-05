@@ -132,6 +132,10 @@ VOTE_MARGIN_PX = 32.0
 VOTE_MIN_ZNCC = 0.5
 """A match weaker than this is not a vote."""
 
+ROUGH_PX = 3.0
+"""How closely, display px, the elements must agree with a rough pose
+(:func:`rough_correction`)."""
+
 #: Kinds whose measurement is a plain shift. A needle turns and a bar fills.
 SHIFTING = {ElementKind.ICON, ElementKind.TEXT, ElementKind.TELLTALE, ElementKind.REGION}
 
@@ -203,6 +207,15 @@ def far_correction(reference: np.ndarray, live: np.ndarray, profile,
     went from 99.1% to 94.9% right; so elements may still change sides as the
     fit settles.
     """
+    src, dst, ids = far_votes(reference, live, profile, values)
+    return _correction(src, dst, ids, prior, home)
+
+
+def far_votes(reference: np.ndarray, live: np.ndarray, profile, values=None):
+    """Where each element that shifts was found, looked for up to VOTE_MARGIN_PX.
+
+    (where it belongs, where it was found, ids): centres in display px.
+    """
     from layoutval.measure import crop, is_degenerate, subpixel_crop, zncc_match
 
     src, dst, ids = [], [], []
@@ -226,8 +239,33 @@ def far_correction(reference: np.ndarray, live: np.ndarray, profile,
         src.append((x + w / 2, y + h / 2))
         dst.append((sx + px + w / 2, sy + py + h / 2))
         ids.append(spec.id)
-    return _correction(np.float64(src).reshape(-1, 2), np.float64(dst).reshape(-1, 2),
-                       ids, prior, home)
+    return np.float64(src).reshape(-1, 2), np.float64(dst).reshape(-1, 2), ids
+
+
+def rough_correction(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, int] | None:
+    """A first pose too far out for :func:`far_correction`, brought closer: (G, agreeing).
+
+    One homography that most of the elements agree with to ROUGH_PX, refitted to
+    those. Not a measurement: it only brings each element near enough to be
+    matched precisely, and far_correction decides afterwards what moved. None
+    when no majority agrees.
+    """
+    n = len(src)
+    if n < MIN_AFFINE:
+        return None
+    G, mask = cv2.findHomography(src.reshape(-1, 1, 2), dst.reshape(-1, 1, 2),
+                                 cv2.RANSAC, ROUGH_PX, maxIters=4000, confidence=0.999)
+    if G is None or mask is None:
+        return None
+    keep = mask.ravel() > 0
+    if keep.sum() < max(MIN_AFFINE, 0.5 * n):
+        return None
+    refit, _ = cv2.findHomography(src[keep].reshape(-1, 1, 2), dst[keep].reshape(-1, 1, 2), 0)
+    if refit is not None:
+        G = refit
+    G = G / G[2, 2]
+    off = np.linalg.norm(_project(G[None], src)[0] - dst, axis=1)
+    return G, int((off < ROUGH_PX).sum())
 
 
 def _correction(src_a: np.ndarray, dst_a: np.ndarray, ids: list[str],

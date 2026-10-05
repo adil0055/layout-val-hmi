@@ -314,6 +314,26 @@ reported. A haze of room light on the glass pulled the screen-wide pose far
 enough that a good screen failed with the phone moved; finished on the
 elements, it passes, for any cluster with 8 or more elements.
 
+**How far round the camera may go.** From a steep view — well above the screen,
+or from its side — matched features can miss the screen altogether, and a
+blurred photo starts the pose 8–30 px out. Then several starts are tried (fewer
+matched features, the same on contrast-equalised copies, the screen's own
+outline) and the one most elements agree with is kept, brought close on their
+rough agreement before the usual fit. On six phone photos of a laptop's
+cluster, the steep ones went from every element failing to none. No screen is
+quite flat, though: a laptop's lid is out by a millimetre or so, and seen from
+far round that alone moves the middle of the screen 3–3.5 px against its sides,
+mostly along the way the camera moved. An element off by no more than the
+view's move explains, in that direction, is REVIEW, not FAIL, and the report
+says how many degrees round the photo was taken. Labels seen from far round are
+also compared softened (blurred 1.5 px), since one photo shows them thin and
+the other bold and sharpened. Up to about 15 degrees round, a 4 px move of the
+speed band was still found whole. Past the point where the unevenness exceeds
+the failure tolerance (on that laptop about 20 degrees), a fault that small
+cannot be told from it; the run says so, REVIEW, with how close to the
+reference position to retake. A camera that stays put is judged exactly as
+before.
+
 Differences outside what the cluster draws, where the reference showed trim, a
 lid or the wall behind, no longer make a passing run REVIEW. Something drawn
 where the screen was empty still does.

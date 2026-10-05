@@ -1747,8 +1747,36 @@ def feature_homography(reference: np.ndarray, live: np.ndarray, *,
     homography came from them -- the hinge's corners exact, the top corners
     400 px off -- and the pose was solved from there.
     """
-    sift = cv2.SIFT_create(nfeatures=4000)
+    return _sift_homography(to_gray(reference), to_gray(live), mask, min_inliers)
+
+
+def feature_homographies(reference: np.ndarray, live: np.ndarray, *,
+                         mask: np.ndarray | None = None,
+                         min_inliers: int = 10) -> list[np.ndarray]:
+    """Every reference-to-live homography matched features offer, for a caller to vet.
+
+    :func:`feature_homography` asks for 25 agreeing matches, and a screen seen
+    steeply from above or the side has fewer: its picture is dim and squeezed,
+    and on two such photographs of a laptop's cluster 15-21 agreed -- on the
+    right homography -- and none was offered. So fewer are accepted here, and
+    the same match is also tried on contrast-equalised copies (CLAHE), which
+    found the screen of a lid seen from the left where the plain one put a
+    corner 130 px off. Fewer matches can also agree on a wrong homography, so
+    these are candidates: the caller keeps whichever the elements agree with.
+    """
     a, b = to_gray(reference), to_gray(live)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    found = []
+    for pa, pb in ((a, b), (clahe.apply(a), clahe.apply(b))):
+        H = _sift_homography(pa, pb, mask, min_inliers)
+        if H is not None:
+            found.append(H)
+    return found
+
+
+def _sift_homography(a: np.ndarray, b: np.ndarray, mask: np.ndarray | None,
+                     min_inliers: int) -> np.ndarray | None:
+    sift = cv2.SIFT_create(nfeatures=4000)
     ka, da = sift.detectAndCompute(
         a, None if mask is None else (mask > 0).astype(np.uint8) * 255)
     kb, db = sift.detectAndCompute(b, None)
