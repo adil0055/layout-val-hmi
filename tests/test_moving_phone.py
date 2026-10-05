@@ -349,6 +349,51 @@ def test_every_element_votes_even_when_the_first_pose_followed_the_moved_group()
     assert np.allclose(centre, [628.0, 400.0], atol=0.5)
 
 
+def _small_cluster():
+    """32 element centres on a 1920 x 1200 screen, laid out like a sparse
+    cluster: a speed band of 11 down the left with the speed digits beside it,
+    a band of 8 down the right with the gear letter beside it, a media tile in
+    the middle, a row along the bottom. Returns the centres and what moves."""
+    pts, what = [], []
+    for y in np.linspace(300, 800, 11):
+        pts.append((290 + 20 * ((y // 100) % 2), y)); what.append("band")
+    pts += [(230, 560), (240, 620)]; what += ["digits", "unit"]
+    for y in np.linspace(320, 780, 8):
+        pts.append((1660, y)); what.append("right")
+    pts.append((1750, 560)); what.append("gear")
+    pts += [(960, 500), (960, 600), (940, 640), (1000, 700)]; what += ["media"] * 4
+    pts += [(150, 870), (300, 880), (960, 860), (1620, 880), (1700, 880), (1760, 890)]
+    what += ["bottom"] * 6
+    return np.array(pts, float), np.array(what)
+
+
+def test_a_small_cluster_with_three_things_moved_still_anchors_on_the_rest():
+    """Speed band 4 px, speed digits and gear letter 3 px: 13 of 32 moved.
+
+    That left 19 to fit, one short of the 20 a homography was allowed from,
+    so no correction was made and the pose stayed where ECC put it -- pulled
+    1-2 px towards what moved, so the band came out half green, half red. It
+    worked with the gear letter left alone, because then 20 were left.
+    """
+    rng = np.random.default_rng(3)
+    points, what = _small_cluster()
+    error = np.array([[1.001, 0.002, 1.2], [-0.001, 0.999, -0.6], [1e-6, -5e-7, 1.0]])
+    found = cv2.perspectiveTransform(points.reshape(-1, 1, 2), error).reshape(-1, 2)
+    noise = rng.normal(0, 0.15, points.shape)
+    shifts = found - points + noise
+    move = {"band": (4.0, 0.0), "digits": (3.0, 0.0), "gear": (3.0, 0.0)}
+    for name, d in move.items():
+        shifts[what == name] += d
+    specs, report = _report_with(points, shifts)
+    fix = anchor.element_correction(report, specs)
+    assert fix is not None
+    left = cv2.perspectiveTransform((points + shifts).reshape(-1, 1, 2),
+                                    np.linalg.inv(fix.G)).reshape(-1, 2) - points - noise
+    for name in np.unique(what):
+        expected = np.array(move.get(name, (0.0, 0.0)))
+        assert np.linalg.norm(left[what == name] - expected, axis=1).max() < 0.5, name
+
+
 def test_too_few_elements_are_not_anchored_on():
     specs, report = _report_with([(100, 100), (500, 120), (300, 400)], [(1, 0)] * 3)
     assert anchor.element_correction(report, specs) is None

@@ -54,6 +54,19 @@ VOTE_MARGIN_PX away (:func:`far_correction`), and only then are the elements
 measured as usual. With the first pose locked onto a dial moved 6-12 px, 2 of
 12 runs on two bench photographs had flipped; none do now, all 434 of the dial's
 elements flagged and 36 elsewhere where there had been 165.
+
+**Few elements, several things moved.** A sparse cluster of 32 elements with
+its speed band moved 4 px and the speed digits and gear letter 3 px left 19
+unmoved -- one short of the 20 a homography was allowed from -- so no
+correction was made and the pose stayed where ECC put it, pulled 1-2 px
+towards what moved: half the band passed. With the gear letter left alone, 20
+were left and it worked, which is how moving one element changed the verdict
+on others. Now an affine map, which cannot bend, is fitted when fewer than 20
+are left; more than one group may move, by different amounts; and the
+mapping must be fitted to more elements than any group holds, or a mapping
+lined up on what moved scores as well as the right one. On hazy webcam-size
+frames of a bench cluster cut to 32 elements, with the first pose pulled
+towards three moved things, 35 of 171 unmoved elements were flagged; 4 now.
 """
 
 from __future__ import annotations
@@ -102,8 +115,8 @@ class Correction:
     """Largest correction at any element used, display px."""
     grouped: int = 0
     """Elements left out of the mapping because they moved together, as a group."""
-    split: tuple[frozenset, frozenset] | None = None
-    """(ids the mapping was fitted to, ids that moved together), for refining it
+    split: dict | None = None
+    """Each element's label (see _explained), for refining the mapping
     without choosing again."""
 
 
@@ -178,40 +191,32 @@ def _correction(src_a: np.ndarray, dst_a: np.ndarray, ids: list[str],
     n = len(src_a)
     if n < MIN_AFFINE:
         return None
-    if n >= MIN_HOMOGRAPHY:
-        if split is not None:
-            keep = np.array([i in split[0] for i in ids])
-            group = np.array([i in split[1] for i in ids])
-            found = _refine(src_a, dst_a, keep, group)
-        else:
-            found = _grouped_homography(src_a, dst_a)
-        if found is None:
+    if split is not None:
+        label = np.array([split.get(i, UNEXPLAINED) for i in ids])
+    else:
+        label = _choose(src_a, dst_a)
+        if label is None:
             return None
-        G, keep, group = found
-        inliers, grouped = int(keep.sum()), int(group.sum())
-        if inliers + grouped < max(MIN_AFFINE - 2, 0.6 * n) or inliers < MIN_HOMOGRAPHY:
-            return None                   # no one mapping explains most of them
-        moved = cv2.perspectiveTransform(src_a.reshape(-1, 1, 2), G).reshape(-1, 2) - src_a
-        named = np.array(ids, dtype=object)
-        return Correction(G=G, used=n, inliers=inliers, grouped=grouped,
-                          largest_px=float(np.linalg.norm(moved, axis=1).max()),
-                          split=(frozenset(named[keep]), frozenset(named[group])))
-    A, mask = cv2.estimateAffine2D(src_a, dst_a, method=cv2.RANSAC,
-                                   ransacReprojThreshold=INLIER_PX,
-                                   maxIters=5000, confidence=0.999)
-    G = None if A is None else np.vstack([A, [0.0, 0.0, 1.0]])
-    if G is not None and mask is not None and mask.sum() >= 3:
-        keep = mask.ravel() > 0
-        A, _ = cv2.estimateAffine2D(src_a[keep], dst_a[keep], method=cv2.LMEDS)
-        G = None if A is None else np.vstack([A, [0.0, 0.0, 1.0]])
-    if G is None or mask is None:
+    # A homography from enough elements; from fewer, an affine map, which
+    # cannot bend. A small inventory with a group moved -- 32 elements, 13 of
+    # them moved -- left 19 to fit, one short of a homography; giving up there
+    # handed the pose back to ECC, which the moved elements had pulled 1-2 px.
+    model = "h" if (label == POSE).sum() >= MIN_HOMOGRAPHY else "a"
+    found = _refine(src_a, dst_a, label, model)
+    if found is None:
         return None
-    inliers = int(mask.sum())
-    if inliers < max(MIN_AFFINE - 2, 0.6 * n):
+    G, label = found
+    inliers, grouped = int((label == POSE).sum()), int((label > POSE).sum())
+    if inliers + grouped < max(MIN_AFFINE - 2, 0.6 * n) or inliers < MIN_AFFINE - 2:
         return None                       # no one mapping explains most of them
     moved = cv2.perspectiveTransform(src_a.reshape(-1, 1, 2), G).reshape(-1, 2) - src_a
-    return Correction(G=G, used=n, inliers=inliers,
-                      largest_px=float(np.linalg.norm(moved, axis=1).max()))
+    return Correction(G=G, used=n, inliers=inliers, grouped=grouped,
+                      largest_px=float(np.linalg.norm(moved, axis=1).max()),
+                      split=dict(zip(ids, label.tolist())))
+
+
+UNEXPLAINED, POSE = -1, 0
+"""Labels: neither in the mapping nor in a group; in the mapping. A group is 1, 2, ..."""
 
 
 def _project(Hs: np.ndarray, pts: np.ndarray) -> np.ndarray:
@@ -221,82 +226,128 @@ def _project(Hs: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return q[..., :2] / q[..., 2:3]
 
 
-def _explained(residuals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(inliers, the largest group of the rest that moved together), as masks."""
+def _explained(residuals: np.ndarray) -> np.ndarray:
+    """Each element's label: in the mapping, in a group that moved together, or neither.
+
+    Groups are taken largest first, each the elements whose shifts lie within
+    INLIER_PX of one of them: a fault can move more than one thing, and by
+    different amounts -- a gauge 4 px and a gear letter 3 px.
+    """
     norm = np.linalg.norm(residuals, axis=1)
-    inlier = norm < INLIER_PX
-    group = np.zeros_like(inlier)
-    rest = np.flatnonzero(~inlier & (norm >= GROUP_SHIFT_PX))
-    if len(rest) >= GROUP_MIN:
+    label = np.full(len(residuals), UNEXPLAINED)
+    label[norm < INLIER_PX] = POSE
+    rest = np.flatnonzero((label == UNEXPLAINED) & (norm >= GROUP_SHIFT_PX))
+    group = POSE
+    while len(rest) >= GROUP_MIN:
         r = residuals[rest]
         together = np.linalg.norm(r[:, None] - r[None], axis=2) < INLIER_PX
         centre = int(together.sum(axis=1).argmax())
-        if together[centre].sum() >= GROUP_MIN:
-            group[rest[together[centre]]] = True
-    return inlier, group
+        if together[centre].sum() < GROUP_MIN:
+            break
+        group += 1
+        label[rest[together[centre]]] = group
+        rest = rest[~together[centre]]
+    return label
 
 
-def _grouped_homography(src: np.ndarray, dst: np.ndarray):
-    """RANSAC for the mapping, scored by what it explains including a moved group.
+def _score(label: np.ndarray) -> tuple[int, int] | None:
+    """(explained, in the mapping), or None if a group outnumbers the mapping.
 
-    The winner is refitted on its inliers together with the group, the group
-    taken as one rigid block with a shift of its own: nothing else may pin the
-    side of the screen it is on, and its own shape does. Returns
-    (G, inliers, grouped), or None.
+    The mapping is the camera, and the camera is what most of the screen
+    agrees on. Without that, a mapping lined up on what moved scored as well
+    as the right one -- the moved elements its inliers, the rest one big group
+    -- and with two groups moved by different amounts it scored better.
     """
+    inliers = int((label == POSE).sum())
+    sizes = np.bincount(label[label > POSE]) if (label > POSE).any() else np.zeros(1, int)
+    if sizes.max() > inliers:
+        return None
+    return inliers + int(sizes.sum()), inliers
+
+
+def _choose(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
+    """RANSAC for which elements the mapping is fitted to and which moved together."""
     n = len(src)
+    homography = n >= MIN_HOMOGRAPHY
     rng = np.random.default_rng(0)
-    samples = np.array([rng.choice(n, 4, replace=False) for _ in range(HYPOTHESES)])
+    k = 4 if homography else 3
+    samples = np.array([rng.choice(n, k, replace=False) for _ in range(HYPOTHESES)])
     stack = np.full((HYPOTHESES, 3, 3), np.nan)
-    for k, s in enumerate(samples):
+    for i, s in enumerate(samples):
+        a, b = src[s].astype(np.float32), dst[s].astype(np.float32)
         try:
-            stack[k] = cv2.getPerspectiveTransform(src[s].astype(np.float32),
-                                                   dst[s].astype(np.float32))
+            stack[i] = (cv2.getPerspectiveTransform(a, b) if homography
+                        else np.vstack([cv2.getAffineTransform(a, b), [0.0, 0.0, 1.0]]))
         except cv2.error:
-            pass                          # three of the four in a line
+            pass                          # points in a line
     with np.errstate(all="ignore"):
         residuals = _project(stack, src) - dst[None]
     finite = np.isfinite(residuals).all(axis=(1, 2))
-    counts = (np.linalg.norm(residuals, axis=2) < INLIER_PX).sum(axis=1)
+    norms = np.linalg.norm(np.where(finite[:, None, None], residuals, np.inf), axis=2)
+    counts = (norms < INLIER_PX).sum(axis=1)
+    # The most a hypothesis can explain is its inliers and everything far
+    # enough off to be in a group; tried best first, the rest are skipped once
+    # they cannot win.
+    bound = counts + (np.isfinite(norms) & (norms >= GROUP_SHIFT_PX)).sum(axis=1)
+    order = np.lexsort((-counts, -bound))
     best, best_key = None, (-1, -1)
-    for k in np.flatnonzero(finite & (counts >= 0.3 * n)):
-        inlier, group = _explained(residuals[k])
-        key = (int(inlier.sum() + group.sum()), int(inlier.sum()))
-        if key > best_key:
-            best, best_key = k, key
-    if best is None:
+    for i in order:
+        if not finite[i] or counts[i] < max(3, 0.2 * n):
+            continue
+        if (bound[i], counts[i]) <= best_key:
+            if bound[i] < best_key[0]:
+                break
+            continue
+        key = _score(_explained(residuals[i]))
+        if key is not None and key > best_key:
+            best, best_key = i, key
+    return None if best is None else _explained(residuals[best])
+
+
+def _fit(model: str, src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
+    """Least squares: a homography ("h") or an affine map ("a"), as 3x3."""
+    if model == "h":
+        if len(src) < 4:
+            return None
+        G, _ = cv2.findHomography(src, dst, 0)
+        return G
+    if len(src) < 3:
         return None
-    keep, group = _explained(residuals[best])
-    return _refine(src, dst, keep, group)
+    A = np.concatenate([src, np.ones((len(src), 1))], axis=1)
+    X, *_ = np.linalg.lstsq(A, dst, rcond=None)
+    return np.vstack([X.T, [0.0, 0.0, 1.0]])
 
 
-def _refine(src: np.ndarray, dst: np.ndarray, keep: np.ndarray, group: np.ndarray):
-    """Fit the mapping to ``keep`` with ``group`` as one block with its own shift.
+def _refine(src: np.ndarray, dst: np.ndarray, label: np.ndarray, model: str = "h"):
+    """Fit the mapping to its elements with each group as one block with its own shift.
 
-    Which elements are which is updated as the fit settles. Returns
-    (G, keep, group), or None.
+    A group's shape pins the side of the screen it is on, where nothing else
+    may. Which elements are which is updated as the fit settles. Returns
+    (G, label), or None.
     """
-    if keep.sum() < 4:
-        return None
-    G, _ = cv2.findHomography(src[keep], dst[keep], 0)
+    G = _fit(model, src[label == POSE], dst[label == POSE])
     if G is None:
         return None
-    # residual = mapped - found, so the group's own shift is minus its residual
-    residual = _project(G[None], src)[0] - dst
-    shift = -np.median(residual[group], axis=0) if group.any() else np.zeros(2)
+    # residual = mapped - found, so a group's own shift is minus its residual
+    shifts = {}
     for _ in range(20):
-        G, _ = cv2.findHomography(np.concatenate([src[keep], src[group]]),
-                                  np.concatenate([dst[keep], dst[group] - shift]), 0)
+        residual = _project(G[None], src)[0] - dst
+        new = {g: -np.median(residual[label == g], axis=0)
+               for g in np.unique(label[label > POSE])}
+        fit = label >= POSE
+        moved_dst = dst.copy()
+        for g, s in new.items():
+            moved_dst[label == g] -= s
+        G = _fit(model, src[fit], moved_dst[fit])
         if G is None:
             return None
         residual = _project(G[None], src)[0] - dst
-        now_keep, now_group = _explained(residual)
-        if now_keep.sum() < 4:
+        now = _explained(residual)
+        if (now == POSE).sum() < 3:
             return None
-        now_shift = -np.median(residual[now_group], axis=0) if now_group.any() else np.zeros(2)
-        settled = ((now_keep == keep).all() and (now_group == group).all()
-                   and np.abs(now_shift - shift).max() < 0.01)
-        keep, group, shift = now_keep, now_group, now_shift
+        settled = ((now == label).all() and new.keys() == shifts.keys()
+                   and all(np.abs(new[g] - shifts[g]).max() < 0.01 for g in new))
+        label, shifts = now, new
         if settled:
             break
-    return G, keep, group
+    return G, label

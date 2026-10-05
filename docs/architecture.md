@@ -331,6 +331,20 @@ correction until it settles, each round starting from the last one's choice of
 which elements are the pose and which moved; chosen afresh, a near tie could
 swing a later round back to a bent mapping.
 
+**Few elements, and more than one thing moved.** A sparse cluster -- 32
+elements -- with its speed band moved 4 px and the speed digits and gear letter
+3 px left 19 unmoved, one short of the 20 a homography was allowed from: no
+correction was made, the pose stayed where ECC put it, pulled 1-2 px towards
+what moved, and half the band passed. Left alone, the gear letter left 20 and
+it worked -- which is how moving one element changed the verdict on others.
+Now fewer than 20 get an affine map, which cannot bend; groups may be more than
+one, moved by different amounts, each a rigid block in the fit; and the
+mapping must hold more elements than any group, since the camera is what most
+of the screen agrees on -- without that, a mapping lined up on what moved
+scored as well as the right one. On hazy webcam-size frames of a bench
+cluster cut to 32 elements, the first pose pulled towards three moved things,
+unmoved elements flagged went from 35 of 171 to 4.
+
 `--edges` (`edgecheck.py`) measures what the re-solve cannot: the drawing
 against the display's edges. The edges are proposed in the reference; at
 Validate each is carried into the test photo through the solved pose and a
