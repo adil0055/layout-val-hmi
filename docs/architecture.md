@@ -345,6 +345,28 @@ scored as well as the right one. On hazy webcam-size frames of a bench
 cluster cut to 32 elements, the first pose pulled towards three moved things,
 unmoved elements flagged went from 35 of 171 to 4.
 
+**The same scene twice gives the same answer.** Nothing in the measurement is
+random -- the RANSAC is seeded, SIFT and ECC are deterministic -- so two
+captures differ only by what the camera does between them. Simulated on a
+bench photograph at webcam size, 8-10 captures each with fresh sensor noise
+and compression, exposure wandering 12%, white balance 6%, focus hunting
+between 0.3 and 1.6 px of blur and focus breathing 0.4%: on the full
+inventory an unchanged screen never changed verdict, and a moved gauge
+changed one borderline element. On inventories of 32 it was not so: on one
+of six, one capture in ten lost its way in a later round of element votes --
+a few elements dropped out of the mapping, it fitted the rest worse, more
+dropped out, 21 down to 11 -- and the pose went 11 px off, seven unmoved
+elements failing. So a later round may only refine (at most 1 px), keeps
+the first round's kind of mapping, and each fit returns its best-scoring
+state rather than its last. On those six inventories, the elements that
+changed verdict between captures went from 8 to 1 -- one sitting on the
+1.5 px line beside the moved gauge.
+
+The page also fixes the webcam's exposure, white balance and focus once it
+has settled (2.5 s after it starts), where the browser and camera allow it --
+Chrome does, on most USB webcams -- and says which it locked, or that it could
+not.
+
 `--edges` (`edgecheck.py`) measures what the re-solve cannot: the drawing
 against the display's edges. The edges are proposed in the reference; at
 Validate each is carried into the test photo through the solved pose and a

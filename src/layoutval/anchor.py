@@ -118,6 +118,8 @@ class Correction:
     split: dict | None = None
     """Each element's label (see _explained), for refining the mapping
     without choosing again."""
+    model: str = "h"
+    """"h" for a homography, "a" for an affine map."""
 
 
 def can_anchor(profile) -> bool:
@@ -143,16 +145,16 @@ def element_correction(report: RunReport, profile, values=None) -> Correction | 
 
 
 def far_correction(reference: np.ndarray, live: np.ndarray, profile,
-                   values=None, split=None) -> Correction | None:
+                   values=None, prior: Correction | None = None) -> Correction | None:
     """The mapping, from every element that shifts looked for up to VOTE_MARGIN_PX.
 
     Each is a plain ZNCC match of its patch in the reference, both frames in
     display space under the same first pose. Only a vote: what is reported is
     measured afterwards, as usual, under the corrected pose.
 
-    ``split`` is an earlier correction's -- which elements the mapping was
-    fitted to and which moved together -- and the fit starts from it rather
-    than choosing again from scratch: freshly chosen under each correction, a
+    ``prior`` is the previous round's correction: the fit starts from its
+    split -- which elements the mapping was fitted to and which moved
+    together -- and keeps its kind of mapping, rather than choosing again: freshly chosen under each correction, a
     near tie could swing a later round back to a bent mapping. Held fixed
     instead, it kept the rough first round's mistakes, and unchanged screens
     went from 99.1% to 94.9% right; so elements may still change sides as the
@@ -182,17 +184,17 @@ def far_correction(reference: np.ndarray, live: np.ndarray, profile,
         dst.append((sx + px + w / 2, sy + py + h / 2))
         ids.append(spec.id)
     return _correction(np.float64(src).reshape(-1, 2), np.float64(dst).reshape(-1, 2),
-                       ids, split)
+                       ids, prior)
 
 
 def _correction(src_a: np.ndarray, dst_a: np.ndarray, ids: list[str],
-                split=None) -> Correction | None:
+                prior: Correction | None = None) -> Correction | None:
     """The mapping from where the elements belong to where they were found."""
     n = len(src_a)
     if n < MIN_AFFINE:
         return None
-    if split is not None:
-        label = np.array([split.get(i, UNEXPLAINED) for i in ids])
+    if prior is not None and prior.split is not None:
+        label = np.array([prior.split.get(i, UNEXPLAINED) for i in ids])
     else:
         label = _choose(src_a, dst_a)
         if label is None:
@@ -201,7 +203,8 @@ def _correction(src_a: np.ndarray, dst_a: np.ndarray, ids: list[str],
     # cannot bend. A small inventory with a group moved -- 32 elements, 13 of
     # them moved -- left 19 to fit, one short of a homography; giving up there
     # handed the pose back to ECC, which the moved elements had pulled 1-2 px.
-    model = "h" if (label == POSE).sum() >= MIN_HOMOGRAPHY else "a"
+    model = ("h" if (label == POSE).sum() >= MIN_HOMOGRAPHY else "a") if prior is None \
+        else prior.model
     found = _refine(src_a, dst_a, label, model)
     if found is None:
         return None
@@ -212,7 +215,7 @@ def _correction(src_a: np.ndarray, dst_a: np.ndarray, ids: list[str],
     moved = cv2.perspectiveTransform(src_a.reshape(-1, 1, 2), G).reshape(-1, 2) - src_a
     return Correction(G=G, used=n, inliers=inliers, grouped=grouped,
                       largest_px=float(np.linalg.norm(moved, axis=1).max()),
-                      split=dict(zip(ids, label.tolist())))
+                      split=dict(zip(ids, label.tolist())), model=model)
 
 
 UNEXPLAINED, POSE = -1, 0
@@ -322,12 +325,17 @@ def _refine(src: np.ndarray, dst: np.ndarray, label: np.ndarray, model: str = "h
     """Fit the mapping to its elements with each group as one block with its own shift.
 
     A group's shape pins the side of the screen it is on, where nothing else
-    may. Which elements are which is updated as the fit settles. Returns
-    (G, label), or None.
+    may. Which elements are which is updated as the fit settles, and the
+    best-scoring state is what is returned: with few elements, an update could
+    drop a handful out of the mapping, which then fitted the rest worse and
+    dropped more -- 21 elements in it, then 14, then 11, and the pose 11 px
+    out on one capture of a scene the others got right. Returns (G, label),
+    or None.
     """
     G = _fit(model, src[label == POSE], dst[label == POSE])
     if G is None:
         return None
+    best, best_key = None, None
     # residual = mapped - found, so a group's own shift is minus its residual
     shifts = {}
     for _ in range(20):
@@ -343,11 +351,14 @@ def _refine(src: np.ndarray, dst: np.ndarray, label: np.ndarray, model: str = "h
             return None
         residual = _project(G[None], src)[0] - dst
         now = _explained(residual)
+        key = _score(now)
+        if key is not None and (best_key is None or key > best_key):
+            best, best_key = (G.copy(), now.copy()), key
         if (now == POSE).sum() < 3:
-            return None
+            break
         settled = ((now == label).all() and new.keys() == shifts.keys()
                    and all(np.abs(new[g] - shifts[g]).max() < 0.01 for g in new))
         label, shifts = now, new
         if settled:
             break
-    return G, label
+    return best

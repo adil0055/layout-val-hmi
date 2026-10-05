@@ -36,7 +36,12 @@ preview and a camera picker; the address is printed on every run too, and
 **Use this computer's webcam** on the page switches to it. Aim the webcam at
 the screen under test -- a second monitor, say -- and press **Capture from
 webcam**: each capture is the mean of 8 frames, which takes most of a
-webcam's noise out. The lens step is hands-free: show the ChArUco board on your
+webcam's noise out. Once the webcam has settled, the page fixes its exposure,
+white balance and focus for every capture after (Chrome can on most USB
+webcams; the page says what it locked, or that it could not), so it does not
+re-meter or re-focus between two shots of the same screen. Keep the mouse
+pointer off the screen under test, and anything that changes on its own --
+a clock, a media progress bar -- reads as a change. The lens step is hands-free: show the ChArUco board on your
 phone (or a print), hold it in front of the webcam and turn on **Hands-free lens
 views**; a view is taken each time the board has been moved and then held
 still, and a repeat of an earlier view is not counted. The webcam's lens solve

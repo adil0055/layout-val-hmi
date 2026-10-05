@@ -139,6 +139,10 @@ than how many shots."""
 FRAME_AREAS = ("top-left", "top", "top-right", "left", "centre", "right",
                "bottom-left", "bottom", "bottom-right")
 
+LATER_ROUND_PX = 1.0
+"""Largest correction, display px, a second or third round of element votes may
+make: the first brings the pose close, and later ones only refine it."""
+
 #: Past this many views the lens is solved with whatever coverage there is.
 INTRINSIC_VIEWS_MAX = 30
 
@@ -1580,14 +1584,14 @@ class CaptureSession:
             est = tracker.measure(live_view, init=init)
         return est.rescaled(scale) if scale < 1.0 else est
 
-    def _far_correction(self, undistorted: np.ndarray, H: np.ndarray, split=None):
+    def _far_correction(self, undistorted: np.ndarray, H: np.ndarray, prior=None):
         """The pose correction every element votes on (anchor.far_correction)."""
         live = self.calibration.geometry.rectify(undistorted, H)
         ref = self.reference
         if self.deglare and live.ndim == 3 and live.shape == ref.shape:
             pair = glare.deglare_pair(ref, live, bright=self.glare_bright)
             ref, live = pair.reference, pair.live
-        return far_correction(ref, live, self.profile, self.values, split)
+        return far_correction(ref, live, self.profile, self.values, prior)
 
     def _measure_at(self, undistorted: np.ndarray, shape: tuple[int, ...],
                     H: np.ndarray, report: RunReport) -> tuple[RunReport, np.ndarray]:
@@ -1909,15 +1913,19 @@ class CaptureSession:
             # usual search: the first pose can lock onto a group that moved, and
             # then the rest are too far off to be measured and have no say. The
             # votes are taken again under each correction until it settles.
-            split = None
+            prior = None
             for _ in range(3):
-                fix = self._far_correction(undistorted, H, split)
+                fix = self._far_correction(undistorted, H, prior)
                 if fix is None:
                     break
-                split = fix.split
                 voted = True
-                if fix.largest_px < 0.25:
+                # After the first round the pose is close, and a later round
+                # only refines it. One that wants to move it far has lost its
+                # way -- on few elements, noise can tip which side some fall
+                # on -- and is not taken.
+                if fix.largest_px < 0.25 or (prior is not None and fix.largest_px > LATER_ROUND_PX):
                     break
+                prior = fix
                 H = H @ fix.G
                 step = {"far": True, "used": fix.used, "inliers": fix.inliers,
                         "largest_px": round(fix.largest_px, 2)}
@@ -2137,7 +2145,7 @@ const $ = id => document.getElementById(id);
 // This computer's own webcam, instead of a phone. Browsers only hand a page a
 // camera on a secure origin, which http://localhost is and a LAN address is
 // not -- so on a phone the option never shows.
-let CAM = null, AUTO = null;
+let CAM = null, AUTO = null, LOCKED = null;
 const CAN_CAM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 const WANT_CAM = new URLSearchParams(location.search).get("cam") === "1";
 const SHOOT = () => CAM ? "Capture from webcam" : "Take photo";
@@ -2466,7 +2474,38 @@ async function startCam(id) {
     `<option value="${esc(d.deviceId)}">${esc(d.label || "Camera " + (i + 1))}</option>`).join("");
   $("camsel").value = st.deviceId || "";
   $("camres").textContent = `${st.width || v.videoWidth} \u00d7 ${st.height || v.videoHeight}`;
+  LOCKED = null;
   paintSteps();
+  const stream = CAM;
+  setTimeout(() => lockCam(stream), 2500);
+}
+
+// A webcam left on automatic re-meters, re-balances and re-focuses between
+// captures, so two shots of an unchanged screen differ. Once it has settled,
+// whatever it settled on is fixed for every capture after. Chrome can do
+// this on most USB webcams; a browser that cannot says so.
+async function lockCam(stream) {
+  if (!CAM || CAM !== stream) return;
+  const track = CAM.getVideoTracks()[0];
+  let caps = {}, st = {};
+  try { caps = track.getCapabilities ? track.getCapabilities() : {}; st = track.getSettings(); } catch (e) {}
+  const want = {}, names = [];
+  const can = (mode) => Array.isArray(caps[mode]) && caps[mode].includes("manual");
+  if (can("exposureMode") && st.exposureTime !== undefined) {
+    want.exposureMode = "manual"; want.exposureTime = st.exposureTime; names.push("exposure");
+  }
+  if (can("whiteBalanceMode") && st.colorTemperature !== undefined) {
+    want.whiteBalanceMode = "manual"; want.colorTemperature = st.colorTemperature; names.push("white balance");
+  }
+  if (can("focusMode") && st.focusDistance !== undefined) {
+    want.focusMode = "manual"; want.focusDistance = st.focusDistance; names.push("focus");
+  }
+  LOCKED = "";
+  if (names.length) {
+    try { await track.applyConstraints({advanced: [want]}); LOCKED = names.join(", "); }
+    catch (e) { LOCKED = ""; }
+  }
+  paintCam();
 }
 function stopCam() {
   stopAuto();
@@ -2481,6 +2520,10 @@ function paintCam() {
   $("camauto").style.display = CAM && action === "intrinsics" ? "block" : "none";
   $("camauto").textContent = AUTO ? "Hands-free is on \u2014 tap to stop" : "Hands-free lens views";
   $("camauto").classList.toggle("live", !!AUTO);
+  const res = $("camres").textContent.split(" \u00b7 ")[0];
+  $("camres").textContent = !CAM || LOCKED === null ? res
+    : res + " \u00b7 " + (LOCKED ? LOCKED + " locked"
+                                 : "exposure and focus automatic: this browser or camera cannot lock them");
   paintSize();
 }
 $("camsel").onchange = () => startCam($("camsel").value);
