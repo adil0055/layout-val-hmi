@@ -313,6 +313,24 @@ of the screen nothing else does. On a two-dial layout with the left dial moved,
 the old fit flagged 0-21 of its 56 elements and 2-33 of the other 79; this one
 flags all 56 and none of the 79, the move recovered to within 0.4 px.
 
+**Every element votes.** Which set is the pose and which moved is decided by
+count, so every element has to be counted. Measured as usual, an element is
+looked for 8 px round where the first pose puts it, and the first pose can lock
+onto the moved group: on a webcam shot with the right of the screen hazy, the
+sharp left dial was what the matched features and ECC followed; the rest of the
+screen sat 8 px or more off, came back "missing or displaced" and had no say,
+and the moved dial passed while everything else failed. So before anything is
+measured, every element that shifts is looked for up to 32 px away by a plain
+ZNCC match (`anchor.far_correction`), and the pose is corrected from those
+votes. On a synthetic screen with the rest 12 px off, an 8 px search let 28 of
+60 elements vote and the moved group won; 32 px let all 60 vote. On two bench
+photographs with the first pose forced onto a dial moved 6-12 px, 2 of 12 runs
+had flipped; none do now -- all 434 of the dial's elements flagged, and 36
+elsewhere where there had been 165. The votes are taken again under each
+correction until it settles, each round starting from the last one's choice of
+which elements are the pose and which moved; chosen afresh, a near tie could
+swing a later round back to a bent mapping.
+
 `--edges` (`edgecheck.py`) measures what the re-solve cannot: the drawing
 against the display's edges. The edges are proposed in the reference; at
 Validate each is carried into the test photo through the solved pose and a

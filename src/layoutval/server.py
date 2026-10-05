@@ -64,7 +64,7 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
-from layoutval.anchor import can_anchor, element_correction
+from layoutval.anchor import can_anchor, element_correction, far_correction
 from layoutval.autoprofile import profile_from_reference
 from layoutval import edgecheck, glare
 from layoutval.blur import match_shake
@@ -1580,6 +1580,15 @@ class CaptureSession:
             est = tracker.measure(live_view, init=init)
         return est.rescaled(scale) if scale < 1.0 else est
 
+    def _far_correction(self, undistorted: np.ndarray, H: np.ndarray, split=None):
+        """The pose correction every element votes on (anchor.far_correction)."""
+        live = self.calibration.geometry.rectify(undistorted, H)
+        ref = self.reference
+        if self.deglare and live.ndim == 3 and live.shape == ref.shape:
+            pair = glare.deglare_pair(ref, live, bright=self.glare_bright)
+            ref, live = pair.reference, pair.live
+        return far_correction(ref, live, self.profile, self.values, split)
+
     def _measure_at(self, undistorted: np.ndarray, shape: tuple[int, ...],
                     H: np.ndarray, report: RunReport) -> tuple[RunReport, np.ndarray]:
         """Rectify through ``H`` and measure everything; the report and the frame."""
@@ -1894,9 +1903,31 @@ class CaptureSession:
                     ),
                 )
 
+        voted = False
+        if anchored:
+            # Every element votes on the pose, each looked for well past its
+            # usual search: the first pose can lock onto a group that moved, and
+            # then the rest are too far off to be measured and have no say. The
+            # votes are taken again under each correction until it settles.
+            split = None
+            for _ in range(3):
+                fix = self._far_correction(undistorted, H, split)
+                if fix is None:
+                    break
+                split = fix.split
+                voted = True
+                if fix.largest_px < 0.25:
+                    break
+                H = H @ fix.G
+                step = {"far": True, "used": fix.used, "inliers": fix.inliers,
+                        "largest_px": round(fix.largest_px, 2)}
+                if fix.grouped:
+                    step["moved_together"] = fix.grouped
+                report.metadata.setdefault("pose_steps", []).append(step)
+
         flags = list(report.flags)
         report, live = self._measure_at(undistorted, frame.shape, H, report)
-        if anchored:
+        if anchored and not voted:
             # The last step of a hand-held pose: from the elements themselves,
             # then measured again. See layoutval.anchor.
             fine = False

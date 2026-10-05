@@ -313,6 +313,42 @@ def test_a_dial_that_moved_as_a_whole_is_left_out_whole(move, seed):
     assert np.linalg.norm(error[~dial], axis=1).max() < 0.5
 
 
+def _labels(offsets):
+    """A dark screen of distinct labels, each drawn at its place plus its offset."""
+    img = np.full((SCREEN[1], SCREEN[0], 3), 25, np.uint8)
+    rng = np.random.default_rng(5)
+    specs = []
+    for i in range(60):
+        col, row = i % 10, i // 10
+        text = "".join(rng.choice(list("ABDEFHKMNPRSTUVWXYZ0123456789"), 3))
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+        x, y = 20 + col * 125, 60 + row * 125
+        dx, dy = offsets(x)
+        cv2.putText(img, text, (int(x + dx), int(y + th + dy)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (220, 220, 220), 2, cv2.LINE_AA)
+        box = (x - 4.0, y - 4.0, tw + 8.0, th + 14.0)
+        specs.append(ElementSpec(id=f"l{i}", kind=ElementKind.REGION, bbox=box,
+                                 position=PositionModel(origin=box[:2]), tolerance=Tolerance()))
+    return img, specs
+
+
+def test_every_element_votes_even_when_the_first_pose_followed_the_moved_group():
+    """The first pose locked onto a group that moved -- the sharpest thing on a
+    hazy screen -- so the rest sat 12 px off, past the usual 8 px search, came
+    back missing and had no say; the moved group passed and the rest failed.
+    Looked for far enough, the rest outvote it."""
+    group = lambda x: x < 0.35 * SCREEN[0]
+    reference, specs = _labels(lambda x: (0.0, 0.0))
+    live, _ = _labels(lambda x: (0.0, 0.0) if group(x) else (-12.0, 0.0))
+    fix = anchor.far_correction(reference, live, specs)
+    moved = np.array([group(s.bbox[0]) for s in specs])
+    assert fix is not None
+    assert fix.grouped == moved.sum() and fix.inliers == (~moved).sum()
+    # the mapping is the rest's 12 px, so the group is what shows a move
+    centre = cv2.perspectiveTransform(np.float64([[[640.0, 400.0]]]), fix.G).ravel()
+    assert np.allclose(centre, [628.0, 400.0], atol=0.5)
+
+
 def test_too_few_elements_are_not_anchored_on():
     specs, report = _report_with([(100, 100), (500, 120), (300, 400)], [(1, 0)] * 3)
     assert anchor.element_correction(report, specs) is None

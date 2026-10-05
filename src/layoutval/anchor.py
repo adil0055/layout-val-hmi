@@ -41,6 +41,19 @@ from element to element. Scored that way, 345 of 345 moved-gauge elements were
 flagged, and 20 of 639 elsewhere -- mostly neighbours the planted move touched;
 of a 3 px move of the left third of the layout, 82% of its elements were
 flagged where 41% had been.
+
+**Every element gets a vote.** Which set is the pose and which moved is
+decided by count, so every element has to be in the count. Measured as usual,
+an element is searched for 8 px round where the first pose puts it -- and the
+first pose can lock onto the moved group: on a webcam shot with the right of
+the screen hazy, the sharp left dial was what the matched features and ECC
+followed, the rest of the screen sat 8 px or more off, came back "missing or
+displaced" and had no vote, and the moved dial passed while everything else
+failed. So the first correction is taken from every element looked for up to
+VOTE_MARGIN_PX away (:func:`far_correction`), and only then are the elements
+measured as usual. With the first pose locked onto a dial moved 6-12 px, 2 of
+12 runs on two bench photographs had flipped; none do now, all 434 of the dial's
+elements flagged and 36 elsewhere where there had been 165.
 """
 
 from __future__ import annotations
@@ -68,6 +81,12 @@ so a group stands clear of the mapping's own scatter."""
 HYPOTHESES = 3000
 """Candidate mappings tried, each from four elements chosen at random."""
 
+VOTE_MARGIN_PX = 32.0
+"""How far, display px, each element is looked for when it votes on the pose."""
+
+VOTE_MIN_ZNCC = 0.5
+"""A match weaker than this is not a vote."""
+
 #: Kinds whose measurement is a plain shift. A needle turns and a bar fills.
 SHIFTING = {ElementKind.ICON, ElementKind.TEXT, ElementKind.TELLTALE, ElementKind.REGION}
 
@@ -83,6 +102,9 @@ class Correction:
     """Largest correction at any element used, display px."""
     grouped: int = 0
     """Elements left out of the mapping because they moved together, as a group."""
+    split: tuple[frozenset, frozenset] | None = None
+    """(ids the mapping was fitted to, ids that moved together), for refining it
+    without choosing again."""
 
 
 def can_anchor(profile) -> bool:
@@ -93,7 +115,7 @@ def can_anchor(profile) -> bool:
 def element_correction(report: RunReport, profile, values=None) -> Correction | None:
     """The smooth mapping that explains where the elements were found, or None."""
     specs = {s.id: s for s in profile}
-    src, dst = [], []
+    src, dst, ids = [], [], []
     for r in report.results:
         m = r.measurement
         spec = specs.get(r.element_id)
@@ -103,20 +125,77 @@ def element_correction(report: RunReport, profile, values=None) -> Correction | 
         x, y, w, h = spec.expected_bbox(resolve_value(spec, values))
         src.append((x + w / 2, y + h / 2))
         dst.append((x + w / 2 + m.dx, y + h / 2 + m.dy))
-    n = len(src)
+        ids.append(spec.id)
+    return _correction(np.float64(src).reshape(-1, 2), np.float64(dst).reshape(-1, 2), ids)
+
+
+def far_correction(reference: np.ndarray, live: np.ndarray, profile,
+                   values=None, split=None) -> Correction | None:
+    """The mapping, from every element that shifts looked for up to VOTE_MARGIN_PX.
+
+    Each is a plain ZNCC match of its patch in the reference, both frames in
+    display space under the same first pose. Only a vote: what is reported is
+    measured afterwards, as usual, under the corrected pose.
+
+    ``split`` is an earlier correction's -- which elements the mapping was
+    fitted to and which moved together -- and the fit starts from it rather
+    than choosing again from scratch: freshly chosen under each correction, a
+    near tie could swing a later round back to a bent mapping. Held fixed
+    instead, it kept the rough first round's mistakes, and unchanged screens
+    went from 99.1% to 94.9% right; so elements may still change sides as the
+    fit settles.
+    """
+    from layoutval.measure import crop, is_degenerate, subpixel_crop, zncc_match
+
+    src, dst, ids = [], [], []
+    m = VOTE_MARGIN_PX
+    for spec in profile:
+        if spec.kind not in SHIFTING:
+            continue
+        x, y, w, h = spec.expected_bbox(resolve_value(spec, values))
+        template = subpixel_crop(reference, (x, y, w, h))
+        if template.size == 0 or min(template.shape[:2]) < 3 or is_degenerate(template):
+            continue
+        sx, sy = int(round(x - m)), int(round(y - m))
+        area = crop(live, (sx, sy, int(round(w + 2 * m)), int(round(h + 2 * m))))
+        if area.shape[0] < template.shape[0] + 2 or area.shape[1] < template.shape[1] + 2:
+            continue
+        # Clipped at the frame's edge, the window starts later than asked.
+        sx, sy = max(sx, 0), max(sy, 0)
+        (px, py), score, on_border = zncc_match(area, template)
+        if on_border or score < VOTE_MIN_ZNCC:
+            continue
+        src.append((x + w / 2, y + h / 2))
+        dst.append((sx + px + w / 2, sy + py + h / 2))
+        ids.append(spec.id)
+    return _correction(np.float64(src).reshape(-1, 2), np.float64(dst).reshape(-1, 2),
+                       ids, split)
+
+
+def _correction(src_a: np.ndarray, dst_a: np.ndarray, ids: list[str],
+                split=None) -> Correction | None:
+    """The mapping from where the elements belong to where they were found."""
+    n = len(src_a)
     if n < MIN_AFFINE:
         return None
-    src_a, dst_a = np.float64(src), np.float64(dst)
     if n >= MIN_HOMOGRAPHY:
-        found = _grouped_homography(src_a, dst_a)
+        if split is not None:
+            keep = np.array([i in split[0] for i in ids])
+            group = np.array([i in split[1] for i in ids])
+            found = _refine(src_a, dst_a, keep, group)
+        else:
+            found = _grouped_homography(src_a, dst_a)
         if found is None:
             return None
-        G, inliers, grouped = found
+        G, keep, group = found
+        inliers, grouped = int(keep.sum()), int(group.sum())
         if inliers + grouped < max(MIN_AFFINE - 2, 0.6 * n) or inliers < MIN_HOMOGRAPHY:
             return None                   # no one mapping explains most of them
         moved = cv2.perspectiveTransform(src_a.reshape(-1, 1, 2), G).reshape(-1, 2) - src_a
+        named = np.array(ids, dtype=object)
         return Correction(G=G, used=n, inliers=inliers, grouped=grouped,
-                          largest_px=float(np.linalg.norm(moved, axis=1).max()))
+                          largest_px=float(np.linalg.norm(moved, axis=1).max()),
+                          split=(frozenset(named[keep]), frozenset(named[group])))
     A, mask = cv2.estimateAffine2D(src_a, dst_a, method=cv2.RANSAC,
                                    ransacReprojThreshold=INLIER_PX,
                                    maxIters=5000, confidence=0.999)
@@ -188,22 +267,36 @@ def _grouped_homography(src: np.ndarray, dst: np.ndarray):
     if best is None:
         return None
     keep, group = _explained(residuals[best])
-    shift = -np.median(residuals[best][group], axis=0) if group.any() else np.zeros(2)
-    G = None
+    return _refine(src, dst, keep, group)
+
+
+def _refine(src: np.ndarray, dst: np.ndarray, keep: np.ndarray, group: np.ndarray):
+    """Fit the mapping to ``keep`` with ``group`` as one block with its own shift.
+
+    Which elements are which is updated as the fit settles. Returns
+    (G, keep, group), or None.
+    """
+    if keep.sum() < 4:
+        return None
+    G, _ = cv2.findHomography(src[keep], dst[keep], 0)
+    if G is None:
+        return None
+    # residual = mapped - found, so the group's own shift is minus its residual
+    residual = _project(G[None], src)[0] - dst
+    shift = -np.median(residual[group], axis=0) if group.any() else np.zeros(2)
     for _ in range(20):
-        if keep.sum() < 4:
-            return None
         G, _ = cv2.findHomography(np.concatenate([src[keep], src[group]]),
                                   np.concatenate([dst[keep], dst[group] - shift]), 0)
         if G is None:
             return None
         residual = _project(G[None], src)[0] - dst
         now_keep, now_group = _explained(residual)
-        # residual = mapped - found, so the group's own shift is minus its residual
+        if now_keep.sum() < 4:
+            return None
         now_shift = -np.median(residual[now_group], axis=0) if now_group.any() else np.zeros(2)
         settled = ((now_keep == keep).all() and (now_group == group).all()
                    and np.abs(now_shift - shift).max() < 0.01)
         keep, group, shift = now_keep, now_group, now_shift
         if settled:
             break
-    return G, int(keep.sum()), int(group.sum())
+    return G, keep, group
