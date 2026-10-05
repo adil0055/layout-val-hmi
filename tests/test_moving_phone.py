@@ -394,6 +394,33 @@ def test_a_small_cluster_with_three_things_moved_still_anchors_on_the_rest():
         assert np.linalg.norm(left[what == name] - expected, axis=1).max() < 0.5, name
 
 
+@pytest.mark.parametrize("seed", range(6))
+def test_of_two_explanations_that_fit_alike_the_screen_stays_where_it_was_taught(seed):
+    """A mounted webcam, the speed band moved 4 px, and a first pose that ECC
+    let the band pull: under it the band reads 0 and everything else carries a
+    stretch, the far left 4 px off. Two explanations then fit every element:
+    the band moved, or the view stretched 0.3% and the four elements beside
+    the band moved the other way. Counting inliers preferred the second, and
+    which one won turned on noise -- right on one capture, wrong on the next.
+    The one that leaves the screen where it was taught is taken.
+    """
+    rng = np.random.default_rng(seed)
+    points, what = _small_cluster()
+    band = what == "band"
+    a, b = 4.0 / 1360, -4.0 - 4.0 * (-300) / 1360      # the first pose's stretch
+    shifts = np.stack([a * points[:, 0] + b, np.zeros(len(points))], 1)
+    shifts += rng.normal(0, 0.2, points.shape)
+    shifts[band] += (4.0, 0.0)
+    home = np.array([[1 - a, 0, -b], [0, 1, 0], [0, 0, 1.0]])
+    specs, report = _report_with(points, shifts)
+    fix = anchor.element_correction(report, specs, home=home)
+    assert fix is not None
+    left = cv2.perspectiveTransform((points + shifts).reshape(-1, 1, 2),
+                                    np.linalg.inv(fix.G)).reshape(-1, 2) - points
+    assert (np.linalg.norm(left[band], axis=1) > 2.5).all()
+    assert (np.linalg.norm(left[~band], axis=1) < 2.5).all()
+
+
 def test_too_few_elements_are_not_anchored_on():
     specs, report = _report_with([(100, 100), (500, 120), (300, 400)], [(1, 0)] * 3)
     assert anchor.element_correction(report, specs) is None

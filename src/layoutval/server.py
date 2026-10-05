@@ -1591,7 +1591,11 @@ class CaptureSession:
         if self.deglare and live.ndim == 3 and live.shape == ref.shape:
             pair = glare.deglare_pair(ref, live, bright=self.glare_bright)
             ref, live = pair.reference, pair.live
-        return far_correction(ref, live, self.profile, self.values, prior)
+        # Where the screen was when it was taught, relative to this pose: a
+        # mounted webcam's screen has not moved, and of two explanations that
+        # fit as well, the one that leaves it there is taken.
+        home = np.linalg.inv(self.calibration.geometry.H) @ H
+        return far_correction(ref, live, self.profile, self.values, prior, home)
 
     def _measure_at(self, undistorted: np.ndarray, shape: tuple[int, ...],
                     H: np.ndarray, report: RunReport) -> tuple[RunReport, np.ndarray]:

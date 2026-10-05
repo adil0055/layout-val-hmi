@@ -362,6 +362,34 @@ state rather than its last. On those six inventories, the elements that
 changed verdict between captures went from 8 to 1 -- one sitting on the
 1.5 px line beside the moved gauge.
 
+**Two answers that fit alike.** On a sparse cluster through a mounted webcam,
+with a reference taken once and the same faulted screen captured again and
+again, the first few came back right and later ones turned it inside out: the
+moved speed band passing, the unmoved km/h, battery and clock beside it
+failing. Nothing is learnt between validations -- the reference, the
+templates and the calibration are only written by Reference -- so it was what
+changed in the room: a reflection growing on the glass. Rebuilt in
+simulation (a BMW-style layout at 0.51 camera px per display px, haze, moire,
+a reflection growing over two minutes), one capture in nine flipped. Three
+things were behind it:
+
+- ECC, pulled by the sharp moved band, already bent the first pose 3.5 px
+  towards it, so the band read 0-1 px and the rest carried a stretch.
+- At that sampling each element is placed to 0.5-1 px, about the inlier
+  tolerance, so the right answer lost supporters to noise, and a mapping drawn
+  from four sharp elements of the band and the right side won. Now the best
+  40 distinct candidates are refitted to what they agree with before they are
+  compared (locally optimised RANSAC), and every element's own shift is a
+  candidate too: a shift cannot bend.
+- Even so, two explanations fit every element: the band (11) moved 4 px, or
+  the view stretched 0.3% and the four elements beside the band moved 4 px the
+  other way. Counting inliers picked the second. Now, of explanations within
+  two elements of the best, the one that leaves the screen nearest where it
+  was taught is taken (`home`): a mounted webcam's screen has not moved. On
+  synthetic votes of that layout with the first pose stretched, wrong answers
+  went from 28 of 30 to none at 0.2 px of vote noise, 10 to 1 at 0.5 px; at
+  0.7 px, 17 to 13 -- the measurement there is too coarse to tell.
+
 The page also fixes the webcam's exposure, white balance and focus once it
 has settled (2.5 s after it starts), where the browser and camera allow it --
 Chrome does, on most USB webcams -- and says which it locked, or that it could

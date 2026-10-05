@@ -67,6 +67,21 @@ mapping must be fitted to more elements than any group holds, or a mapping
 lined up on what moved scores as well as the right one. On hazy webcam-size
 frames of a bench cluster cut to 32 elements, with the first pose pulled
 towards three moved things, 35 of 171 unmoved elements were flagged; 4 now.
+
+**Two answers that fit alike.** With a mounted webcam on a sparse cluster, a
+reference taken once and the same faulted screen captured again and again,
+some captures came back inside out: the moved speed band passing, the unmoved
+elements beside it failing. Nothing is learnt between captures; a reflection
+growing on the glass was enough. ECC, pulled by the sharp band, bent the first
+pose towards it, so the band read 0 and the rest carried a stretch; at 0.51
+camera px per display px each element is placed to 0.5-1 px. Then the band
+(11) moved 4 px and the view stretched 0.3% with the 4 elements beside it
+moved the other way fit every element alike, and counting inliers took the
+second. So: the best 40 distinct candidates are refitted before they are
+compared; every element's own shift, and the screen exactly where it was
+taught, are candidates too; and of explanations within TIE_ELEMENTS of the
+best, the one nearest where the screen was taught is taken -- if that is
+itself among them, so a camera or lid that really moved is not held to it.
 """
 
 from __future__ import annotations
@@ -87,12 +102,29 @@ MIN_AFFINE = 8
 GROUP_MIN = 3
 """Elements that must share one displacement to count as a group that moved."""
 
+MAX_GROUPS = 3
+"""At most this many groups. A fault moves a thing or a few; a camera that moved
+leaves a smooth field of offsets, which, carved into enough small groups,
+"explains" every element -- and with the screen where it was taught it then
+looked like the answer, on a phone turned 4 degrees with one block moved 2 px."""
+
 GROUP_SHIFT_PX = 2.0
 """Smallest displacement, display px, for such a group to count: twice INLIER_PX,
 so a group stands clear of the mapping's own scatter."""
 
 HYPOTHESES = 3000
 """Candidate mappings tried, each from four elements chosen at random."""
+
+REFINED = 40
+"""How many of the best distinct candidates are refitted before they are compared."""
+
+TIE_ELEMENTS = 2
+"""Explanations this many elements apart are as good as each other; the one
+that leaves the screen nearest where it was taught is taken."""
+
+AT_HOME_PX = 1.0
+"""A pose within this, display px on average, of the taught one leaves the
+screen where it was."""
 
 VOTE_MARGIN_PX = 32.0
 """How far, display px, each element is looked for when it votes on the pose."""
@@ -127,8 +159,12 @@ def can_anchor(profile) -> bool:
     return sum(1 for s in profile if s.kind in SHIFTING) >= MIN_AFFINE
 
 
-def element_correction(report: RunReport, profile, values=None) -> Correction | None:
-    """The smooth mapping that explains where the elements were found, or None."""
+def element_correction(report: RunReport, profile, values=None,
+                       home: np.ndarray | None = None) -> Correction | None:
+    """The smooth mapping that explains where the elements were found, or None.
+
+    ``home`` as for :func:`far_correction`.
+    """
     specs = {s.id: s for s in profile}
     src, dst, ids = [], [], []
     for r in report.results:
@@ -141,18 +177,25 @@ def element_correction(report: RunReport, profile, values=None) -> Correction | 
         src.append((x + w / 2, y + h / 2))
         dst.append((x + w / 2 + m.dx, y + h / 2 + m.dy))
         ids.append(spec.id)
-    return _correction(np.float64(src).reshape(-1, 2), np.float64(dst).reshape(-1, 2), ids)
+    return _correction(np.float64(src).reshape(-1, 2), np.float64(dst).reshape(-1, 2), ids,
+                       home=home)
 
 
 def far_correction(reference: np.ndarray, live: np.ndarray, profile,
-                   values=None, prior: Correction | None = None) -> Correction | None:
+                   values=None, prior: Correction | None = None,
+                   home: np.ndarray | None = None) -> Correction | None:
     """The mapping, from every element that shifts looked for up to VOTE_MARGIN_PX.
 
     Each is a plain ZNCC match of its patch in the reference, both frames in
     display space under the same first pose. Only a vote: what is reported is
     measured afterwards, as usual, under the corrected pose.
 
-    ``prior`` is the previous round's correction: the fit starts from its
+    ``home`` is the pose the frames were rectified with, relative to the
+    reference's (display to display): where the screen was when it was taught.
+    Two explanations can fit equally well -- a speed band of 11 elements moved
+    4 px one way, or the view stretched 0.3% and the 4 elements beside it
+    moved the other way -- and the one that leaves the screen where it was is
+    then taken. ``prior`` is the previous round's correction: the fit starts from its
     split -- which elements the mapping was fitted to and which moved
     together -- and keeps its kind of mapping, rather than choosing again: freshly chosen under each correction, a
     near tie could swing a later round back to a bent mapping. Held fixed
@@ -184,28 +227,26 @@ def far_correction(reference: np.ndarray, live: np.ndarray, profile,
         dst.append((sx + px + w / 2, sy + py + h / 2))
         ids.append(spec.id)
     return _correction(np.float64(src).reshape(-1, 2), np.float64(dst).reshape(-1, 2),
-                       ids, prior)
+                       ids, prior, home)
 
 
 def _correction(src_a: np.ndarray, dst_a: np.ndarray, ids: list[str],
-                prior: Correction | None = None) -> Correction | None:
+                prior: Correction | None = None,
+                home: np.ndarray | None = None) -> Correction | None:
     """The mapping from where the elements belong to where they were found."""
     n = len(src_a)
     if n < MIN_AFFINE:
         return None
     if prior is not None and prior.split is not None:
         label = np.array([prior.split.get(i, UNEXPLAINED) for i in ids])
+        model = prior.model
+        found = _refine(src_a, dst_a, label, model)
     else:
-        label = _choose(src_a, dst_a)
-        if label is None:
+        found = _choose(src_a, dst_a, home)
+        if found is None:
             return None
-    # A homography from enough elements; from fewer, an affine map, which
-    # cannot bend. A small inventory with a group moved -- 32 elements, 13 of
-    # them moved -- left 19 to fit, one short of a homography; giving up there
-    # handed the pose back to ECC, which the moved elements had pulled 1-2 px.
-    model = ("h" if (label == POSE).sum() >= MIN_HOMOGRAPHY else "a") if prior is None \
-        else prior.model
-    found = _refine(src_a, dst_a, label, model)
+        G, label, model = found
+        found = (G, label)
     if found is None:
         return None
     G, label = found
@@ -241,7 +282,7 @@ def _explained(residuals: np.ndarray) -> np.ndarray:
     label[norm < INLIER_PX] = POSE
     rest = np.flatnonzero((label == UNEXPLAINED) & (norm >= GROUP_SHIFT_PX))
     group = POSE
-    while len(rest) >= GROUP_MIN:
+    while len(rest) >= GROUP_MIN and group < MAX_GROUPS:
         r = residuals[rest]
         together = np.linalg.norm(r[:, None] - r[None], axis=2) < INLIER_PX
         centre = int(together.sum(axis=1).argmax())
@@ -268,8 +309,11 @@ def _score(label: np.ndarray) -> tuple[int, int] | None:
     return inliers + int(sizes.sum()), inliers
 
 
-def _choose(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
-    """RANSAC for which elements the mapping is fitted to and which moved together."""
+def _choose(src: np.ndarray, dst: np.ndarray, home: np.ndarray | None = None):
+    """RANSAC for which elements the mapping is fitted to and which moved together.
+
+    Returns (G, label, model) of the explanation taken, or None.
+    """
     n = len(src)
     homography = n >= MIN_HOMOGRAPHY
     rng = np.random.default_rng(0)
@@ -283,6 +327,24 @@ def _choose(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
                         else np.vstack([cv2.getAffineTransform(a, b), [0.0, 0.0, 1.0]]))
         except cv2.error:
             pass                          # points in a line
+    # And every element's own shift, as the whole screen's. A shift cannot
+    # bend, so the plain answer -- the screen where it was, one group moved --
+    # is always among the candidates. Drawn from four elements at a time, it
+    # need not be: on a hazy webcam shot of a 32-element cluster with its speed
+    # band moved, the four-element mappings came out bent -- stretched 0.3% to
+    # follow the band, the screen's middle 1.7 px off -- and one of those won,
+    # passing the band and failing the rest, on one capture in nine.
+    shifts = np.repeat(np.eye(3)[None], n, axis=0)
+    shifts[:, :2, 2] = dst - src
+    stack = np.concatenate([stack, shifts])
+    # And the screen exactly where it was taught. A first pose that ECC let a
+    # moved band pull was 1-2% stretched and 6 px off, and most of what had
+    # not moved stood in one column down the right: no four of them drawn at
+    # random gave back the plain answer, which this is.
+    taught = None
+    if home is not None:
+        taught = len(stack)
+        stack = np.concatenate([stack, np.linalg.inv(home)[None]])
     with np.errstate(all="ignore"):
         residuals = _project(stack, src) - dst[None]
     finite = np.isfinite(residuals).all(axis=(1, 2))
@@ -293,18 +355,67 @@ def _choose(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
     # they cannot win.
     bound = counts + (np.isfinite(norms) & (norms >= GROUP_SHIFT_PX)).sum(axis=1)
     order = np.lexsort((-counts, -bound))
-    best, best_key = None, (-1, -1)
+    # Each hypothesis as drawn is a rough start: from four noisy elements it
+    # extrapolates badly. The most promising are refitted to what they agree
+    # with before they are compared (locally optimised RANSAC). Compared as
+    # drawn, on a hazy webcam shot at 0.51 camera px per display px -- each
+    # element placed to 0.5-1 px -- the plain answer lost its supporters to
+    # the noise, and a mapping bent to follow a moved speed band won.
+    # The best REFINED distinct labellings; a hypothesis's key can be no more
+    # than (bound, count), so once that falls below the weakest kept, the rest
+    # are skipped.
+    top: dict[bytes, tuple[tuple[int, int], np.ndarray, int]] = {}
+    if taught is not None and finite[taught]:
+        label = _explained(residuals[taught])
+        key = _score(label)
+        if key is not None:
+            top[label.tobytes()] = (key, label, taught)
     for i in order:
         if not finite[i] or counts[i] < max(3, 0.2 * n):
             continue
-        if (bound[i], counts[i]) <= best_key:
-            if bound[i] < best_key[0]:
-                break
+        if len(top) >= REFINED and (bound[i], counts[i]) < min(v[0] for v in top.values()):
+            break
+        label = _explained(residuals[i])
+        key = _score(label)
+        if key is None:
             continue
-        key = _score(_explained(residuals[i]))
-        if key is not None and key > best_key:
-            best, best_key = i, key
-    return None if best is None else _explained(residuals[best])
+        signature = label.tobytes()
+        if signature in top and top[signature][0] >= key:
+            continue
+        top[signature] = (key, label, i)
+        if len(top) > REFINED:
+            del top[min(top, key=lambda s: top[s][0])]
+    done = []
+    for key, label, i in sorted(top.values(), key=lambda v: v[0], reverse=True):
+        # Refitted, or kept as drawn where the refit fails or does worse: the
+        # taught pose, refitted as an affine map from the 16 elements it held,
+        # could not undo a first pose bent by perspective, and was lost.
+        model = "h" if i == taught or (label == POSE).sum() >= MIN_HOMOGRAPHY else "a"
+        refined = _refine(src, dst, label, model, start=stack[i])
+        refined_key = None if refined is None else _score(refined[1])
+        if refined_key is not None and refined_key >= key:
+            done.append((refined_key, refined[0], refined[1], model))
+        else:
+            done.append((key, stack[i], label, "h" if homography or i == taught else "a"))
+    if not done:
+        return None
+    most = max(d[0][0] for d in done)
+    close = [d for d in done if d[0][0] >= most - TIE_ELEMENTS]
+    # Among those that explain about as much as the best, the one that leaves
+    # the screen nearest where it was taught -- but only if the screen where it
+    # was taught is itself among them. When the camera or the lid has moved,
+    # it explains little, and which of the rest is nearer means nothing.
+    if home is not None and any(_away(home, d[1], src) < AT_HOME_PX for d in close):
+        pick = min(close, key=lambda d: (_away(home, d[1], src), -d[0][1]))
+    else:
+        pick = max(done, key=lambda d: d[0])
+    return pick[1], pick[2], pick[3]
+
+
+def _away(home: np.ndarray, G: np.ndarray, pts: np.ndarray) -> float:
+    """How far, display px on average, pose ``G`` puts the elements from where they were taught."""
+    there = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), home @ G).reshape(-1, 2)
+    return float(np.linalg.norm(there - pts, axis=1).mean())
 
 
 def _fit(model: str, src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
@@ -321,7 +432,8 @@ def _fit(model: str, src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
     return np.vstack([X.T, [0.0, 0.0, 1.0]])
 
 
-def _refine(src: np.ndarray, dst: np.ndarray, label: np.ndarray, model: str = "h"):
+def _refine(src: np.ndarray, dst: np.ndarray, label: np.ndarray, model: str = "h",
+            start: np.ndarray | None = None):
     """Fit the mapping to its elements with each group as one block with its own shift.
 
     A group's shape pins the side of the screen it is on, where nothing else
@@ -332,7 +444,7 @@ def _refine(src: np.ndarray, dst: np.ndarray, label: np.ndarray, model: str = "h
     out on one capture of a scene the others got right. Returns (G, label),
     or None.
     """
-    G = _fit(model, src[label == POSE], dst[label == POSE])
+    G = start if start is not None else _fit(model, src[label == POSE], dst[label == POSE])
     if G is None:
         return None
     best, best_key = None, None
@@ -352,7 +464,8 @@ def _refine(src: np.ndarray, dst: np.ndarray, label: np.ndarray, model: str = "h
         residual = _project(G[None], src)[0] - dst
         now = _explained(residual)
         key = _score(now)
-        if key is not None and (best_key is None or key > best_key):
+        # A later state that scores as well is the more settled one.
+        if key is not None and (best_key is None or key >= best_key):
             best, best_key = (G.copy(), now.copy()), key
         if (now == POSE).sum() < 3:
             break
