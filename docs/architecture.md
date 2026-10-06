@@ -390,6 +390,40 @@ things were behind it:
   went from 28 of 30 to none at 0.2 px of vote noise, 10 to 1 at 0.5 px; at
   0.7 px, 17 to 13 -- the measurement there is too coarse to tell.
 
+**A camera held still.** A webcam on a stand, a reference taken once, and the
+same faulted screen captured again and again came back right, then with the
+moved speed band passing and the unmoved elements beside it failing, then half
+of each. The same photograph always gives the same report -- nothing is learnt
+between validations, the reference is never written by one, the RANSAC is
+seeded per call -- so it was what each capture's noise did to two decisions.
+First, the pose was re-solved from what was drawn: with the band and the media
+area moved 6-7 px (17 elements) against 23 that were not, noise tipped it
+towards the band, or halfway, and the screen's own outline, drawn through that
+pose, was 10-15 px off. So the photo is first lined up on a band round the
+screen's outline alone (`_held_pose`: ECC from where the screen was, on the
+bezel, the window frame and the wall round it, and on their detail only -- a
+reflection nine grey levels high over the dark bezel had pulled it 1.5-1.8 px,
+and 0.04 px with its slope of light taken off); when that converges
+(correlation 0.8 or more) and no corner moved more than 4 px, it is the pose,
+and the element votes may refine it by at most 1 px. A phone moved between
+shots or a tilted lid moves the outline further, and a photo smeared by a
+moving hand (its detail along the outline under 0.7 of the other's) lines up
+1-1.5 px out; both go the usual way. Second, the camera-shake match estimated
+its smear from the whole frame, and the moved group put a ghost in it 6 px
+from the true defocus; centred on the centroid of both, it shifted the
+reference 1.7 px -- only on the captures a touch softer than the reference.
+Now, with the camera held still, every element is looked for first; three or
+more that moved together, 4 px or more from the common shift, are a group, and
+whatever of the estimated smear lies nearer the group's displacement than the
+common one is cleared before it is used. (Leaving the moved elements out of
+the frames instead destabilised the estimate, 5.9 px of smear for 2.3. With
+the camera moved, the smear can be wide and an uneven screen's own 3-9 px
+shifts overlap it, so nothing is cleared: cleared there, real smear went with
+it and 11-20 more labels failed.) Simulated from the user's own photo at
+webcam size, the camera still, fresh noise, exposure within 3% and focus
+within 0.5 px each capture: 2 of 12 captures had flagged 17 unmoved elements;
+none do now.
+
 **A first pose that missed the screen.** Six phone photographs of a laptop's
 cluster, nothing on it changed, from in front, well above, below and either
 side. From well above and from the left, matched features offered no start

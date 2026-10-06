@@ -323,6 +323,21 @@ reported. A haze of room light on the glass pulled the screen-wide pose far
 enough that a good screen failed with the phone moved; finished on the
 elements, it passes, for any cluster with 8 or more elements.
 
+**A camera held still gives the same answer every time.** Nothing is learnt
+between validations: the same photograph always gives the same report. But a
+webcam on a stand, the same faulted screen captured again and again, gave
+different answers, because every capture re-solved the pose from what was on
+the screen; with the speed band and the media area moved (17 elements) against
+23 that were not, a capture's own noise tipped the pose towards the moved band
+or halfway. Now the photo is first lined up on the screen's outline alone — the
+bezel, the window frame, the wall round it, on their edges so a reflection's
+glow does not count — which nothing drawn can move. When that holds within 4
+px, it is the pose, and the elements may refine it by at most 1 px, so a moved
+group can no longer take it along. A phone moved between shots, a tilted lid or
+a shaken photo goes the usual way. And the matching of camera shake, which
+blurs the sharper photo to match the other, no longer reads a moved group as
+smear: on the softer captures that had shifted the whole reference 1.7 px.
+
 **How far round the camera may go.** From a steep view — well above the screen,
 or from its side — matched features can miss the screen altogether, and a
 blurred photo starts the pose 8–30 px out. Then several starts are tried (fewer

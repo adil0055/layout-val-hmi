@@ -22,9 +22,11 @@ may be the shaken one, and the kernel is used only if applying it actually
 brings the two frames closer.
 
 **Why it cannot hide a fault.** The kernel is one for the whole frame, fitted to
-every element at once, so an element that moved does not move it. And it is
-re-centred on its own centroid before use, so blurring introduces no shift at
-all: it can change how sharp an element looks, never where it is.
+every element at once, so an element that moved does not move it. Many that
+moved together do leave a second blob at their displacement, and the kernel
+is cleared there (see :func:`match_shake`). And it is re-centred on its own
+centroid before use, so blurring introduces no shift at all: it can change
+how sharp an element looks, never where it is.
 """
 
 from __future__ import annotations
@@ -39,6 +41,12 @@ from layoutval.capture import to_gray
 RADIUS = 20
 """Largest smear handled, in display pixels either side of centre."""
 
+GHOST_MIN_PX = 4.0
+"""A group that moved less than this, display px, from the rest leaves no blob
+apart from the smear's own -- the two overlap -- and nothing is taken out for
+it: cleared at 3 px, half of a real defocus went with it, and on a photo from
+14 degrees round 20 labels failed as different content."""
+
 
 @dataclass
 class ShakeMatch:
@@ -52,8 +60,16 @@ class ShakeMatch:
     """RMS radius of the kernel: how far the smear reaches."""
 
 
-def _estimate(sharp: np.ndarray, blurred: np.ndarray, radius: int) -> np.ndarray | None:
-    """Kernel k with blurred ~= k * sharp, cut to ``radius``; None if there is none."""
+def _estimate(sharp: np.ndarray, blurred: np.ndarray, radius: int,
+              ghosts: list[tuple[float, float]] = (),
+              common: tuple[float, float] = (0.0, 0.0)) -> np.ndarray | None:
+    """Kernel k with blurred ~= k * sharp, cut to ``radius``; None if there is none.
+
+    ``ghosts`` are displacements, sharp to blurred, of content that moved
+    between the frames, and ``common`` that of everything else: each ghost
+    leaves a blob that is not smear, and whatever of the kernel lies nearer a
+    ghost than the common displacement is cleared.
+    """
     a = sharp - sharp.mean()
     b = blurred - blurred.mean()
     h, w = a.shape
@@ -71,6 +87,11 @@ def _estimate(sharp: np.ndarray, blurred: np.ndarray, radius: int) -> np.ndarray
     k = np.fft.fftshift(k)
     cy, cx = h // 2, w // 2
     k = k[cy - radius:cy + radius + 1, cx - radius:cx + radius + 1].astype(np.float64)
+    ys, xs = np.mgrid[-radius:radius + 1, -radius:radius + 1]
+    cx0, cy0 = common
+    for gx, gy in ghosts:
+        if np.hypot(gx - cx0, gy - cy0) >= GHOST_MIN_PX:
+            k[np.hypot(xs - gx, ys - gy) < np.hypot(xs - cx0, ys - cy0)] = 0.0
     k[k < 0.05 * k.max()] = 0.0
     total = k.sum()
     if not np.isfinite(total) or total <= 0:
@@ -105,13 +126,28 @@ def _spread(k: np.ndarray) -> float:
 
 
 def match_shake(reference: np.ndarray, live: np.ndarray, *, radius: int = RADIUS,
-                min_gain: float = 0.1) -> ShakeMatch:
+                min_gain: float = 0.1,
+                moved: list[tuple[float, float]] | None = None,
+                common: tuple[float, float] = (0.0, 0.0)) -> ShakeMatch:
     """Blur whichever frame is sharper by the smear that separates them.
 
     Both frames must already be aligned in display space. Returns them
     unchanged when neither is measurably more blurred than the other, or when
     applying the estimated smear would not bring them at least ``min_gain``
     (10%) closer.
+
+    ``moved`` are the displacements, reference to live, of groups of elements
+    that moved together on the screen, and ``common`` that of the rest. Each puts a second blob in the estimate
+    at its displacement: with the speed band and the media area drawn 6-7 px
+    to the right, the estimate came back as the true defocus plus a ghost 6 px
+    away at half its height, and centred on the centroid of both it shifted the
+    reference 1.7 px -- every element that had not moved read 1.5-1.9 px off,
+    in the captures a touch softer than the reference and only those, which is
+    an answer that changes from capture to capture. So whatever of the kernel
+    lies nearer such a displacement than the common one is cleared before it
+    is used. (Leaving the moved
+    elements out of the frames instead destabilised the estimate: without
+    their detail, from far round, the smear came back 5.9 px for 2.3.)
     """
     a = to_gray(reference).astype(np.float32)
     b = to_gray(live).astype(np.float32)
@@ -123,8 +159,12 @@ def match_shake(reference: np.ndarray, live: np.ndarray, *, radius: int = RADIUS
         return float(np.sqrt((d * d).mean()))
 
     best = ("", None, gap(a, b))
-    for name, sharp, blurred in (("reference", a, b), ("live", b, a)):
-        k = _estimate(sharp, blurred, radius)
+    there = [tuple(map(float, d)) for d in (moved or [])]
+    back = [(-dx, -dy) for dx, dy in there]
+    mx, my = map(float, common)
+    for name, sharp, blurred, ghosts, at in (("reference", a, b, there, (mx, my)),
+                                             ("live", b, a, back, (-mx, -my))):
+        k = _estimate(sharp, blurred, radius, ghosts, at)
         if k is None or _spread(k) < 0.5:
             continue
         g = gap(cv2.filter2D(sharp, -1, k.astype(np.float32)), blurred)

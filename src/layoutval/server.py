@@ -69,6 +69,7 @@ from layoutval.anchor import (ROUGH_PX, can_anchor, element_correction, far_corr
 from layoutval.autoprofile import profile_from_reference
 from layoutval import edgecheck, glare
 from layoutval.blur import match_shake
+from layoutval.capture import to_gray
 from layoutval.displayfind import propose_display_corners
 from layoutval.calibration import (
     Calibration,
@@ -148,6 +149,39 @@ make: the first brings the pose close, and later ones only refine it."""
 
 ROUGH_ROUNDS = 4
 """Most times a rough pose is re-voted on as it settles (see ``_rough_pose``)."""
+
+HELD_PX = 4.0
+"""Largest move, camera px at any corner of the screen, for its outline alone to
+give the pose (see ``_held_pose``): a camera on a stand, or a laptop lid that
+wobbled as the capture was clicked -- not a phone moved between shots."""
+
+HELD_REFINE_PX = 1.0
+"""Most the elements may move a held pose, display px: enough to take out what
+lining the outline up leaves -- 0.3-0.5 px on a photo smeared 8-12 px by shake
+-- and far short of following a gauge drawn a few pixels off."""
+
+HELD_RING = 0.04
+"""Half-width of the band round the screen's outline the held pose is lined up
+on, as a fraction of the screen's shorter side in the photograph."""
+
+HELD_DETAIL_SIGMA = 6.0
+"""Scale, photograph px, above which brightness is taken off before the outline is
+lined up: the bezel's and the window's edges stay, a reflection's slope goes."""
+
+HELD_CC = 0.8
+"""Least ECC correlation over that band for the outline to be trusted."""
+
+HELD_SHARPNESS = 0.7
+"""Least ratio of the two photos' detail along the outline, softer over sharper
+(gradient energy, at the scale of strokes rather than pixels), for the outline
+to give the pose: a photo smeared by a moving hand -- 0.47-0.63 of the other's
+detail along the outline at a 6-12 px streak -- is not a camera held still,
+and lining up its outline left the pose 1-1.5 px out. A webcam refocusing
+0.5-0.8 px keeps 0.79-0.95."""
+
+MOVED_APART_PX = 1.0
+"""An element this far, display px, from the median shift moved on the screen
+(see ``_moved_groups``)."""
 
 #: Past this many views the lens is solved with whatever coverage there is.
 INTRINSIC_VIEWS_MAX = 30
@@ -1619,6 +1653,86 @@ class CaptureSession:
             ref, live = pair.reference, pair.live
         return ref, live
 
+    def _held_pose(self, undistorted: np.ndarray) -> tuple[np.ndarray, float] | None:
+        """The pose from the screen's outline, if it has barely moved: (H, px moved) or None.
+
+        A webcam on a stand, the same faulted screen captured again and again,
+        and the answer changed between captures: right, then the moved speed
+        band passing and the unmoved elements beside it failing, then half of
+        each. Nothing is learnt between validations -- the same photograph
+        always gives the same report -- but every capture re-solved the pose
+        from what was on the screen, and with the speed band and the media
+        area moved (17 elements) against 23 that were not, a capture's own
+        noise tipped which side the pose took: the outline of the screen,
+        drawn through that pose, was 10-15 px off where it was.
+
+        The outline is what says where the screen is, and nothing the cluster
+        draws can move it: the bezel's edges, the window's frame, the wall
+        round it. So first the reference and this photograph are lined up on a
+        band round the screen's outline alone (HELD_RING), starting from where
+        the screen was; when that holds (HELD_CC) and no corner has moved more
+        than HELD_PX, that is the pose. The elements may refine it by up to
+        HELD_REFINE_PX -- what lining a smeared photo's outline up leaves -- and
+        no more, so a group that moved on the screen cannot take it with it. A
+        phone moved between shots, or a lid tilted, moves the outline further
+        than that and goes the usual way.
+        """
+        ref = self.reference_camera
+        if ref is None or ref.shape != undistorted.shape:
+            return None
+        h0, w0 = undistorted.shape[:2]
+        scale = min(1.0, TRACK_SIDE / max(h0, w0))
+        size = (round(w0 * scale), round(h0 * scale))
+        scale = size[0] / w0
+        ref_view, live_view = ref, undistorted
+        if scale < 1.0:
+            ref_view = cv2.resize(ref, size, interpolation=cv2.INTER_AREA)
+            live_view = cv2.resize(undistorted, size, interpolation=cv2.INTER_AREA)
+        R = self.calibration.geometry.H
+        dw, dh = self.calibration.geometry.display_size
+        corners = np.float64([[[0, 0]], [[dw, 0]], [[dw, dh]], [[0, dh]]])
+        quad = cv2.perspectiveTransform(corners, R).reshape(-1, 2)
+        c = 0.5 * (scale - 1.0)              # pixel centres, as DriftEstimate.rescaled
+        small = quad * scale + c
+        sides = np.linalg.norm(small - np.roll(small, 1, axis=0), axis=1)
+        band = max(4, round(HELD_RING * float(sides.min())))
+        ring = np.zeros(size[::-1], np.uint8)
+        cv2.polylines(ring, [np.round(small).astype(np.int32).reshape(-1, 1, 2)], True, 1,
+                      thickness=2 * band + 1)
+        picture, _ = self._pose_masks(undistorted.shape, size, scale)
+        ring &= picture
+        if ring.sum() < 1000:
+            return None
+        on = ring > 0
+
+        def detail(view: np.ndarray) -> float:
+            g = cv2.GaussianBlur(to_gray(view).astype(np.float32), (0, 0), 1.5)
+            gx, gy = cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1)
+            return float(np.mean((gx * gx + gy * gy)[on]))
+
+        sharp = [detail(ref_view), detail(live_view)]
+        if min(sharp) < HELD_SHARPNESS * max(sharp):
+            return None
+        # On detail only: a reflection on the glass is a slope of light, and
+        # over a dark bezel even a faint one -- nine grey levels -- was read as
+        # the screen having moved 1.5-1.8 px.
+        def edges(view: np.ndarray) -> np.ndarray:
+            g = to_gray(view).astype(np.float32)
+            return g - cv2.GaussianBlur(g, (0, 0), HELD_DETAIL_SIGMA)
+
+        est = DriftTracker(edges(ref_view), (0, 0, size[0], size[1]), motion=cv2.MOTION_HOMOGRAPHY,
+                           mask=ring, max_iterations=100).measure(edges(live_view))
+        if not est.converged or est.correlation < HELD_CC:
+            return None
+        if scale < 1.0:
+            est = est.rescaled(scale)
+        W = est.warp_camera
+        moved = cv2.perspectiveTransform(quad.reshape(-1, 1, 2), W).reshape(-1, 2) - quad
+        moved = float(np.linalg.norm(moved, axis=1).max())
+        if moved > HELD_PX:
+            return None
+        return W @ R, moved
+
     def _rough_pose(self, undistorted: np.ndarray, H: np.ndarray) -> np.ndarray | None:
         """A first pose the elements could not correct, replaced by one they agree with.
 
@@ -1700,8 +1814,12 @@ class CaptureSession:
         return self._outline[1]
 
     def _measure_at(self, undistorted: np.ndarray, shape: tuple[int, ...],
-                    H: np.ndarray, report: RunReport) -> tuple[RunReport, np.ndarray]:
-        """Rectify through ``H`` and measure everything; the report and the frame."""
+                    H: np.ndarray, report: RunReport,
+                    held: bool = False) -> tuple[RunReport, np.ndarray]:
+        """Rectify through ``H`` and measure everything; the report and the frame.
+
+        ``held``: the pose came from the screen's outline (see _held_pose).
+        """
         # Stages 4-6 only: there is one frame rather than a live source, and
         # the pose is resolved by the caller, so the pipeline is handed an
         # already rectified frame.
@@ -1717,7 +1835,13 @@ class CaptureSession:
         ref_m, live_m = (pair.reference, pair.live) if pair else (self.reference, live)
         # A photo smeared by the hand moving during the exposure is compared
         # with the reference smeared the same way. See layoutval.blur.
-        shake = match_shake(ref_m, live_m)
+        # With the camera held still, a group that moved on the screen stands
+        # well apart from the little the two photos differ in sharpness, and is
+        # kept out of the smear. With the camera moved, the smear can be wide
+        # and an uneven screen's own shifts overlap it: from 31-64 degrees round,
+        # clearing them took real smear with it and 11-13 more labels failed.
+        groups, common = self._moved_groups(ref_m, live_m) if held else ([], (0.0, 0.0))
+        shake = match_shake(ref_m, live_m, moved=groups, common=common)
         ref_m, live_m = shake.reference, shake.live
         if shake.kernel is not None:
             report.flag("shake_matched", severity="note", blurred=shake.applied_to,
@@ -1783,6 +1907,35 @@ class CaptureSession:
                 detail="a reflection on the glass was measured and subtracted",
             )
         return report, live
+
+    def _moved_groups(self, reference: np.ndarray, live: np.ndarray
+                      ) -> tuple[list[tuple[float, float]], tuple[float, float]]:
+        """Displacements of groups of elements that moved together, and of the rest.
+
+        Every element that shifts is looked for (anchor.far_votes). Those more
+        than MOVED_APART_PX from the median shift, three or more of them within
+        MOVED_APART_PX of one displacement, are a group that moved; the median
+        displacement of each is returned, with the median of all. Camera shake
+        moves everything alike and leaves none; a view that does not line up
+        everywhere scatters its elements every way, and leaves none either.
+        """
+        if self.profile is None:
+            return [], (0.0, 0.0)
+        src, dst, _ = far_votes(reference, live, self.profile, self.values)
+        if len(src) < 3:
+            return [], (0.0, 0.0)
+        d = dst - src
+        common = np.median(d, axis=0)
+        apart = np.linalg.norm(d - common, axis=1) > MOVED_APART_PX
+        close = np.linalg.norm(d[:, None, :] - d[None, :, :], axis=2) <= MOVED_APART_PX
+        left = apart & ((close & apart[None, :]).sum(axis=1) >= 3)
+        groups = []
+        while left.any():
+            i = int(np.argmax((close & left[None, :]).sum(axis=1) * left))
+            members = close[i] & left
+            groups.append(tuple(np.median(d[members], axis=0).tolist()))
+            left &= ~members
+        return groups, tuple(common.tolist())
 
     def _comparable(self, live_seen: np.ndarray) -> np.ndarray:
         """Where the two photos can be compared pixel for pixel, in display space.
@@ -1984,7 +2137,21 @@ class CaptureSession:
         anchored = hand_held and can_anchor(self.profile)
         H = self.calibration.geometry.H
         est = None
-        if self.reference_camera is not None:
+        held = self._held_pose(undistorted) if hand_held else None
+        if held is not None:
+            # The screen's outline has not moved, or barely: the pose is taken
+            # from it, and what is drawn may only refine it. See _held_pose.
+            H, moved = held
+            report.metadata["pose_shift_px"] = round(moved, 2)
+            report.flag(
+                "pose_held", severity="note", shift_px=round(moved, 2),
+                detail=(
+                    f"the screen's outline moved {moved:.2f} px since the reference, so "
+                    "the pose was taken from the outline: what is drawn on the screen "
+                    f"may only refine it, by up to {HELD_REFINE_PX:g} px."
+                ),
+            )
+        elif self.reference_camera is not None:
             est = (self._solve_pose(undistorted, COARSE_SIDE, COARSE_ITERATIONS) if anchored
                    else self._solve_pose(undistorted, TRACK_SIDE, 200))
             report.metadata["pose_shift_px"] = round(est.magnitude_px, 2)
@@ -2017,7 +2184,8 @@ class CaptureSession:
                     ),
                 )
 
-        voted = False
+        # Held, the outline's pose stands whatever the votes make of it.
+        voted = held is not None
         if anchored:
             # Every element votes on the pose, each looked for well past its
             # usual search: the first pose can lock onto a group that moved, and
@@ -2027,7 +2195,7 @@ class CaptureSession:
             rough = False
             for _ in range(3):
                 fix = self._far_correction(undistorted, H, prior)
-                if fix is None and prior is None and not rough:
+                if fix is None and prior is None and not rough and held is None:
                     rough = True
                     better = self._rough_pose(undistorted, H)
                     if better is not None:
@@ -2051,6 +2219,10 @@ class CaptureSession:
                 # on -- and is not taken.
                 if fix.largest_px < 0.25 or (prior is not None and fix.largest_px > LATER_ROUND_PX):
                     break
+                if held is not None and fix.largest_px > HELD_REFINE_PX:
+                    # A mapping that would move the outline's pose further is
+                    # following what moved on the screen.
+                    break
                 prior = fix
                 H = H @ fix.G
                 step = {"far": True, "used": fix.used, "inliers": fix.inliers,
@@ -2060,7 +2232,8 @@ class CaptureSession:
                 report.metadata.setdefault("pose_steps", []).append(step)
 
         flags = list(report.flags)
-        report, live = self._measure_at(undistorted, frame.shape, H, report)
+        report, live = self._measure_at(undistorted, frame.shape, H, report,
+                                        held=held is not None)
         if anchored and not voted:
             # The last step of a hand-held pose: from the elements themselves,
             # then measured again. See layoutval.anchor.
