@@ -2185,6 +2185,8 @@ label.shoot.off{background:#3A4650;color:#9DADB5;pointer-events:none}
 .camrow{display:flex;gap:8px;align-items:center;margin:8px 0 10px;font-size:12.5px;color:#8B9AA3}
 .camrow select{flex:1;min-width:0;background:#0F1518;color:#E3EAE8;border:1px solid #2B373D;
                border-radius:8px;padding:8px;font-size:13px}
+.camrow input[type=range]{flex:1;min-width:0;accent-color:#2F7D57}
+#camexpv{min-width:7.5em;text-align:right}
 button.wide{display:block;width:100%;margin-top:8px}
 button.ghost.live{background:#1D5B8A;border-color:#3E8FD0}
 </style>
@@ -2235,6 +2237,12 @@ button.ghost.live{background:#1D5B8A;border-color:#3E8FD0}
       <select id="camsel" aria-label="Camera"></select>
       <span id="camres"></span>
     </div>
+    <div class="camrow" id="exprow" style="display:none">
+      <label for="camexp">Exposure</label>
+      <input id="camexp" type="range" min="0" max="1000" step="1"
+             title="Darker to the left. Double-click: back to the camera's own choice.">
+      <span id="camexpv"></span>
+    </div>
   </div>
   <label class="shoot" id="shootLabel" for="shot">Take photo</label>
   <input id="shot" type="file" accept="image/*" capture="environment">
@@ -2278,7 +2286,7 @@ const $ = id => document.getElementById(id);
 // This computer's own webcam, instead of a phone. Browsers only hand a page a
 // camera on a secure origin, which http://localhost is and a LAN address is
 // not -- so on a phone the option never shows.
-let CAM = null, AUTO = null, LOCKED = null;
+let CAM = null, AUTO = null, LOCKED = null, LOCK_WANT = {}, EXPO = null;
 const CAN_CAM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 const WANT_CAM = new URLSearchParams(location.search).get("cam") === "1";
 const SHOOT = () => CAM ? "Capture from webcam" : "Take photo";
@@ -2608,8 +2616,11 @@ async function startCam(id) {
   $("camsel").value = st.deviceId || "";
   $("camres").textContent = `${st.width || v.videoWidth} \u00d7 ${st.height || v.videoHeight}`;
   LOCKED = null;
+  LOCK_WANT = {};
+  EXPO = null;
   paintSteps();
   const stream = CAM;
+  await restoreExposure();
   setTimeout(() => lockCam(stream), 2500);
 }
 
@@ -2635,11 +2646,110 @@ async function lockCam(stream) {
   }
   LOCKED = "";
   if (names.length) {
-    try { await track.applyConstraints({advanced: [want]}); LOCKED = names.join(", "); }
+    try { await track.applyConstraints({advanced: [want]}); LOCKED = names.join(", "); LOCK_WANT = want; }
     catch (e) { LOCKED = ""; }
   }
+  setupExposure();
   paintCam();
 }
+
+// Exposure by hand. On the camera's own choice a cluster's white strokes on
+// black can come out clipped, and a clipped stroke has lost the edges an
+// element's place is found on. The slider sets the exposure time where the
+// camera allows it (else its exposure compensation), shows it in stops from
+// what the camera chose, and is remembered for this camera. The same exposure
+// then holds for every capture: set it before the reference and leave it.
+let EXPO_BUSY = false, EXPO_NEXT = null;
+function expoKey() {
+  const st = CAM ? CAM.getVideoTracks()[0].getSettings() : {};
+  return "layoutval.exposure." + (st.deviceId || "");
+}
+function expoRange(track) {
+  let caps = {}, st = {};
+  try { caps = track.getCapabilities ? track.getCapabilities() : {}; st = track.getSettings(); } catch (e) {}
+  const ok = r => r && typeof r.min === "number" && typeof r.max === "number" && r.max > r.min;
+  if (ok(caps.exposureTime) && Array.isArray(caps.exposureMode) && caps.exposureMode.includes("manual")
+      && typeof st.exposureTime === "number")
+    return {key: "exposureTime", min: caps.exposureTime.min, max: caps.exposureTime.max,
+            step: caps.exposureTime.step || 0, now: st.exposureTime};
+  if (ok(caps.exposureCompensation) && typeof st.exposureCompensation === "number")
+    return {key: "exposureCompensation", min: caps.exposureCompensation.min,
+            max: caps.exposureCompensation.max, step: caps.exposureCompensation.step || 0,
+            now: st.exposureCompensation};
+  return null;
+}
+function expoSaved(key) {
+  try {
+    const s = JSON.parse(localStorage.getItem(expoKey()) || "null");
+    return s && s.key === key ? s : null;
+  } catch (e) { return null; }
+}
+// Exposure time on a log scale -- each step of the slider the same fraction
+// darker -- and compensation, already in stops, on a straight one.
+function expoFrom(pos) {
+  const e = EXPO, lo = e.key === "exposureTime" ? Math.max(e.min, e.max / 1000, 1e-6) : e.min;
+  let v = e.key === "exposureTime" ? lo * Math.pow(e.max / lo, pos / 1000) : lo + (e.max - lo) * pos / 1000;
+  if (e.step > 0) v = e.min + Math.round((v - e.min) / e.step) * e.step;
+  return Math.min(e.max, Math.max(e.min, v));
+}
+function expoTo(v) {
+  const e = EXPO, lo = e.key === "exposureTime" ? Math.max(e.min, e.max / 1000, 1e-6) : e.min;
+  const f = e.key === "exposureTime" ? Math.log(Math.max(v, lo) / lo) / Math.log(e.max / lo)
+                                     : (v - lo) / (e.max - lo);
+  return Math.round(1000 * Math.min(1, Math.max(0, f)));
+}
+function expoLabel(v) {
+  const e = EXPO;
+  const stops = e.key === "exposureTime" ? Math.log2(v / e.auto) : v - e.auto;
+  return Math.abs(stops) < 0.05 ? "camera's own"
+       : (stops < 0 ? "\u2212" : "+") + Math.abs(stops).toFixed(1) + (Math.abs(stops) < 1.05 ? " stop" : " stops");
+}
+async function applyExposure(v) {
+  if (EXPO_BUSY) { EXPO_NEXT = v; return; }
+  const track = CAM && CAM.getVideoTracks()[0];
+  if (!track || !EXPO) return;
+  EXPO_BUSY = true;
+  const want = EXPO.key === "exposureTime" ? {exposureMode: "manual", exposureTime: v}
+                                           : {exposureCompensation: v};
+  // With whatever else is locked, so changing the exposure frees nothing.
+  try { await track.applyConstraints({advanced: [{...LOCK_WANT, ...want}]}); LOCK_WANT = {...LOCK_WANT, ...want}; }
+  catch (e) { /* the camera keeps what it had */ }
+  try { localStorage.setItem(expoKey(), JSON.stringify({key: EXPO.key, value: v, auto: EXPO.auto})); }
+  catch (e) { /* private window */ }
+  EXPO_BUSY = false;
+  if (EXPO_NEXT !== null) { const n = EXPO_NEXT; EXPO_NEXT = null; await applyExposure(n); }
+}
+// At start, before the camera settles: the exposure this camera was last given.
+async function restoreExposure() {
+  const track = CAM && CAM.getVideoTracks()[0];
+  const r = track && expoRange(track);
+  const s = r && expoSaved(r.key);
+  if (!s) return;
+  const want = r.key === "exposureTime" ? {exposureMode: "manual", exposureTime: s.value}
+                                        : {exposureCompensation: s.value};
+  try { await track.applyConstraints({advanced: [want]}); } catch (e) { /* left automatic */ }
+}
+function setupExposure() {
+  const track = CAM && CAM.getVideoTracks()[0];
+  const r = track && expoRange(track);
+  if (!r) { EXPO = false; return; }
+  const s = expoSaved(r.key);
+  EXPO = {...r, auto: s ? s.auto : r.now};
+  $("camexp").value = expoTo(r.now);
+  $("camexpv").textContent = expoLabel(r.now);
+}
+$("camexp").addEventListener("input", () => {
+  if (!EXPO) return;
+  const v = expoFrom(+$("camexp").value);
+  $("camexpv").textContent = expoLabel(v);
+  applyExposure(v);
+});
+$("camexp").addEventListener("dblclick", () => {
+  if (!EXPO) return;
+  $("camexp").value = expoTo(EXPO.auto);
+  $("camexpv").textContent = expoLabel(EXPO.auto);
+  applyExposure(EXPO.auto);
+});
 function stopCam() {
   stopAuto();
   if (CAM) CAM.getTracks().forEach(t => t.stop());
@@ -2648,6 +2758,11 @@ function stopCam() {
 function paintCam() {
   if (AUTO && (action !== "intrinsics" || !CAM)) stopAuto();
   $("camwrap").style.display = CAM ? "block" : "none";
+  // The slider once the camera has settled; a line saying why not, where it cannot.
+  $("exprow").style.display = CAM && EXPO !== null ? "flex" : "none";
+  $("camexp").style.display = EXPO ? "" : "none";
+  if (CAM && EXPO === false)
+    $("camexpv").textContent = "not adjustable in this browser or on this camera \u2014 Chrome and Edge can, on most USB webcams";
   $("camtoggle").style.display = CAN_CAM ? "block" : "none";
   $("camtoggle").textContent = CAM ? "Use a photo file instead" : "Use this computer's webcam";
   $("camauto").style.display = CAM && action === "intrinsics" ? "block" : "none";

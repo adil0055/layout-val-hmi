@@ -37,5 +37,6 @@ def test_the_page_offers_the_webcam_at_a_localhost_address(tmp_path):
             f"http://localhost:{port}/?t={server.token}&cam=1", timeout=10).read().decode()
         assert "getUserMedia" in page and 'id="camtoggle"' in page
         assert 'id="camauto"' in page                  # hands-free lens views
+        assert 'id="camexp"' in page and "exposureTime" in page   # the exposure slider
     finally:
         server.shutdown()

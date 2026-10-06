@@ -39,7 +39,16 @@ webcam**: each capture is the mean of 8 frames, which takes most of a
 webcam's noise out. Once the webcam has settled, the page fixes its exposure,
 white balance and focus for every capture after (Chrome can on most USB
 webcams; the page says what it locked, or that it could not), so it does not
-re-meter or re-focus between two shots of the same screen. Keep the mouse
+re-meter or re-focus between two shots of the same screen. Then an
+**Exposure** slider appears under the preview: drag it left when the
+cluster's white text and needles come out blown-out, since a clipped stroke
+has lost the edges its position is measured on. It shows stops from the
+camera's own choice, double-click puts it back, and it is remembered for that
+webcam. Set it before the Reference and leave it for Validate. It needs a
+browser and webcam that allow it (Chrome or Edge, most USB webcams); Firefox
+does not, and the page says so. A phone's photo is taken by its own camera
+app, so on a phone use that app's exposure control instead (on an iPhone, tap
+the screen and drag the sun down). Keep the mouse
 pointer off the screen under test, and anything that changes on its own --
 a clock, a media progress bar -- reads as a change. The lens step is hands-free: show the ChArUco board on your
 phone (or a print), hold it in front of the webcam and turn on **Hands-free lens

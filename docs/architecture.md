@@ -435,10 +435,14 @@ is REVIEW and says how close to come: on that laptop, 13-14 degrees round
 allowance -- a camera that stayed put, or moved a little -- none of this
 applies.
 
-The page also fixes the webcam's exposure, white balance and focus once it
-has settled (2.5 s after it starts), where the browser and camera allow it --
+The page also fixes the webcam's exposure, white balance and focus once it has
+settled (2.5 s after it starts), where the browser and camera allow it --
 Chrome does, on most USB webcams -- and says which it locked, or that it could
-not.
+not. Then an exposure slider sets the exposure time by hand where the camera
+allows it (else its exposure compensation), on a log scale shown in stops from
+the camera's own choice, with whatever else is locked kept locked; it is
+remembered per webcam and re-applied when the camera opens, so reference and
+validate are taken alike.
 
 `--edges` (`edgecheck.py`) measures what the re-solve cannot: the drawing
 against the display's edges. The edges are proposed in the reference; at
