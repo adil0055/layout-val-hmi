@@ -56,6 +56,34 @@ Options: `--device cpu` works without a GPU but takes tens of seconds a
 photograph; `--fp32` turns off bfloat16 on older cards; `SAM3_TOKEN` can hold
 the token instead of `--token`.
 
+## When it does not start
+
+**`TypeError: expected str, bytes or os.PathLike object, not NoneType`**, from
+`pkg_resources` in `model_builder.py`: `sam3_server.py` was saved in the folder
+the repository was cloned into, beside the clone's `sam3` folder, and Python
+took that folder for the package. The server now steps round it; an older copy
+works once moved to a folder of its own.
+
+**`CUDA initialization: ... Error 804: forward compatibility was attempted on
+non supported HW`**, then `SAM 3 ready on cpu`: PyTorch cannot use the GPU, and
+SAM 3 runs on the CPU, many times slower. The CUDA driver library PyTorch
+loaded is the forward-compatibility one (the `cuda-compat` package), which only
+data-centre GPUs accept. Check:
+
+```bash
+nvidia-smi                                   # driver version, and the CUDA it supports
+echo $LD_LIBRARY_PATH                        # a .../cuda-*/compat entry here is the culprit
+ldconfig -p | grep libcuda.so                # should be the driver's, not .../compat/
+dpkg -l | grep -i cuda-compat                # the package, if installed
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+Take the `compat` folder out of `LD_LIBRARY_PATH` (look in `~/.bashrc`), or
+remove the package (`sudo apt remove cuda-compat-12-*`), then open a new
+terminal. If `nvidia-smi` itself fails, the driver is not loaded: reboot after
+a driver update. A driver older than 525 is too old for any CUDA 12 build of
+PyTorch, and needs updating.
+
 ## Licence
 
 SAM 3's code and weights are under Meta's SAM License: royalty-free, and the

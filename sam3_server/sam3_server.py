@@ -51,6 +51,22 @@ DEFAULT_THRESHOLD = 0.4
 DEFAULT_MAX = 5
 
 
+def _skip_clone_beside_script() -> None:
+    """Keep a SAM 3 clone that sits beside this file from shadowing the installed package.
+
+    Saved in the folder the repository was cloned into, this file has a folder
+    named ``sam3`` next to it -- the clone, which has no ``__init__.py`` -- and
+    Python looks in this file's folder first. ``sam3`` was then imported as an
+    empty namespace package, its submodules still found through the editable
+    install, and SAM 3 failed loading its tokenizer: "expected str, bytes or
+    os.PathLike object, not NoneType", from pkg_resources.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    clone = os.path.join(here, "sam3")
+    if os.path.isdir(clone) and not os.path.isfile(os.path.join(clone, "__init__.py")):
+        sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.curdir) != here]
+
+
 class Sam3Segmenter:
     """SAM 3 itself: one model, loaded once, asked one photograph at a time."""
 
@@ -59,12 +75,17 @@ class Sam3Segmenter:
         # Imported here, not at the top, so the HTTP part of this file can be
         # tested on a computer without PyTorch.
         import torch
+        _skip_clone_beside_script()
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
 
         self.torch = torch
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cpu":
+                print(f"  no usable GPU: PyTorch {torch.__version__} (CUDA "
+                      f"{torch.version.cuda or 'none'}) cannot use one here, so SAM 3 "
+                      "runs on the CPU, many times slower. Check nvidia-smi.", flush=True)
         self.device = device
         if device == "cuda":
             # TF32 on Ampere and later: faster, and nothing here needs more.
