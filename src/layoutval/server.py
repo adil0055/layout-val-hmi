@@ -45,6 +45,7 @@ secure context.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import secrets
 import socket
@@ -67,7 +68,7 @@ import numpy as np
 from layoutval.anchor import (ROUGH_PX, can_anchor, element_correction, far_correction,
                               far_votes, rough_correction)
 from layoutval.autoprofile import profile_from_reference
-from layoutval import edgecheck, glare
+from layoutval import edgecheck, glare, sam3client
 from layoutval.blur import match_shake
 from layoutval.capture import to_gray
 from layoutval.displayfind import propose_display_corners
@@ -125,8 +126,10 @@ ACTIONS = ("intrinsics", "calibrate", "propose", "corners", "rebind",
 
 #: How the display is located, as the phone offers them. ``manual``: tap the
 #: four corners. ``auto``: the corners are proposed and you confirm or drag
-#: them. ``chessboard``: the cluster draws its calibration pattern.
-CALIBRATION_MODES = ("manual", "auto", "chessboard")
+#: them. ``chessboard``: the cluster draws its calibration pattern. ``sam3``:
+#: SAM 3, on another computer, finds the screen from a text prompt -- any
+#: shape -- and the corners are proposed from its outline (layoutval.sam3client).
+CALIBRATION_MODES = ("manual", "auto", "chessboard", "sam3")
 
 #: Views wanted before the intrinsics solve is attempted. A calibration solved
 #: from three near-identical views is worse than none, because it looks fine.
@@ -437,8 +440,21 @@ class CaptureSession:
         edge_check: bool = False,
         size_from_phone: bool = False,
         board_from_size: bool = False,
+        sam3_url: str | None = None,
+        sam3_token: str | None = None,
+        sam3_prompt: str | None = None,
     ) -> None:
         self.lock = threading.Lock()
+        #: A SAM 3 service on another computer (sam3_server/), for the sam3
+        #: mode; None and the mode is not offered.
+        self.sam3_url = (sam3_url or "").strip() or None
+        self.sam3_token = sam3_token or None
+        self.sam3_prompt = (sam3_prompt or "").strip() or sam3client.DEFAULT_PROMPT
+        #: The prompt last used, so the reference asks for the same thing.
+        self._sam3_asked = self.sam3_prompt
+        #: The last SAM 3 proposal: (photograph's fingerprint, shape), so the
+        #: corners confirmed for that photograph know what shape they came from.
+        self._sam3_last: tuple[str, str] | None = None
         #: The cluster's resolution is typed in on the phone, and nothing runs
         #: until it is. It is not read from anywhere: the computer running this
         #: is not the cluster, and its own screen says nothing about one.
@@ -547,7 +563,7 @@ class CaptureSession:
 
     def available_modes(self) -> dict[str, bool]:
         """Which modes this session can offer, and why one might not be."""
-        return {
+        modes = {
             "manual": True,
             "auto": True,
             # The chessboard needs the exact corners the cluster drew: from its
@@ -557,18 +573,27 @@ class CaptureSession:
             "chessboard": (self.display_points is not None or bool(self.board_candidates)
                            or self.board_from_size),
         }
+        if self.sam3_url is not None:
+            # A computer running sam3_server/, named with --sam3-url. Not
+            # listed at all without one, so the page does not offer it.
+            modes["sam3"] = True
+        return modes
 
     def set_mode(self, mode: str) -> None:
         if mode not in CALIBRATION_MODES:
             raise ValueError(f"unknown mode {mode!r}; one of {', '.join(CALIBRATION_MODES)}")
-        if not self.available_modes()[mode]:
+        if not self.available_modes().get(mode, False):
+            if mode == "sam3":
+                raise ValueError(
+                    "SAM 3 mode needs the SAM 3 server running on the GPU computer -- "
+                    "start with `layoutval go --sam3-url http://<that computer>:8765`")
             raise ValueError(
                 "chessboard mode needs the board the cluster exports -- start "
                 "with `layoutval go --board board.json`")
         with self.lock:
             switching = bool(self.calib_mode) and mode != self.calib_mode
             self.calib_mode = mode
-            self.mark_corners = mode in ("manual", "auto")
+            self.mark_corners = mode in ("manual", "auto", "sam3")
             self.aperture = False
             self.display_size = (self.board_display_size or self.display_size
                                  if mode == "chessboard" else self.corner_display_size)
@@ -652,6 +677,7 @@ class CaptureSession:
             "calibrates_from": self._calibrates_from(),
             "mode": self.calib_mode,
             "modes": self.available_modes() if self.calib_mode else {},
+            "sam3_prompt": self.sam3_prompt if self.sam3_url else None,
             "charuco": self.charuco_spec.to_dict() if self.charuco_spec else None,
             "anchor_bound": self.charuco_anchor is not None,
             "has_intrinsics": bool(
@@ -698,7 +724,8 @@ class CaptureSession:
         if self.calib_mode:
             return {"manual": "corners you mark",
                     "auto": "corners found automatically",
-                    "chessboard": "the cluster's chessboard"}[self.calib_mode]
+                    "chessboard": "the cluster's chessboard",
+                    "sam3": "the screen SAM 3 finds"}[self.calib_mode]
         if self.mark_corners:
             return "corners you mark"
         if self.aperture:
@@ -722,7 +749,8 @@ class CaptureSession:
     # -- actions ------------------------------------------------------------
 
     def handle(self, action: str, data: bytes,
-               corners: list[list[float]] | None = None) -> CaptureRecord:
+               corners: list[list[float]] | None = None,
+               prompt: str | None = None) -> CaptureRecord:
         frame = decode_upload(data)
         stamp = datetime.now().strftime("%H%M%S")
         base = f"{stamp}-{action}"
@@ -748,7 +776,7 @@ class CaptureSession:
         if action == "propose":
             # Read-only: nothing about the session changes until the dots are
             # confirmed and come back as "corners".
-            return self._propose(frame, base)
+            return self._propose(frame, base, prompt=prompt)
         with self.lock:
             if action == "corners":
                 return self._record(self._calibrate_corners(frame, base, corners))
@@ -1267,10 +1295,13 @@ class CaptureSession:
         self.reference_edges = self.screen_mask = None
         return rec
 
-    def _propose(self, frame: np.ndarray, base: str) -> CaptureRecord:
+    def _propose(self, frame: np.ndarray, base: str,
+                 prompt: str | None = None) -> CaptureRecord:
         """Proposed display corners, for the phone to show as draggable dots."""
         rec = CaptureRecord(name=f"{base}.jpg", action="propose",
                             when=datetime.now().isoformat(timespec="seconds"))
+        if self.calib_mode == "sam3" and self.sam3_url:
+            return self._propose_sam3(frame, base, rec, prompt)
         intrinsics = self.calibration.intrinsics if self.calibration else None
         # The resolution typed in says what shape the screen is, which picks it
         # out from the panels a cluster draws inside it.
@@ -1299,6 +1330,57 @@ class CaptureSession:
                       "then use them." if not proposal.confident else
                       "found the display. Use these corners, or drag to adjust.")
         rec.proposal = proposal.to_dict(frame.shape)
+        return rec
+
+    def _propose_sam3(self, frame: np.ndarray, base: str, rec: CaptureRecord,
+                      prompt: str | None) -> CaptureRecord:
+        """Display corners from the screen SAM 3 finds for ``prompt``, any shape.
+
+        Asked on the undistorted frame, where a flat screen's sides are
+        straight, and the dots go back in the raw photograph's pixels, as the
+        automatic proposal's do. Nothing is kept but which shape it was, for the
+        corners confirmed on this same photograph.
+        """
+        asked = " ".join((prompt or "").split())[:200] or self.sam3_prompt
+        intrinsics = self.calibration.intrinsics if self.calibration else None
+        undistorter = Undistorter(intrinsics) if intrinsics is not None else None
+        seen = undistorter(frame) if undistorter is not None else frame
+        try:
+            found = sam3client.segment(seen, self.sam3_url, asked, token=self.sam3_token)
+        except sam3client.Sam3Error as exc:
+            rec.verdict = "FAILED"
+            rec.detail = f"{exc}. Tap the four corners instead."
+            return rec
+        pick = sam3client.best(found)
+        shape = sam3client.fit_display(pick.mask, self.corner_display_size) if pick else None
+        if shape is None:
+            rec.verdict = "FAILED"
+            rec.detail = (f"SAM 3 found nothing it calls \"{asked}\" -- describe the "
+                          "screen another way, or tap its four corners.")
+            return rec
+        self._store(f"{base}-sam3.jpg", sam3client.draw(seen, shape))
+        if undistorter is not None:
+            shape.corners = _distort_points(shape.corners, intrinsics, undistorter.new_K)
+            shape.outline = _distort_points(shape.outline, intrinsics, undistorter.new_K)
+        with self.lock:
+            self._sam3_asked = asked
+            self._sam3_last = (_fingerprint(frame), shape.kind)
+        rec.verdict = "OK"
+        rec.detail = {
+            "rect": "SAM 3 found the screen. Use these corners, or drag to adjust.",
+            "round": ("SAM 3 found a round screen. The dots are the corners of the "
+                      "square its picture is drawn in, taken upright -- a circle "
+                      "does not show which way is up, so drag them if the camera "
+                      "is turned."),
+            "other": ("SAM 3 found the screen, but it is neither four-sided nor "
+                      "round. The dots are the box round it -- set them on the "
+                      "corners of its picture."),
+        }[shape.kind]
+        if shape.kind == "rect" and not shape.confident:
+            rec.detail = ("SAM 3 found the screen. Check the dots, drag any that "
+                          "are off, then use them.")
+        rec.proposal = {**shape.to_dict(frame.shape),
+                        "score": round(pick.score, 3), "prompt": asked}
         return rec
 
     def _calibrate_corners(
@@ -1331,9 +1413,17 @@ class CaptureSession:
                 self.calibration.intrinsics.dist, P=undistorter.new_K,
             ).reshape(-1, 2)
 
+        # What SAM 3 found on this photograph, if it was SAM 3 that proposed
+        # these dots. A round screen has no straight edge to snap them to: the
+        # corners are where its outline put them.
+        sam3_kind = None
+        if self.calib_mode == "sam3" and self._sam3_last is not None \
+                and self._sam3_last[0] == _fingerprint(frame):
+            sam3_kind = self._sam3_last[1]
         try:
             geometry = homography_from_marked_corners(
                 undistorted, points, display_size=self.corner_display_size,
+                refine=sam3_kind in (None, "rect"),
                 inset_px=self.display_inset_px,
             )
         except RuntimeError as exc:
@@ -1343,6 +1433,19 @@ class CaptureSession:
 
         self._store(rec.name.replace(".jpg", "-corners.jpg"),
                     draw_aperture(undistorted, geometry.corners))
+        if sam3_kind is not None:
+            self._commit_geometry(geometry, f"phone capture, the screen SAM 3 found ({sam3_kind})")
+            rec.verdict = "OK"
+            rec.detail = "display located from the screen SAM 3 found. Next: Reference."
+            if sam3_kind != "rect":
+                rec.detail += (
+                    " It is not four-sided, so the corners are as SAM 3's outline "
+                    "and your dots put them -- check "
+                    + rec.name.replace(".jpg", "-corners.jpg"))
+            ratio = geometry.sampling_ratio()
+            if ratio < 2.0:
+                rec.detail += f" (sampling {ratio:.1f} -- move closer for finer work)"
+            return rec
         self._commit_geometry(geometry, "phone capture, corners marked by hand")
         rec.verdict = "OK"
         rec.detail = "display located from your four corners. Next: Reference."
@@ -1510,9 +1613,19 @@ class CaptureSession:
                 )
         # Elements are found on the frame with its reflections taken off, or a
         # reflection's edge is found as an element and its hill merges real ones.
+        # In SAM 3 mode the screen is its own outline: a round screen is not
+        # its corners.
+        outline, note = None, ""
+        if self.calib_mode == "sam3" and self.sam3_url:
+            outline, note = self._sam3_screen(undistorted)
         segment_from = self.reference
         if self.deglare and self.reference.ndim == 3:
-            self.glare_bright = glare.bright_on_dark(self.reference)
+            # Night theme or day, judged on the screen alone where its outline
+            # is known: a round screen's framebuffer corners are black bezel,
+            # and enough of them read a night theme as a day one -- and then a
+            # plain block that moved was taken for a reflection and lost.
+            self.glare_bright = glare.bright_on_dark(
+                self.reference if outline is None else self.reference[outline][None])
             segment_from, _ = glare.flatten(self.reference, bright=self.glare_bright)
         # What the camera actually saw, in display space. Corners placed past
         # the edge of the photograph leave empty border in the rectified frame,
@@ -1520,7 +1633,11 @@ class CaptureSession:
         # segments like an element and cannot be measured.
         seen = self._coverage(frame.shape)
         # And only the screen, where corners were set a little past it.
-        self.screen_mask = self._find_screen(undistorted)
+        self.screen_mask = outline
+        if note:
+            rec.detail += f". {note}"
+        if self.screen_mask is None:
+            self.screen_mask = self._find_screen(undistorted)
         if self.screen_mask is not None:
             seen = seen & self.screen_mask
         outside = _outside(self._coverage(frame.shape))
@@ -1997,6 +2114,39 @@ class CaptureSession:
             return None
         return mask > 0
 
+    def _sam3_screen(self, undistorted: np.ndarray) -> tuple[np.ndarray | None, str]:
+        """The screen in display space as SAM 3 outlines it, and a note if not.
+
+        Asked again on the reference itself, for the same thing the corners
+        were found with, and the mask most over the calibrated display is
+        taken. Only ever narrows the area checked: it is applied inside the
+        corners, never past them.
+        """
+        geometry = self.calibration.geometry
+        dw, dh = geometry.display_size
+        h, w = undistorted.shape[:2]
+        quad = cv2.perspectiveTransform(
+            np.array([[0, 0], [dw, 0], [dw, dh], [0, dh]], np.float64).reshape(-1, 1, 2),
+            geometry.H).reshape(-1, 2)
+        near = np.zeros((h, w), np.uint8)
+        cv2.fillConvexPoly(near, np.round(quad).astype(np.int32), 1)
+        try:
+            found = sam3client.segment(undistorted, self.sam3_url, self._sam3_asked,
+                                       token=self.sam3_token)
+        except sam3client.Sam3Error as exc:
+            return None, f"{exc}, so the whole of the corners is checked"
+        pick = sam3client.best(found, near=near > 0)
+        if pick is None:
+            return None, "SAM 3 found no screen in this photo, so the whole of the corners is checked"
+        mask = sam3client.display_mask(pick.mask, geometry.H, (dw, dh))
+        share = float(mask.mean())
+        if share > 0.995:
+            return None, ""                     # the screen fills the corners
+        if share < 0.30:
+            return None, ("SAM 3's screen does not fit the corners, so the whole "
+                          "of the corners is checked")
+        return mask, ""
+
     def _reference_seen(self) -> np.ndarray:
         if self.reference_camera is None:
             return np.ones(self.reference.shape[:2], bool)
@@ -2337,6 +2487,7 @@ td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
 .stat{display:flex;justify-content:space-between;font-size:13px;color:#9DADB5;padding:3px 0}
 .stat b{color:#E3EAE8;font-weight:600;font-variant-numeric:tabular-nums}
 .modes{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px}
+.modes.four{grid-template-columns:repeat(4,1fr)}
 .modes button{background:#1E272C;color:#C2CED6;border:1px solid #2B373D;border-radius:9px;
               padding:10px 4px;font-size:13px;font-weight:600;-webkit-tap-highlight-color:transparent}
 .modes button.on{background:#1D5B8A;border-color:#3E8FD0;color:#fff}
@@ -2383,8 +2534,19 @@ button.ghost.live{background:#1D5B8A;border-color:#3E8FD0}
   <button data-m="auto">Auto corners</button>
   <button data-m="manual">Tap corners</button>
   <button data-m="chessboard">Chessboard</button>
+  <button data-m="sam3" style="display:none">SAM 3</button>
 </div>
 <div class="hint" id="modehint" style="margin:-6px 0 12px"></div>
+
+<div class="card" id="sam3card" style="display:none">
+  <b>What SAM 3 looks for</b> <span style="color:#8B9AA3;font-size:12.5px">optional</span>
+  <div class="sizerow">
+    <input id="sam3prompt" type="text" maxlength="200" autocomplete="off"
+           style="font-variant-numeric:normal" placeholder="display screen">
+  </div>
+  <div class="hint">A few words naming the screen, e.g. <i>round instrument cluster</i>.
+    Empty asks for the default.</div>
+</div>
 
 <div class="steps" id="steps">
   <div class="step" data-a="corners"><b>1 Corners</b><span>tap the display</span></div>
@@ -2477,6 +2639,8 @@ function paintSteps() {
     rebind: "Only needed if the bezel sticker was moved or reprinted. Needs the markers and the calibration screen together again.",
     corners: MODE === "auto"
       ? "Shoot the whole screen with a margin round it. The corners are found for you \u2014 check them, drag any that are off. Once per camera position."
+      : MODE === "sam3"
+      ? "Shoot the whole screen with a margin round it. SAM 3 finds it, any shape, and places the corners \u2014 check them, drag any that are off. Once per camera position."
       : "Shoot the cluster, then tap its four corners on the photo. Rough taps are fine \u2014 the edges get snapped to the panel. Once per camera position.",
     intrinsics: "Shoot the board from a different angle each time, and put it in every part of the frame \u2014 each corner and each edge, not only the middle. The lens bends most at the edges, and it is only measured where the board has been."
   };
@@ -2553,17 +2717,30 @@ function paintSize() {
 function paintModes() {
   const bar = $("modebar");
   bar.style.display = MODE ? "grid" : "none";
+  // SAM 3 is only offered when layoutval was started with a SAM 3 computer.
+  const sam3 = MODES.sam3 === true;
+  bar.classList.toggle("four", sam3);
+  document.querySelector('.modes [data-m="sam3"]').style.display = sam3 ? "" : "none";
   document.querySelectorAll(".modes button").forEach(b => {
     b.classList.toggle("on", b.dataset.m === MODE);
     b.disabled = MODES[b.dataset.m] === false;
   });
+  $("sam3card").style.display = MODE === "sam3" ? "block" : "none";
   $("modehint").textContent = !MODE ? "" : {
     auto: "The corners are found for you. Check the dots, drag any that are off.",
     manual: "You tap the four corners of the screen on the photo.",
-    chessboard: "The cluster shows its chessboard for one shot."
+    chessboard: "The cluster shows its chessboard for one shot.",
+    sam3: "SAM 3 finds the screen from a few words \u2014 round or any shape \u2014 and places the corners. Check the dots, drag any that are off."
   }[MODE] + (MODES.chessboard === false && MODE !== "chessboard"
       ? " (Chessboard needs --board.)" : "");
 }
+
+// The prompt is kept on this phone, so it is typed once.
+function sam3Prompt() { return $("sam3prompt").value.trim(); }
+try { $("sam3prompt").value = localStorage.getItem("lv-sam3-prompt") || ""; } catch (e) {}
+$("sam3prompt").addEventListener("input", () => {
+  try { localStorage.setItem("lv-sam3-prompt", sam3Prompt()); } catch (e) {}
+});
 
 async function refresh() {
   try {
@@ -2585,9 +2762,10 @@ async function refresh() {
     $("rebindRow").style.display = (BEZEL && ANCHORED) ? "grid" : "none";
     $("introw").style.display = s.uses_intrinsics ? "grid" : "none";
     MODE = s.mode || ""; MODES = s.modes || {};
+    if (s.sam3_prompt) $("sam3prompt").placeholder = s.sam3_prompt;
     paintModes();
     document.querySelector('[data-a="corners"] span').textContent =
-      MODE === "auto" ? "find the display" : "tap the display";
+      MODE === "auto" ? "find the display" : MODE === "sam3" ? "SAM 3 finds it" : "tap the display";
     const byHand = MODE ? MODE !== "chessboard"
                         : s.calibrates_from === "corners you mark";
     document.querySelector('[data-a="corners"]').style.display = byHand ? "" : "none";
@@ -2621,13 +2799,23 @@ async function refresh() {
 }
 
 // --- marking the display's corners by hand -------------------------------
-let taps = [], pending = null;
+let taps = [], pending = null, outline = null, found = "";
 
 function paintTaps() {
   const cv = $("markcv"), img = $("markimg");
   cv.width = img.clientWidth; cv.height = img.clientHeight;
   const g = cv.getContext("2d");
   g.clearRect(0, 0, cv.width, cv.height);
+  if (outline && outline.length > 2) {
+    // The screen's own outline as SAM 3 found it, for checking the dots against.
+    g.save(); g.setLineDash([6, 5]); g.strokeStyle = "#E39A3B"; g.lineWidth = 2;
+    g.beginPath();
+    outline.forEach((t, i) => {
+      const x = t[0] * cv.width, y = t[1] * cv.height;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.closePath(); g.stroke(); g.restore();
+  }
   g.strokeStyle = "#4FB584"; g.fillStyle = "#4FB584"; g.lineWidth = 2;
   taps.forEach((t, i) => {
     const x = t[0] * cv.width, y = t[1] * cv.height;
@@ -2646,6 +2834,8 @@ function paintTaps() {
   }
   $("markhint").textContent = taps.length < 4
     ? `corner ${taps.length + 1} of 4 \u2014 go round the display, any direction`
+    : found && found !== "rect"
+    ? "Press and drag a dot to move it. They are the corners of the box the screen's picture is drawn in, round the dashed outline \u2014 not snapped, so place them with care."
     : "Press and drag a dot to move it. Close is fine \u2014 the edges get snapped to the panel.";
   $("marksend").disabled = taps.length !== 4;
 }
@@ -2698,7 +2888,7 @@ $("marksend").onclick = async () => {
   }
   $("marksend").textContent = "Use these corners";
   $("marker").style.display = "none";
-  taps = []; pending = null;
+  taps = []; pending = null; outline = null; found = "";
   refresh();
 };
 
@@ -2714,24 +2904,32 @@ async function useShot(file) {
     // Nothing is calibrated until the corners are confirmed, so the photograph
     // is shown here and held until then. In auto mode the laptop proposes the
     // dots first; they arrive already placed, and are dragged like any other.
-    pending = file; taps = [];
+    pending = file; taps = []; outline = null; found = "";
     $("markimg").onload = paintTaps;
     $("markimg").src = URL.createObjectURL(file);
     $("marker").style.display = "block";
     $("result").style.display = "none";
     $("marktitle").textContent = MODE === "auto" ? "Finding the display\u2026"
+                               : MODE === "sam3" ? "Asking SAM 3\u2026"
                                                  : "Tap the four corners of the display";
-    if (MODE === "auto") {
+    if (MODE === "auto" || MODE === "sam3") {
       const body = new FormData();
       body.append("action", "propose");
       body.append("image", file, file.name || "capture.jpg");
+      if (MODE === "sam3" && sam3Prompt()) body.append("prompt", sam3Prompt());
       try {
         const r = await fetch(`/upload?t=${TOKEN}`, { method: "POST", body });
         const res = await r.json();
-        if (res.proposal && pending === file) { taps = res.proposal.corners; }
+        if (res.proposal && pending === file) {
+          taps = res.proposal.corners; outline = res.proposal.outline || null;
+          found = res.proposal.shape || "";
+        }
         $("marktitle").textContent = res.proposal
-          ? (res.proposal.confident ? "Found it \u2014 drag a dot if it's off"
-                                    : "Check these \u2014 drag any dot that's off")
+          ? (MODE === "sam3" && res.proposal.shape !== "rect"
+              ? `SAM 3 found a ${res.proposal.shape === "round" ? "round" : "shaped"} screen \u2014 check the dots`
+              : res.proposal.confident ? "Found it \u2014 drag a dot if it's off"
+                                       : "Check these \u2014 drag any dot that's off")
+          : MODE === "sam3" && res.detail ? res.detail
           : "Couldn't find it \u2014 tap the four corners";
       } catch (e) {
         $("marktitle").textContent = "Couldn't reach the computer \u2014 tap the corners";
@@ -3234,7 +3432,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            action, image, corners = _parse_multipart(
+            action, image, corners, prompt = _parse_multipart(
                 self.rfile.read(length), self.headers.get("Content-Type", "")
             )
         except ValueError as exc:
@@ -3258,7 +3456,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # phone displayed the photograph at.
                 shape = decode_upload(image).shape
                 pixels = [[x * shape[1], y * shape[0]] for x, y in corners]
-            record = self.session.handle(action, image, corners=pixels)
+            record = self.session.handle(action, image, corners=pixels, prompt=prompt)
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"verdict": "FAILED", "detail": str(exc)})
             return
@@ -3286,6 +3484,12 @@ def _outside(seen: np.ndarray, *, allow: float = 0.01) -> str:
         "top": seen[:bh, :].mean(), "bottom": seen[-bh:, :].mean(),
     }
     return f"{100 * missing:.0f}% of the display, mostly on the {min(sides, key=sides.get)},"
+
+
+def _fingerprint(frame: np.ndarray) -> str:
+    """Which photograph this is: the same upload decodes to the same pixels."""
+    return hashlib.blake2b(np.ascontiguousarray(frame[::7, ::7]).tobytes(),
+                           digest_size=16).hexdigest()
 
 
 def _distort_points(points: np.ndarray, intrinsics: Any, new_k: np.ndarray) -> np.ndarray:
@@ -3368,8 +3572,8 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
 
 def _parse_multipart(
     body: bytes, content_type: str
-) -> tuple[str, bytes, list[list[float]] | None]:
-    """Pull the action and the image out of a browser form post.
+) -> tuple[str, bytes, list[list[float]] | None, str | None]:
+    """Pull the action, the image, any corners and any prompt out of a browser form post.
 
     Through :mod:`email` rather than by hand: multipart boundaries inside
     binary image data are a classic way to get a hand-rolled parser to hand
@@ -3380,7 +3584,7 @@ def _parse_multipart(
     message = BytesParser(policy=default_policy).parsebytes(
         b"Content-Type: " + content_type.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + body
     )
-    action, image, corners = "", b"", None
+    action, image, corners, prompt = "", b"", None, None
     for part in message.iter_parts():
         name = part.get_param("name", header="content-disposition")
         payload = part.get_payload(decode=True) or b""
@@ -3398,9 +3602,12 @@ def _parse_multipart(
                 corners = pts if len(pts) == 4 else None
             except (ValueError, TypeError):
                 corners = None
+        elif name == "prompt":
+            # What SAM 3 is to look for; empty means the default.
+            prompt = payload.decode("utf-8", "replace").strip()[:200] or None
     if not image:
         raise ValueError("no image in the upload")
-    return action, image, corners
+    return action, image, corners, prompt
 
 
 class CaptureServer(ThreadingHTTPServer):

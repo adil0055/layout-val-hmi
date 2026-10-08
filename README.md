@@ -69,6 +69,7 @@ any time:
 | **Auto corners** (default) | shoot the cluster; four dots appear on its corners. Drag one if it is off, then confirm |
 | **Tap corners** | tap the four corners yourself |
 | **Chessboard** | put the cluster on its calibration screen and shoot it. No file needed: the resolution you typed in says which board the HMI draws |
+| **SAM 3** (with `--sam3-url`) | shoot the cluster; SAM 3 finds the screen from a few words — round or any shape — and places the dots. Optionally type what to look for |
 
 Both corner modes ask the cluster for nothing, and either way the dots are
 snapped to the real panel edge sub-pixel, so rough is fine. Auto corners uses
@@ -79,6 +80,27 @@ Switching mode
 starts calibration over — the new mode maps into a different display space — but
 keeps the lens solve. `--auto-border` keeps the older fully automatic border
 fit, which needs a clean scene.
+
+**SAM 3 mode** runs Meta's SAM 3 on another computer with a GPU and asks it
+for the screen by name (`display screen` unless you type something else on the
+page, e.g. `round instrument cluster`). Its outline gives the corners: four
+straight sides are snapped to the panel edge like tapped corners; a round or
+oval screen gets the corners of the square its picture is drawn in, and only
+the circle is inventoried and compared. Put `sam3_server/` on the GPU computer
+(see [its README](sam3_server/README.md)), then:
+
+```bash
+layoutval go --sam3-url http://<gpu-computer>:8765 --sam3-token <secret>
+```
+
+SAM 3 only proposes the dots; you confirm them, and nothing learned runs while
+measuring. If the GPU computer cannot be reached the page says so and you can
+tap the corners. A circle does not show which way is up or how far the camera
+is off square, so for a round screen keep the camera square on and upright, or
+drag the dots; the same mapping serves the reference and every validation, so
+what it gets wrong cancels between them. The SAM 3 weights are under Meta's SAM
+License (not an OSI licence; check it for your use) and stay on the GPU
+computer -- layoutval only talks to it over HTTP.
 
 Which to use is about what the cluster can be asked to do, not which is better
 in the abstract. `--board` is the more reliable of the two on a desk, because a

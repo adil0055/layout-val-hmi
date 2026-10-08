@@ -97,6 +97,14 @@ residual.py  repeatability.py  linearity.py  types.py  profile.py
 
 Adding a module to the measurement path means adding it to that list.
 
+SAM 3 mode (§5, route F) follows the same line. The model runs on another
+computer (`sam3_server/`); `sam3client.py` only sends it a photograph over HTTP
+and fits a shape to the mask that comes back. What it produces is four
+*proposed* corners that a person confirms, exactly like `displayfind.py`'s, and
+a screen outline that narrows which part of display space is inventoried. It
+never measures an element and is never consulted during validation, and
+`tests/test_sam3.py` asserts the client imports no model.
+
 ---
 
 ## 4. The six stages
@@ -194,10 +202,12 @@ comparison against a design, where `inset_px` takes the mask width.
 ### Route F, and proposing its corners
 
 Route F takes four rough corner points and snaps each side to the real panel
-edge sub-pixel. Where the points come from is a separate question with three
+edge sub-pixel. Where the points come from is a separate question with four
 answers, and the phone can switch between them at any time (§11): a person taps
 them, `displayfind.py` proposes them and a person confirms, or route A replaces
-the lot when the cluster can draw its board.
+the lot when the cluster can draw its board. A fourth, with `--sam3-url`: SAM 3
+segments the screen named by a text prompt and `sam3client.py` fits its outline
+(see "SAM 3 mode" below).
 
 `propose_display_corners` exists because the hard part of route E on a bench
 photograph is not accuracy but *which rectangle*: a laptop on a desk offers the
@@ -251,6 +261,38 @@ bowed the edges and the corners landed 29-34 px off, far enough for route F's
 snap to refuse them. Accepted unchanged, the proposal now snaps to within
 0.03 px of route E's border fit. It is deterministic line geometry and sits on
 the measurement path under the same no-learned-models test as everything else.
+
+### SAM 3 mode: any shape of screen
+
+The corner routes look for four straight edges; a round cluster has none. With
+`--sam3-url`, the photograph and a prompt (`display screen` by default, or what
+was typed on the page) go to `sam3_server/sam3_server.py` on a GPU computer,
+and the mask comes back. `sam3client.fit_display` decides what it is:
+
+- **Four-sided** when the quadrilateral fitted to it covers it to IoU 0.97:
+  each side a Huber line through the middle 76% of that side of the outline
+  (rounded corners do not pull it), corners where the lines meet. Then route F
+  snaps them to the panel edge as it does tapped ones.
+- **Round or oval** when its fitted ellipse covers it to 0.97: the framebuffer
+  is taken as the square the round picture is inscribed in, mapped by the
+  symmetric affine map from that circle to the ellipse. Not snapped -- there is
+  no straight edge. A circle cannot say which way is up, nor, under
+  perspective, exactly where its centre is (about r² tan(tilt) / distance off:
+  10 px for a 600 px radius 3° off square), so the camera is assumed upright
+  and square on; the dots can be dragged. The mapping is the same for the
+  reference and every validation, so its error cancels in the comparison.
+- **Anything else**: the smallest rotated rectangle round it, shown as needing
+  checking.
+
+At Reference, SAM 3 is asked again on the reference photograph, the mask most
+over the calibrated display is taken through H into display space and, less a
+thin rim, becomes the screen: for a round cluster the framebuffer's corners are
+bezel and nothing there is inventoried or compared. Night or day theme is then
+judged inside that outline only -- judged on the whole framebuffer, the black
+corners round a circle read a night theme as a day one, and the glare step took
+a plain block that moved 20 px for a reflection and passed it. If the GPU
+computer is unreachable, the page says so and the corners can be tapped; the
+reference falls back to the usual screen search.
 
 ### Drift
 
@@ -695,7 +737,9 @@ Actions, in the order a rig needs them:
 | `validate` | measure against that reference and answer |
 
 **Modes.** `POST /mode` switches between `auto` (proposed corners), `manual`
-(tapped corners) and `chessboard`, live. The corner modes map into the screen's
+(tapped corners), `chessboard` and, when started with `--sam3-url`, `sam3`
+(corners from the screen SAM 3 finds; the page then shows an optional prompt
+box, sent as the `prompt` field with `propose`), live. The corner modes map into the screen's
 full resolution and the chessboard into the board's canvas, so a switch is a
 different display space: it starts calibration over, drops the reference and a
 discovered inventory, and keeps the lens solve, which belongs to the camera.
@@ -982,6 +1026,7 @@ src/layoutval/
 ├── capture.py        stage 1: frames, median stacking, settling detection
 ├── calibration.py    stages 2–3: intrinsics, six homography routes, drift
 ├── displayfind.py    proposes the display's corners from an ordinary photograph
+├── sam3client.py     SAM 3 mode: the screen from a text prompt, any shape (HTTP only)
 ├── edgecheck.py      --edges: the whole layout against the display's own edges
 ├── anchor.py         the hand-held pose, finished on the elements themselves
 ├── viewpoint.py      how far round the camera went, and what that alone can shift

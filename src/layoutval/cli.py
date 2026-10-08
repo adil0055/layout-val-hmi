@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -373,7 +374,11 @@ def cmd_go(args: argparse.Namespace) -> int:
         args.aperture, args.mark_corners, args.calib_mode = True, False, ""
     else:
         args.aperture, args.mark_corners = False, True
-        args.calib_mode = args.mode or ("chessboard" if using_board else "auto")
+        args.calib_mode = args.mode or ("chessboard" if using_board else
+                                        "sam3" if args.sam3_url else "auto")
+        if args.calib_mode == "sam3" and not args.sam3_url:
+            raise SystemExit("error: --mode sam3 needs the SAM 3 computer: "
+                             "--sam3-url http://<that computer>:8765")
     # The cluster's resolution is typed in on the phone, never read from this
     # computer: in use, this computer is not the cluster.
     args.display_size = None
@@ -404,11 +409,38 @@ def cmd_go(args: argparse.Namespace) -> int:
         except Exception:
             lens = intrinsics
     print(f"resolution: enter it on the phone   lens: {lens}")
-    print("modes on the phone: auto corners, tap corners, chessboard")
+    print("modes on the phone: auto corners, tap corners, chessboard"
+          + (", SAM 3" if args.sam3_url else ""))
     if reused:
         print("Tap Intrinsics on the phone to re-shoot the lens.")
     print()
     return cmd_capture_server(args)
+
+
+def _report_sam3(url: str) -> None:
+    """Say at start whether the SAM 3 computer answers; never stops the server."""
+    from layoutval import sam3client
+
+    try:
+        info = sam3client.health(url, timeout=3.0)
+        print(f"SAM 3: {url} ready on {info.get('device', '?')}")
+    except sam3client.Sam3Error as exc:
+        print(f"SAM 3: {exc} -- start sam3_server.py there; the phone will "
+              "say so until it answers")
+
+
+def _sam3_args(c: argparse.ArgumentParser) -> None:
+    c.add_argument("--sam3-url", default=os.environ.get("LAYOUTVAL_SAM3_URL") or None,
+                   help="a computer running sam3_server/sam3_server.py, e.g. "
+                        "http://192.168.1.50:8765 (or set LAYOUTVAL_SAM3_URL). "
+                        "Adds SAM 3 mode on the phone: the screen is found from a "
+                        "text prompt, round or any shape")
+    c.add_argument("--sam3-token", default=os.environ.get("LAYOUTVAL_SAM3_TOKEN") or None,
+                   help="the --token that server was started with (or set "
+                        "LAYOUTVAL_SAM3_TOKEN)")
+    c.add_argument("--sam3-prompt", default=None,
+                   help="what SAM 3 looks for when the phone does not say; "
+                        "default 'display screen'")
 
 
 def cmd_capture_server(args: argparse.Namespace) -> int:
@@ -508,7 +540,8 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         charuco=charuco,
         aperture=args.aperture,
         mark_corners=args.mark_corners,
-        calib_mode=getattr(args, "calib_mode", ""),
+        calib_mode=(getattr(args, "calib_mode", "")
+                    or ("sam3" if getattr(args, "sam3_url", None) else "")),
         board_display_size=board_canvas,
         deglare=not getattr(args, "keep_glare", False),
         edge_check=getattr(args, "edges", False),
@@ -516,7 +549,12 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         board_from_size=getattr(args, "board_from_size", False),
         lens_board=lens_board,
         display_inset_px=tuple(args.display_inset),
+        sam3_url=getattr(args, "sam3_url", None),
+        sam3_token=getattr(args, "sam3_token", None),
+        sam3_prompt=getattr(args, "sam3_prompt", None),
     )
+    if getattr(args, "sam3_url", None):
+        _report_sam3(args.sam3_url)
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
 
     print()
@@ -705,9 +743,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "uses the chessboard the HMI draws instead of its "
                         "border -- more reliable on a desk, where the room is "
                         "full of rectangles, and it needs no lens solve")
-    c.add_argument("--mode", choices=("auto", "manual", "chessboard"),
+    c.add_argument("--mode", choices=("auto", "manual", "chessboard", "sam3"),
                    help="which mode the phone starts in; it can switch at any "
-                        "time. Default: chessboard with --board, else auto")
+                        "time. Default: chessboard with --board, sam3 with "
+                        "--sam3-url, else auto")
     c.add_argument("--auto-border", action="store_true",
                    help="find the display's border automatically instead of "
                         "tapping its corners. Needs a clean scene")
@@ -729,6 +768,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--edges", action="store_true",
                    help="also check the whole layout against the display's own "
                         "edges, which a hand-held camera cannot otherwise see")
+    _sam3_args(c)
     c.set_defaults(func=cmd_go)
 
     c = sub.add_parser(
@@ -806,6 +846,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--no-auto-profile", action="store_true",
                    help="without --profile, do not take an inventory from the "
                         "reference frame; refuse to validate instead")
+    _sam3_args(c)
     c.set_defaults(func=cmd_capture_server)
 
     c = sub.add_parser("demo", help="run the whole pipeline against the built-in simulator")
