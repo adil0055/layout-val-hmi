@@ -47,6 +47,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import secrets
 import socket
 import struct
@@ -69,6 +70,7 @@ from layoutval.anchor import (ROUGH_PX, can_anchor, element_correction, far_corr
                               far_votes, rough_correction)
 from layoutval.autoprofile import profile_from_reference
 from layoutval import edgecheck, glare, sam3client
+from layoutval import lamps as lampkit
 from layoutval.blur import match_shake
 from layoutval.capture import to_gray
 from layoutval.displayfind import propose_display_corners
@@ -122,7 +124,7 @@ COARSE_ITERATIONS = 60
 KEEP_WHOLE_PHOTO = 1.0
 
 ACTIONS = ("intrinsics", "calibrate", "propose", "corners", "rebind",
-           "reference", "validate")
+           "reference", "validate", "teach", "lamps")
 
 #: How the display is located, as the phone offers them. ``manual``: tap the
 #: four corners. ``auto``: the corners are proposed and you confirm or drag
@@ -391,6 +393,9 @@ class CaptureRecord:
     report: dict[str, Any] | None = None
     #: Proposed corners, for the phone to show as draggable dots.
     proposal: dict[str, Any] | None = None
+    #: Rows and a picture for the page, from a CAN teach-in or lamp check.
+    rows: list[dict[str, Any]] | None = None
+    overlay: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -443,8 +448,20 @@ class CaptureSession:
         sam3_url: str | None = None,
         sam3_token: str | None = None,
         sam3_prompt: str | None = None,
+        can: Any = None,
+        teach_plan: Any = None,
     ) -> None:
         self.lock = threading.Lock()
+        #: The CAN tester (layoutval.canbus.CanDriver) and what to switch on
+        #: with it (layoutval.lamps.TeachPlan): the CAN teach-in and lamp check.
+        self.can = can
+        self.plan = teach_plan
+        self.lamp_lib: Any = None
+        self.teach_summary: dict[str, Any] | None = None
+        self._teach_files: dict[str, dict[int, Path]] = {}
+        self._teach_rest: list[np.ndarray] = []
+        self._teach_sweeps: list[dict[str, Any]] | None = None
+        self._check: dict[str, Any] | None = None
         #: A SAM 3 service on another computer (sam3_server/), for the sam3
         #: mode; None and the mode is not offered.
         self.sam3_url = (sam3_url or "").strip() or None
@@ -697,6 +714,7 @@ class CaptureSession:
                 if self.calibration else None
             ),
             "captures": len(self.history),
+            "can": self._can_status(),
         }
 
     @property
@@ -750,7 +768,8 @@ class CaptureSession:
 
     def handle(self, action: str, data: bytes,
                corners: list[list[float]] | None = None,
-               prompt: str | None = None) -> CaptureRecord:
+               prompt: str | None = None,
+               step: str | None = None, shot: int = 0) -> CaptureRecord:
         frame = decode_upload(data)
         stamp = datetime.now().strftime("%H%M%S")
         base = f"{stamp}-{action}"
@@ -788,7 +807,280 @@ class CaptureSession:
                 return self._record(self._reference(frame, base))
             if action == "validate":
                 return self._record(self._validate(frame, base))
+            if action == "teach":
+                return self._teach_shot(frame, base, step, shot)
+            if action == "lamps":
+                return self._lamp_shot(frame, base, step, shot)
         raise ValueError(f"unknown action {action!r}")
+
+    # -- CAN: teach-in and lamp check ------------------------------------------
+    #
+    # The page drives these, because the webcam is the browser's: it asks for
+    # the plan, then for each step sets the CAN state here, waits, and uploads
+    # the step's shots one by one. See layoutval.lamps for what is learnt.
+
+    def _can_status(self) -> dict[str, Any] | None:
+        if self.can is None or self.plan is None:
+            return None
+        lib = self.lamp_lib
+        return {
+            "bus": getattr(self.can, "bus_spec", {}),
+            "plan": self.plan.path.name if self.plan.path else "",
+            "lamps_in_plan": len(self.plan.lamps),
+            "elements_in_plan": len(self.plan.elements),
+            "taught": lib is not None,
+            "lamps_learnt": len(lib.lamps) if lib is not None else 0,
+        }
+
+    def can_start(self, mode: str) -> dict[str, Any]:
+        """Begin a teach-in or a lamp check: the steps the page is to capture."""
+        if self.can is None or self.plan is None:
+            raise ValueError("no CAN here: start layoutval with --can and --teach-plan")
+        if not self.is_calibrated:
+            raise ValueError("do the Corners step first: the teach-in is measured on the display")
+        with self.lock:
+            if mode == "teach":
+                self._teach_files, self._teach_rest = {}, []
+                steps = self.plan.steps()
+            elif mode == "check":
+                if self.lamp_lib is None:
+                    raise ValueError("teach the lamps first")
+                self._check = {"results": {}, "frames": {}, "poses": {}, "pictures": {}}
+                steps = self.plan.check_steps()
+            else:
+                raise ValueError(f"unknown mode {mode!r}")
+        return {"mode": mode, "steps": steps}
+
+    def can_state(self, step_id: str, mode: str = "teach") -> dict[str, Any]:
+        """Put the step's signals on the bus; everything else at rest."""
+        step = self._plan_step(step_id, mode)
+        self.can.apply(step["set"])
+        return {"ok": True, "step": step}
+
+    def _plan_step(self, step_id: str | None, mode: str) -> dict[str, Any]:
+        if self.plan is None:
+            raise ValueError("no teach plan")
+        steps = self.plan.steps() if mode == "teach" else self.plan.check_steps()
+        for s in steps:
+            if s["id"] == step_id:
+                return s
+        raise ValueError(f"no step {step_id!r} in the {mode} plan")
+
+    def _teach_shot(self, frame: np.ndarray, base: str, step_id: str | None,
+                    shot: int) -> CaptureRecord:
+        rec = CaptureRecord(name=f"{base}.jpg", action="teach",
+                            when=datetime.now().isoformat(timespec="seconds"))
+        step = self._plan_step(step_id, "teach")
+        if not self.is_calibrated:
+            rec.verdict, rec.detail = "FAILED", "do the Corners step first"
+            return rec
+        undistorted = self._undistort(frame)
+        display = self.calibration.geometry.rectify(undistorted)
+        folder = self.out_dir / "teach"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{step['id']}-{int(shot)}.png"
+        cv2.imwrite(str(path), display)
+        self._teach_files.setdefault(step["id"], {})[int(shot)] = path
+        if step["id"] == "rest":
+            # The rest screen is also the reference, taken as Reference takes it.
+            self._teach_rest.append(frame)
+        rec.verdict = "OK"
+        rec.detail = f"{step['name']}: shot {int(shot) + 1} of {step['shots']}"
+        return rec
+
+    def can_finish(self, mode: str) -> CaptureRecord:
+        """Learn from a teach-in, or sum up a lamp check; the bus goes back to rest."""
+        try:
+            with self.lock:
+                if mode == "teach":
+                    return self._record(self._teach_finish())
+                if mode == "check":
+                    return self._record(self._check_finish())
+                if mode == "abort":
+                    # Stopped part way: nothing is learnt or concluded.
+                    self._teach_files, self._teach_rest, self._check = {}, [], None
+                    return CaptureRecord(name="abort", action="abort", verdict="OK",
+                                         detail="stopped; the bus is back at rest",
+                                         when=datetime.now().isoformat(timespec="seconds"))
+                raise ValueError(f"unknown mode {mode!r}")
+        finally:
+            if self.can is not None:
+                self.can.rest()
+
+    def _teach_finish(self) -> CaptureRecord:
+        stamp = datetime.now().strftime("%H%M%S")
+        base = f"{stamp}-teach"
+        rec = CaptureRecord(name=f"{base}.jpg", action="teach",
+                            when=datetime.now().isoformat(timespec="seconds"))
+        steps = self.plan.steps()
+        missing = [s["name"] for s in steps if s["id"] not in self._teach_files]
+        if "rest" not in self._teach_files or not self._teach_rest:
+            rec.verdict, rec.detail = "FAILED", "the rest screen was not captured"
+            return rec
+        captured = _ShotFiles(self._teach_files)
+        lib, summary = lampkit.learn(self.plan, captured)
+        sweeps = summary.pop("_sweeps")
+        if missing:
+            summary["problems"].insert(0, f"not captured: {', '.join(missing)}")
+        # The rest screen becomes the reference, and its elements are named
+        # after whatever sweep changes them.
+        rest = np.median(np.stack(self._teach_rest), axis=0).astype(np.uint8) \
+            if len(self._teach_rest) > 1 else self._teach_rest[0]
+        self._teach_sweeps = sweeps
+        ref = self._reference(rest, base)
+        self._record(ref)
+        names = {spec.id: ("unknown" if spec.id.startswith("unknown@")
+                           else spec.id.rstrip("0123456789").rstrip())
+                 for spec in (self.profile or [])}
+        self.lamp_lib = lib
+        self.teach_summary = summary
+        folder = self.out_dir / "teach"
+        lib.save(folder)
+        named = sorted({n for n in names.values() if n != "unknown"})
+        unknown = sum(1 for n in names.values() if n == "unknown")
+        summary["elements_named"] = sorted(n for n in names if not n.startswith("unknown@"))
+        summary["elements_unknown"] = sorted(n for n in names if n.startswith("unknown@"))
+        (folder / "teach.json").write_text(json.dumps(summary, indent=2))
+        # Pictures: every lamp where it lit with all of them on, and every
+        # element of the rest screen, named or unknown.
+        picture = captured.get("all", captured.get("rest"))[0]
+        if "all" in captured:
+            stack = np.max(np.stack(captured["all"]), axis=0)
+            picture = stack
+            found = lib.find(captured["all"])
+        else:
+            found = []
+        lamps_png = f"{base}-lamps.png"
+        self._store(lamps_png, lampkit.draw_lamps(picture, found))
+        elements_png = f"{base}-elements.png"
+        if self.profile is not None:
+            self._store(elements_png, lampkit.draw_elements(self.reference, self.profile))
+        rows = [{"id": lamp.name, "verdict": "PASS",
+                 "detail": f"{lampkit.hue_name(lamp.hue)}{', flashes' if lamp.blinks else ''} "
+                           f"at {lamp.centre[0]:.0f},{lamp.centre[1]:.0f}"
+                           + ("" if lamp.slot_all is not None or len(lib.lamps) < 2
+                              else " (not lit with the others)")}
+                for lamp in lib.lamps]
+        rows += [{"id": n, "verdict": "PASS", "detail": "element"} for n in named]
+        rows += [{"id": p.split(":")[0], "verdict": "REVIEW", "detail": p}
+                 for p in summary["problems"]]
+        taught = len(lib.lamps)
+        rec.verdict = "OK" if taught == len(self.plan.lamps) else "REVIEW"
+        rec.detail = (
+            f"{taught} of {len(self.plan.lamps)} lamps learnt by their symbol"
+            + (f", {sum(1 for l in lib.lamps if l.slot_all is not None)} lit together"
+               if "all" in captured else "")
+            + f"; {len(names)} elements on the rest screen: {len(names) - unknown} named "
+              f"({', '.join(named[:8])}{'...' if len(named) > 8 else ''}), {unknown} unknown. "
+              f"Saved in {folder.name}/.")
+        rec.rows = rows
+        rec.overlay = lamps_png
+        return rec
+
+    def _name_elements(self) -> dict[str, str]:
+        """Name the auto inventory after the teach-in's sweeps: element id -> name."""
+        if not self._teach_sweeps or self.profile is None or not self._profile_is_auto:
+            return {}
+        names = lampkit.name_elements(self.profile, self._teach_sweeps)
+        mapping = lampkit.rename(self.profile, names)
+        return {mapping[old]: name for old, name in names.items()}
+
+    def _lamps_in_validate(self, report: RunReport, undistorted: np.ndarray,
+                           H: np.ndarray) -> None:
+        """Lamps lit in a validation shot, which the bus has all off between runs."""
+        display = self.calibration.geometry.rectify(undistorted, H)
+        found = self.lamp_lib.find([display])
+        report.metadata["lamps_lit"] = [d.to_dict() for d in found]
+        lit = [d.name for d in found if d.name != "unknown"]
+        if lit:
+            report.flag("lamps_lit", severity="fail", lamps=lit,
+                        detail=f"lit though every lamp's signal is off: {', '.join(lit)}")
+
+    def _lamp_shot(self, frame: np.ndarray, base: str, step_id: str | None,
+                   shot: int) -> CaptureRecord:
+        rec = CaptureRecord(name=f"{base}.jpg", action="lamps",
+                            when=datetime.now().isoformat(timespec="seconds"))
+        if self._check is None or self.lamp_lib is None:
+            rec.verdict, rec.detail = "FAILED", "start the lamp check first"
+            return rec
+        step = self._plan_step(step_id, "check")
+        undistorted = self._undistort(frame)
+        H = self._check["poses"].get(step["id"])
+        if H is None:
+            # A webcam knocked a little since the teach-in is followed by the
+            # screen's outline; further than that, it is measured where it was.
+            held = self._held_pose(undistorted) if self.reference_camera is not None else None
+            H = held[0] if held is not None else self.calibration.geometry.H
+            self._check["poses"][step["id"]] = H
+        display = self.calibration.geometry.rectify(undistorted, H)
+        shots = self._check["frames"].setdefault(step["id"], [])
+        shots.append(display)
+        rec.verdict = "OK"
+        rec.detail = f"{step['name']}: shot {len(shots)} of {step['shots']}"
+        if len(shots) < step["shots"]:
+            return rec
+        lib = self.lamp_lib
+        found = lib.find(shots)
+        if step["kind"] == "lamp":
+            expected, where = [step["name"]], "alone"
+        elif step["kind"] == "all":
+            expected, where = [l.name for l in lib.lamps if l.slot_all is not None], "all"
+        else:
+            expected, where = [], ""
+        tol = self.profile.defaults if self.profile is not None else None
+        results = lampkit.check(lib, found, expected, where=where,
+                                tol_warn=tol.tol_warn if tol else 1.5,
+                                tol_fail=tol.tol_fail if tol else 2.5)
+        self._check["results"][step["id"]] = (step, results)
+        if step["kind"] == "all" or lampkit.verdict(results) != "PASS":
+            self._check["pictures"][step["id"]] = lampkit.draw_lamps(
+                np.max(np.stack(shots), axis=0), found, results)
+        del self._check["frames"][step["id"]]
+        verdict = lampkit.verdict(results)
+        rec.verdict = verdict
+        rec.detail = f"{step['name']}: {verdict}" + "".join(
+            f"; {r.name} {r.reason}" for r in results if r.verdict != "PASS")
+        return rec
+
+    def _check_finish(self) -> CaptureRecord:
+        stamp = datetime.now().strftime("%H%M%S")
+        base = f"{stamp}-lamps"
+        rec = CaptureRecord(name=f"{base}.jpg", action="lamps",
+                            when=datetime.now().isoformat(timespec="seconds"))
+        if not self._check or not self._check["results"]:
+            rec.verdict, rec.detail = "FAILED", "no lamp step was captured"
+            return rec
+        steps = []
+        rows = []
+        verdicts = []
+        for step_id, (step, results) in self._check["results"].items():
+            v = lampkit.verdict(results)
+            verdicts.append(v)
+            steps.append({"step": step["name"], "verdict": v,
+                          "lamps": [r.to_dict() for r in results]})
+            for r in results:
+                if r.verdict == "PASS":
+                    continue
+                where = "" if step["kind"] == "lamp" and r.name == step["name"] else \
+                    f" (with {step['name']} on)" if step["kind"] == "lamp" else f" ({step['name']})"
+                off = f"{math.hypot(r.dx, r.dy):.2f} px " if r.dx is not None else ""
+                rows.append({"id": r.name, "verdict": r.verdict,
+                             "detail": f"{off}{r.reason}{where}".strip()})
+        verdict = min(verdicts, key=lambda v: {"FAIL": 0, "REVIEW": 1, "PASS": 2}[v])
+        passed = sum(1 for v in verdicts if v == "PASS")
+        (self.out_dir / f"{base}.json").write_text(json.dumps(
+            {"verdict": verdict, "steps": steps}, indent=2))
+        picture = self._check["pictures"].get("all")
+        if picture is None and self._check["pictures"]:
+            picture = next(iter(self._check["pictures"].values()))
+        if picture is not None:
+            self._store(f"{base}-overlay.png", picture)
+            rec.overlay = f"{base}-overlay.png"
+        rec.verdict = verdict
+        rec.detail = f"{passed} of {len(verdicts)} lamp states as expected. Saved as {base}.json."
+        rec.rows = rows[:60]
+        self._check = None
+        return rec
 
     # -- the bezel board ----------------------------------------------------
 
@@ -1660,6 +1952,10 @@ class CaptureSession:
             )
             self.profile = found
             self._profile_is_auto = True
+            if self._teach_sweeps:
+                # Taught over CAN: the elements keep their names when the
+                # reference is taken again from the same place.
+                self._name_elements()
             rec.detail += (
                 f". No layout profile was loaded, so {len(found)} element(s) were "
                 "found in this frame and will be measured against it. That answers "
@@ -2424,6 +2720,8 @@ class CaptureSession:
                            self.calibration.geometry.H, H, self._camera_matrix(undistorted.shape),
                            self.calibration.geometry.display_size,
                            tol_fail=self.profile.defaults.tol_fail)
+        if self.lamp_lib is not None and self.can is not None:
+            self._lamps_in_validate(report, undistorted, H)
         self._store(f"{base}-rectified.png", live)
 
         if self.edge_check and hand_held:
@@ -2553,6 +2851,16 @@ button.ghost.live{background:#1D5B8A;border-color:#3E8FD0}
   <div class="step" data-a="calibrate" style="display:none"><b>1 Calibrate</b><span>chessboard up</span></div>
   <div class="step" data-a="reference"><b>2 Reference</b><span>correct screen</span></div>
   <div class="step" data-a="validate"><b>3 Validate</b><span>screen under test</span></div>
+</div>
+
+<div class="card" id="cancard" style="display:none">
+  <b>Over CAN</b> <span id="canwhat" style="color:#8B9AA3;font-size:12.5px"></span>
+  <div style="display:flex;gap:8px;margin-top:10px">
+    <button id="canteach" class="ghost">Teach from CAN</button>
+    <button id="cancheck" class="ghost" disabled>Check lamps</button>
+  </div>
+  <button id="canstop" class="ghost wide" style="display:none">Stop</button>
+  <div class="hint" id="canhint"></div>
 </div>
 
 <div class="steps" id="introw" style="display:none;grid-template-columns:1fr">
@@ -2795,8 +3103,97 @@ async function refresh() {
     if (s.calibrated && !s.has_reference && (action === "calibrate" || action === "corners")) {
       action = "reference"; paintSteps();
     }
+    paintCan();
   } catch (e) { /* the laptop went away; the next poll will say so */ }
 }
+
+// --- over CAN: the teach-in and the lamp check ----------------------------
+// The webcam is this page's, so the page runs the sequence: for each step it
+// has the computer put the step's signals on the bus, waits for the cluster
+// to settle, and sends the step's shots. A flashing lamp's step has several
+// shots spread across its flash; each shot is a short mean of frames, so a
+// flash is caught rather than averaged away.
+const CAN_FRAMES = 2;
+let CAN_RUN = null;
+function paintCan() {
+  const c = STATUS && STATUS.can;
+  $("cancard").style.display = c ? "block" : "none";
+  if (!c || CAN_RUN) return;
+  $("canwhat").textContent = `${c.lamps_in_plan} lamps, ${c.elements_in_plan} elements · ` +
+    `${c.bus.interface || ""} ${c.bus.channel || ""}`;
+  const ready = !!CAM && STATUS.calibrated;
+  $("canteach").disabled = !ready;
+  $("cancheck").disabled = !ready || !c.taught;
+  $("canteach").textContent = c.taught ? "Teach again" : "Teach from CAN";
+  $("canhint").textContent = !CAM
+    ? "Needs this computer's webcam: the run takes a couple of hundred shots on its own. " +
+      "Open http://localhost:" + (location.port || "80") + "/?t=" + TOKEN + "&cam=1 here."
+    : !STATUS.calibrated ? "Do the Corners step first, with the webcam where it will stay."
+    : c.taught ? `${c.lamps_learnt} lamps learnt. Check lamps switches each on in turn, then all ` +
+                 "together, and says which were missing, misplaced, the wrong colour or unknown."
+    : "Switches every lamp on in turn, then all together, then drives each gauge and readout: " +
+      "learns each lamp's symbol and names what is on the screen. About four minutes. " +
+      "Leave the webcam and the room's light alone until it is done.";
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function canPost(what, body) {
+  const r = await fetch(`/can/${what}?t=${TOKEN}`, {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const s = await r.json();
+  if (!r.ok) throw new Error(s.detail || r.status);
+  return s;
+}
+async function canRun(mode) {
+  if (CAN_RUN) return;
+  CAN_RUN = {stop: false};
+  $("canteach").disabled = $("cancheck").disabled = true;
+  $("canstop").style.display = "block";
+  $("result").style.display = "none";
+  let failed = null;
+  try {
+    const plan = await canPost("start", {mode});
+    const steps = plan.steps;
+    for (let i = 0; i < steps.length && !CAN_RUN.stop; i++) {
+      const step = steps[i];
+      $("canhint").textContent = `${mode === "teach" ? "Teaching" : "Checking"} ` +
+        `${i + 1} of ${steps.length}: ${step.name}`;
+      await canPost("state", {step: step.id, mode});
+      await sleep(step.settle_ms);
+      for (let k = 0; k < step.shots && !CAN_RUN.stop; k++) {
+        const t0 = performance.now();
+        const file = await grab(CAN_FRAMES);
+        const body = new FormData();
+        body.append("action", mode === "teach" ? "teach" : "lamps");
+        body.append("image", file, file.name);
+        const r = await fetch(`/upload?t=${TOKEN}&step=${encodeURIComponent(step.id)}&shot=${k}`,
+                              {method: "POST", body});
+        const res = await r.json();
+        if (!r.ok || res.verdict === "FAILED") { failed = res; CAN_RUN.stop = true; break; }
+        const wait = step.gap_ms - (performance.now() - t0);
+        if (wait > 0) await sleep(wait);
+      }
+    }
+    if (failed) show(failed);
+    else if (CAN_RUN.stop) show({verdict: "FAILED", detail: "Stopped. Nothing was learnt from this run."});
+    else {
+      const res = await canPost("finish", {mode});
+      show(res);
+      // The teach-in's rest shot is the reference: on to Validate.
+      if (mode === "teach" && res.verdict !== "FAILED") { action = "validate"; paintSteps(); }
+    }
+  } catch (e) {
+    show({verdict: "FAILED", detail: String(e.message || e)});
+  }
+  if (failed || (CAN_RUN && CAN_RUN.stop)) {
+    try { await canPost("finish", {mode: "abort"}); } catch (e) { /* back to rest anyway */ }
+  }
+  CAN_RUN = null;
+  $("canstop").style.display = "none";
+  await refresh();
+}
+$("canteach").onclick = () => canRun("teach");
+$("cancheck").onclick = () => canRun("check");
+$("canstop").onclick = () => { if (CAN_RUN) CAN_RUN.stop = true; };
 
 // --- marking the display's corners by hand -------------------------------
 let taps = [], pending = null, outline = null, found = "";
@@ -3409,6 +3806,35 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"  resolution: {w} x {h}")
         self._json(HTTPStatus.OK, self.session.status())
 
+    def _can(self, what: str) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 4096:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"detail": "too large"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+            mode = str(body.get("mode", "teach"))
+            if what == "start":
+                payload = self.session.can_start(mode)
+            elif what == "state":
+                payload = self.session.can_state(str(body.get("step", "")), mode)
+            elif what == "finish":
+                record = self.session.can_finish(mode)
+                payload = _payload(record)
+                if not self.server.quiet:  # type: ignore[attr-defined]
+                    print(f"  {mode}: {record.verdict} — {record.detail}")
+            else:
+                self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
+                return
+        except (ValueError, AttributeError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"verdict": "FAILED", "detail": str(exc)})
+            return
+        except Exception as exc:  # a bench tool: report, do not take the server down
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                       {"verdict": "FAILED", "detail": f"{type(exc).__name__}: {exc}"})
+            return
+        self._json(HTTPStatus.OK, payload)
+
     def do_POST(self) -> None:  # noqa: N802
         url = urlparse(self.path)
         if not self._authorised(parse_qs(url.query)):
@@ -3419,6 +3845,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if url.path == "/size":
             self._set_size()
+            return
+        if url.path.startswith("/can/"):
+            self._can(url.path[len("/can/"):])
             return
         if url.path != "/upload":
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
@@ -3444,7 +3873,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         started = time.monotonic()
-        if not self.server.quiet:  # type: ignore[attr-defined]
+        # A CAN run uploads a couple of hundred shots: only what each lamp
+        # check step concluded is printed, not every shot.
+        burst = action in ("teach", "lamps")
+        if not self.server.quiet and not burst:  # type: ignore[attr-defined]
             # Printed before the work, so a request the phone gave up on still
             # shows here: nothing at all means it never arrived.
             print(f"  {action}: photo received ({length / 2**20:.1f} MB), working...",
@@ -3456,7 +3888,11 @@ class _Handler(BaseHTTPRequestHandler):
                 # phone displayed the photograph at.
                 shape = decode_upload(image).shape
                 pixels = [[x * shape[1], y * shape[0]] for x, y in corners]
-            record = self.session.handle(action, image, corners=pixels, prompt=prompt)
+            query = parse_qs(url.query)
+            step = (query.get("step") or [None])[0]
+            shot = int((query.get("shot") or ["0"])[0])
+            record = self.session.handle(action, image, corners=pixels, prompt=prompt,
+                                         step=step, shot=shot)
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"verdict": "FAILED", "detail": str(exc)})
             return
@@ -3467,9 +3903,26 @@ class _Handler(BaseHTTPRequestHandler):
 
         payload = _payload(record)
         payload["seconds"] = round(time.monotonic() - started, 2)
-        if not self.server.quiet:  # type: ignore[attr-defined]
+        if not self.server.quiet and (not burst or record.verdict not in ("OK",)):  # type: ignore[attr-defined]
             print(f"  {action}: {record.verdict} — {record.detail}")
         self._json(HTTPStatus.OK, payload)
+
+
+class _ShotFiles(dict):
+    """A teach-in's shots by step, read from disk when a step is asked for.
+
+    A teach-in is a couple of hundred rectified shots, near a gigabyte held
+    at once; learning looks at one step at a time.
+    """
+
+    def __init__(self, files: dict[str, dict[int, Path]]) -> None:
+        super().__init__({sid: [p for _, p in sorted(f.items())] for sid, f in files.items()})
+
+    def __getitem__(self, step_id: str) -> list[np.ndarray]:
+        return [cv2.imread(str(p)) for p in super().__getitem__(step_id)]
+
+    def get(self, step_id: str, default: Any = None) -> Any:
+        return self[step_id] if step_id in self else default
 
 
 def _outside(seen: np.ndarray, *, allow: float = 0.01) -> str:
@@ -3522,6 +3975,10 @@ def _payload(record: CaptureRecord) -> dict[str, Any]:
     }
     if record.proposal:
         out["proposal"] = record.proposal
+    if record.rows is not None:
+        out["rows"] = record.rows
+    if record.overlay:
+        out["overlay"] = record.overlay
     report = record.report
     if not report:
         return out

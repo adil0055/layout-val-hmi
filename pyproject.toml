@@ -20,6 +20,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
+# The CAN teach-in and lamp check (--can).
+can = ["python-can>=4.3", "cantools>=39", "msgpack>=1.0"]
 
 [project.scripts]
 layoutval = "layoutval.cli:main"

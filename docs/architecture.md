@@ -663,6 +663,75 @@ a bar's gradient fill does not. And it must keep 2% clear of the frame's edge,
 where the display's rim and a laptop's status icons live and a hand-held pose
 is least certain. Up to 200 elements are kept.
 
+### Teach-in over CAN: lamps by symbol, elements by sweep
+
+`canbus.py` is the tester's side of the bus: every signal of a DBC held and
+every message sent cyclically, as a vehicle network does, with a changed
+message sent at once. `lamps.py` runs a **teach plan** through it (the HMI's
+`can/teach_plan.json`): rest, each lamp alone, all lamps together, each
+readout swept through a few values. The server runs the plan from the page,
+because the webcam is the browser's: per step, set the bus, wait, upload the
+shots. Every shot is rectified with the calibration and saved, so a teach-in
+is a record as well as a result.
+
+What lit up is found as a **lit change** against the rest shot, not a
+difference: brightening, or taking on a lens colour (chroma weighted 1.4,
+because a dim red lamp on grey moves the colour far more than the value). A
+threshold below the rest screen's own variation -- the top of its difference
+with itself over five shots -- would find the camera's noise and the
+backlight's banding. Strokes a quarter of a symbol apart are one blob.
+
+**Lamps are kept by symbol.** The HMI's strip shows only lit lamps, centred,
+so all 31 lamps lit alone light in the same middle slot: where a lamp is says
+nothing about which it is. Each lamp's template is its lit change, from the
+shot it is brightest in -- judged in its own box: over the whole frame a
+camera's noise outweighed one small lamp, and two flashing lamps were learnt
+from a shot they were dark in. Reading a frame is template matching on its lit
+change, each lamp placed at most once, best first, and only where:
+
+- about as much light falls as the lamp gives (half to double): the
+  normalised score saturates over a nearly flat patch, and an empty corner of
+  the change map "matched" a lamp at 1.0;
+- no other lamp's symbol fits clearly better, even one placed elsewhere: a
+  flashing seat-belt lamp in its dark half otherwise settled on the airbag
+  lamp beside it;
+- no lamp's symbol fits clearly better in shape with only its colour wrong:
+  ABS drawn red is ABS in the wrong colour, not the red brake lamp its circle
+  resembles.
+
+The light bound is 0.3, not 0.5: a capture is a short mean of frames, and a
+flash that switches during one leaves the lamp half lit. Run end to end
+through the page, the browser's webcam and the HMI over CAN, every flashing
+lamp came back half lit in some shot, and at 0.5 each was "unknown" -- 7 of 33
+lamp states failed on a correct screen. And a flashing lamp dark in a shot can
+be read, at a clearly lower score, onto another lamp its symbol half fits --
+front fog, which the HMI draws over the gear letter -- so between shots, a
+lamp's readings away from its best one and clearly weaker are dropped as
+misreads; a reading elsewhere that matches as well means the lamp moved.
+
+Colour rules a match out when two hues differ by more than 18 (of OpenCV's
+180), and costs it 0.3 when one is white and the other coloured, so two lamps
+sharing a symbol in two colours (cruise set and ready) are told apart. Below
+0.82 a lit symbol is **unknown**, with the lamp it is nearest. Shots are read
+one at a time and then put together: a lamp lit in some and dark in others is
+flashing, and one whose place differs between them moved -- reading a stack of
+shots as one picture had shown two layouts on top of each other when the HMI's
+strip reflowed with every flash.
+
+**Elements are named by sweep.** An element of the rest screen belongs to a
+sweep when its own box changes in most of the sweep's states (12% of it at
+least): digits change in every state, while a needle crossing a scale numeral
+changes it in one at most. Names replace the auto inventory's ids
+(`Speed`, `Speed 2`, `unknown@312,75`) and are applied again whenever the
+reference is retaken.
+
+**Checking** compares what is lit with what was sent. Places are checked only
+in the states lamps were taught in -- alone, and all together, against each
+lamp's slot there -- because elsewhere the strip lays them out differently; in
+any state, the order along the strip is checked against the all-lit order,
+and only lamps outside the longest run in order are flagged, so two lamps
+swapped flag two, not the strip.
+
 ---
 
 ## 10. The residual check
@@ -1038,6 +1107,8 @@ src/layoutval/
 ├── residual.py       advisory: what you did not model
 ├── profile.py        the element inventory and its reference patches
 ├── teachin.py        differential teach-in against CAN signals
+├── canbus.py         the tester's side of a CAN bus: a DBC's signals, sent cyclically
+├── lamps.py          CAN teach-in: lamps by symbol, elements by sweep, and the lamp check
 ├── autoprofile.py    inventory from the reference frame, when none is authored
 ├── authoring.py      assisted annotation — the only place a model belongs
 ├── repeatability.py  σ, from a static screen

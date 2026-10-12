@@ -443,6 +443,60 @@ def _sam3_args(c: argparse.ArgumentParser) -> None:
                         "default 'display screen'")
 
 
+def _can_args(c: argparse.ArgumentParser) -> None:
+    c.add_argument("--can", nargs="?", const="udp_multicast", default=None, metavar="BUS",
+                   help="drive the cluster over CAN for the teach-in and lamp check: "
+                        "udp_multicast (default: virtual, over the network, no "
+                        "hardware), socketcan:vcan0, pcan:PCAN_USBBUS1@500000, ...")
+    c.add_argument("--teach-plan", default=None, metavar="FILE",
+                   help="what to switch on and what it is called, e.g. the HMI's "
+                        "can/teach_plan.json; needed with --can")
+    c.add_argument("--dbc", default=None, metavar="FILE",
+                   help="the CAN database; default the one the teach plan names")
+
+
+def _can_setup(args: argparse.Namespace):
+    """(driver, plan) for --can, or (None, None). Stops with a reason if it cannot start."""
+    if not getattr(args, "can", None):
+        if getattr(args, "teach_plan", None):
+            raise SystemExit("error: --teach-plan needs --can (the bus to drive the cluster on)")
+        return None, None
+    if not args.teach_plan:
+        raise SystemExit("error: --can needs --teach-plan: the HMI's can/teach_plan.json, "
+                         "or one written for this cluster")
+    from layoutval.lamps import TeachPlan
+
+    try:
+        plan = TeachPlan.load(args.teach_plan)
+    except (OSError, ValueError, KeyError) as exc:
+        raise SystemExit(f"error: --teach-plan {args.teach_plan}: {exc}")
+    dbc = Path(args.dbc) if args.dbc else plan.dbc
+    if dbc is None or not dbc.is_file():
+        raise SystemExit(f"error: no CAN database: {dbc or 'the plan names none'}; pass --dbc")
+    try:
+        from layoutval.canbus import CanDriver, CanError
+    except ImportError as exc:
+        raise SystemExit(f"error: --can needs python-can and cantools: {exc}")
+    try:
+        driver = CanDriver(dbc, args.can)
+    except ImportError as exc:
+        raise SystemExit(f"error: --can needs python-can, cantools and msgpack: {exc} "
+                         "(pip install 'layoutval[can]')")
+    except Exception as exc:
+        raise SystemExit(f"error: CAN bus {args.can!r}: {exc}")
+    try:
+        driver.check(plan.rest)
+        for step in plan.steps():
+            driver.check(step["set"])
+    except CanError as exc:
+        driver.close()
+        raise SystemExit(f"error: {Path(args.teach_plan).name}: {exc}")
+    print(f"CAN: {driver.bus_spec.get('interface')} {driver.bus_spec.get('channel', '')}".rstrip()
+          + f", {len(plan.lamps)} lamps and {len(plan.elements)} elements to teach "
+            f"from {Path(args.teach_plan).name}")
+    return driver, plan
+
+
 def cmd_capture_server(args: argparse.Namespace) -> int:
     from layoutval.server import (
         CaptureServer,
@@ -523,6 +577,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
                                      display_size=display_size),
         )
 
+    can_driver, teach_plan = _can_setup(args)
     session = CaptureSession(
         Path(args.out),
         profile=profile,
@@ -552,6 +607,8 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         sam3_url=getattr(args, "sam3_url", None),
         sam3_token=getattr(args, "sam3_token", None),
         sam3_prompt=getattr(args, "sam3_prompt", None),
+        can=can_driver,
+        teach_plan=teach_plan,
     )
     if getattr(args, "sam3_url", None):
         _report_sam3(args.sam3_url)
@@ -769,6 +826,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also check the whole layout against the display's own "
                         "edges, which a hand-held camera cannot otherwise see")
     _sam3_args(c)
+    _can_args(c)
     c.set_defaults(func=cmd_go)
 
     c = sub.add_parser(
@@ -847,6 +905,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="without --profile, do not take an inventory from the "
                         "reference frame; refuse to validate instead")
     _sam3_args(c)
+    _can_args(c)
     c.set_defaults(func=cmd_capture_server)
 
     c = sub.add_parser("demo", help="run the whole pipeline against the built-in simulator")
