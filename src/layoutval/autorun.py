@@ -835,7 +835,7 @@ class AutoRun:
             # Taught: testing is for when it is asked for (Test).
             sheet = None
             try:
-                sheet = self._element_pictures(None)
+                sheet = self._element_pictures(None, rows)
             except Exception:
                 self._log(traceback.format_exc())
             worst = _worst([r["verdict"] for r in rows])
@@ -850,8 +850,10 @@ class AutoRun:
             if sheet:
                 out["elements"] = sheet
             return out
-        elif s.lamp_lib is not None and bulb:
-            rows += self._bulb_test(s.lamp_lib, bulb)
+        elif s.lamp_lib is not None and can and (
+                bulb or any(lamp.slot_check is not None for lamp in s.lamp_lib.lamps)):
+            # Taught with a bulb check, tested without one seen is a fault too.
+            rows += self._bulb_test(s.lamp_lib, bulb, rest)
 
         # 5: lamp check.
         lib = s.lamp_lib
@@ -897,7 +899,7 @@ class AutoRun:
         rows.sort(key=lambda r: order.get(r["verdict"], 2))
         sheet = None
         try:
-            sheet = self._element_pictures(val)
+            sheet = self._element_pictures(val, rows)
         except Exception:                    # pictures are for people; never the verdict
             self._log(traceback.format_exc())
         out = self._finish(worst, detail, rows[:120], payload.get("overlay"))
@@ -1129,13 +1131,17 @@ class AutoRun:
 
         self._say("teach", "finding the bulb check in the start-up")
         run = np.median(np.stack([self._display(f) for f, _ in run_frames]), axis=0).astype(np.uint8)
+        recorded = len(startup)
+        span = round(startup[-1][0] - startup[0][0], 1) if len(startup) > 1 else 0.0
         if len(startup) > STARTUP_MAX:
             idx = np.linspace(0, len(startup) - 1, STARTUP_MAX).round().astype(int)
             startup = [startup[i] for i in idx]
         frames = [self._display(decode_upload(data)) for _, data in startup]
         floor, _ = L.noise_floor([self._display(f) for f, _ in run_frames])
         idx, counts = bulb_frames(run, frames, L._threshold(floor, L.LIT_MIN))
-        self.summary["bulb_check"] = {"frames": len(idx), "symbols": max(counts) if counts else 0}
+        self.summary["bulb_check"] = {
+            "frames": len(idx), "symbols": max(counts) if counts else 0, "counts": counts,
+            "startup_frames": recorded, "startup_s": span}
         picked = [frames[i] for i in idx]
         if picked:
             cv2.imwrite(str(self.folder / "bulb-check.png"),
@@ -1328,8 +1334,12 @@ class AutoRun:
                 "colour": L.hue_name(lamp.hue),
                 "img": picture(img, box, COLOURS.get(verdict, (200, 200, 200)))}
 
-    def _element_pictures(self, val) -> str | None:
-        """Every element and lamp cut out against its name: elements.html, elements/."""
+    def _element_pictures(self, val, rows: list[dict[str, Any]] = ()) -> str | None:
+        """Every element and lamp cut out against its name: elements.html, elements/.
+
+        Headed by what did not pass among ``rows``, with the bulb check's and
+        the lamp check's pictures when the run took them.
+        """
         from layoutval import elementsheet as E
 
         s = self.s
@@ -1366,7 +1376,15 @@ class AutoRun:
                               "detail": detail, "pictures": pics})
         if not items:
             return None
-        E.write(self.folder, items, f"Elements, {self.folder.name}")
+        problems = [r for r in rows if r.get("verdict") not in ("PASS", "OK", "TAUGHT")]
+        views = []
+        for name, label in (("bulb-check.png", "the bulb check, as taken from the start-up"),
+                            ("lamp-check.png", "the lamp check: all lamps, or a state that did not pass")):
+            path = self.folder / name
+            img = cv2.imread(str(path)) if path.is_file() else None
+            if img is not None:
+                views.append((label, img))
+        E.write(self.folder, items, f"Elements, {self.folder.name}", problems, views)
         return f"{self.folder.name}/elements.html"
 
     def _look_again(self, seconds: float = 2.5, keep: int = 12) -> list[np.ndarray]:
@@ -1415,9 +1433,17 @@ class AutoRun:
             mask |= _region_mask(shape, boxes)
         return mask
 
-    def _bulb_test(self, lib, bulb: list[np.ndarray]) -> list[dict[str, Any]]:
+    def _bulb_test(self, lib, bulb: list[np.ndarray],
+                   rest: list[np.ndarray]) -> list[dict[str, Any]]:
         """A later run's bulb check: every lamp lit, each in its place, nothing else."""
         from layoutval import lamps as L
+
+        if not bulb:
+            return self._no_bulb_check(0)
+        # What lit is measured against the rest screen of this power cycle --
+        # this camera, this mapping, this minute -- as the lamp check does,
+        # not against the teach-in's.
+        lib.baseline = np.median(np.stack(rest), axis=0).astype(np.uint8)
 
         # What sweeps through the bulb check (a needle, its readout) is no
         # lamp; and a lamp that is not part of it (a shift light the sweeping
@@ -1440,12 +1466,24 @@ class AutoRun:
         results = L.check(lib, found, expected, where="check")
         v = L.verdict(results)
         self.summary["bulb_check_test"] = v
+        lit = sum(r.found for r in results if r.expected)
+        if expected and lit == 0:
+            # Not one lamp: not 31 faults but one -- no bulb check seen.
+            return self._no_bulb_check(len(bulb))
         rows = [{"id": "Bulb check", "verdict": v,
-                 "detail": f"{sum(r.found for r in results if r.expected)} of {len(expected)} "
-                           "lamps lit at power-up"}]
+                 "detail": f"{lit} of {len(expected)} lamps lit at power-up"}]
         rows += [{"id": r.name, "verdict": r.verdict, "detail": f"{r.reason} (bulb check)"}
                  for r in results if r.verdict != "PASS"]
         return rows
+
+    def _no_bulb_check(self, picked: int) -> list[dict[str, Any]]:
+        seen = self.summary.get("bulb_check", {})
+        self.summary["bulb_check_test"] = "FAIL"
+        return [{"id": "Bulb check", "verdict": "FAIL",
+                 "detail": f"no lamp seen lit at power-up ({picked} start-up frame(s) taken for "
+                           f"the bulb check, of {seen.get('startup_frames', '?')} recorded over "
+                           f"{seen.get('startup_s', '?')} s): the cluster did not run its bulb "
+                           "check, or the camera did not catch it"}]
 
     # -- 5. lamp check ----------------------------------------------------------
 

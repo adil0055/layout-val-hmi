@@ -85,16 +85,28 @@ def card(item: dict[str, Any]) -> np.ndarray:
     return out
 
 
+def _fit(img: np.ndarray, width: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    return img if w <= width else cv2.resize(img, (width, max(1, round(h * width / w))),
+                                              interpolation=cv2.INTER_AREA)
+
+
 def _data_url(img: np.ndarray) -> str:
     ok, png = cv2.imencode(".png", img)
     return "data:image/png;base64," + base64.b64encode(png.tobytes()).decode("ascii") if ok else ""
 
 
-def write(folder: Path, items: list[dict[str, Any]], title: str) -> Path:
+def write(folder: Path, items: list[dict[str, Any]], title: str,
+          problems: list[dict[str, Any]] = (),
+          views: list[tuple[str, np.ndarray]] = ()) -> Path:
     """``elements/NNN-name.png`` for each item, and ``elements.html`` with them all.
 
     An item is {"name", "kind" ("lamp" or "element"), "verdict", "detail",
-    "pictures": [(label, image), ...]}.
+    "pictures": [(label, image), ...]}. ``problems`` are the run's rows that
+    did not pass ({"id", "verdict", "detail"}) and ``views`` whole pictures
+    that show them (the bulb check, the lamp check): they head the page, so
+    that what it shows agrees with the verdict -- a bulb check that saw no
+    lamp is no element's, and the page was all green under a FAIL.
     """
     pics_dir = folder / "elements"
     pics_dir.mkdir(parents=True, exist_ok=True)
@@ -120,6 +132,16 @@ def write(folder: Path, items: list[dict[str, Any]], title: str) -> Path:
     body = "".join(
         f"<h2>{heads[k]} <small>{len(v)}</small></h2><div class=grid>{''.join(v)}</div>"
         for k, v in sections.items() if v)
+    if problems or views:
+        rows = "".join(
+            f'<tr><td class="{html.escape(r.get("verdict", ""))}">{html.escape(str(r.get("id", "")))}'
+            f'</td><td>{html.escape(str(r.get("detail", "")))}</td></tr>' for r in problems)
+        shots = "".join(
+            f'<figure><img class="view" src="{_data_url(_fit(img, 900))}" alt="">'
+            f'<figcaption>{html.escape(label)}</figcaption></figure>' for label, img in views)
+        body = (f"<h2>Not passing <small>{len(problems)}</small></h2>"
+                + (f"<table>{rows}</table>" if rows else "")
+                + (f'<div class="pics">{shots}</div>' if shots else "") + body)
     page = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -137,6 +159,9 @@ h2 small{{color:#8B9AA3;font-weight:400}} p{{color:#8B9AA3;margin:0 0 12px}}
 .pics{{display:flex;gap:8px;flex-wrap:wrap}} figure{{margin:0}}
 figure img{{display:block;max-width:100%;image-rendering:pixelated;border-radius:4px;background:#000}}
 figcaption{{color:#8B9AA3;font-size:11px}}
+table{{border-collapse:collapse;margin:0 0 12px;max-width:100%}}
+td{{padding:4px 10px 4px 0;border-bottom:1px solid #222C31;vertical-align:top;overflow-wrap:anywhere}}
+img.view{{image-rendering:auto;max-width:min(900px,100%)}}
 </style></head><body>
 <h1>{html.escape(title)}</h1>
 <p>Each element cut out on its own, its box drawn round it: as the reference has it and as

@@ -220,7 +220,11 @@ manual` asks for them to be tapped. Teaching ends once the cluster is learnt
    **position**, **order**, **not flashing**/**flashing**, **moves between
    shots**). In the bulb check, with every lamp lit, a lamp not picked out
    among the rest is looked for in its own place by its symbol alone: from
-   farther off, the lamps' light runs into each other's margins.
+   farther off, the lamps' light runs into each other's margins. What is lit
+   is measured against the rest screen of the same power cycle; and a test
+   that sees no lamp lit at power-up at all says so in one row -- the cluster
+   did not run its bulb check, or the camera did not catch it -- with how
+   many start-up frames it had, rather than listing every lamp missing.
 7. **Validate** (Test). The layout at rest against the reference.
 
 **Test** tests a cluster against what was taught -- the same one after a

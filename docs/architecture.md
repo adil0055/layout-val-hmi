@@ -895,6 +895,17 @@ its size, matched to 0.7, in its own colour, 0.3-3 times its light); lit
 glow strong enough to lose 4 of 6 lamps to the blob reading lost none to it,
 and a lamp drawn missing stayed missing.
 
+A test's bulb check is measured against the rest screen of its own power
+cycle, as the lamp check is, not the teach-in's: with teaching ending before
+any lamp check, the library's rest screen is otherwise the teach-in's,
+minutes or days old. When no lamp at all is seen lit at power-up -- a real
+webcam's first test after the split reported all 31 "missing (bulb check)"
+while every lamp then passed in its own state -- that is one fault, not 31,
+and is said so: the cluster ran no bulb check, or the camera did not catch
+it, with the start-up's frame count and length to tell which. A test that
+finds no bulb check in the start-up at all fails the same way; it used to
+skip the check without a word.
+
 **Setting the camera** (`camtune.py`). A webcam on automatic exposes for the
 room, and in a room a lit display is the brightest thing: blown out, its white
 strokes bloom into each other, its white balance follows whatever else is in

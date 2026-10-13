@@ -354,7 +354,7 @@ class MiniCluster:
                     (235, 235, 235), 3, cv2.LINE_AA)
         cv2.putText(img, "km/h", (70, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
         cv2.circle(img, (470, 160), 55, (90, 80, 70), 2, cv2.LINE_AA)
-        check = age < 1.4
+        check = age < 1.4 and "no bulb check" not in faults
         flash_on = (time.monotonic() % (2 * self.FLASH)) < self.FLASH
         abs_req = v.get("ESC_ABS_TtReq", "Off")
         if check or abs_req == "On" or (abs_req == "Flash" and flash_on):
@@ -489,6 +489,8 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
         rec2, summary2 = run(teach=False)
         faults.append("abs")
         rec3, summary3 = run(teach=False)
+        faults[:] = ["no bulb check"]
+        rec4, _ = run(teach=False)
     finally:
         stop.set()
     # The corners were found, shown, and asked about once in the teach-in
@@ -541,3 +543,10 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
     assert rec3["verdict"] == "FAIL"
     assert {r["id"] for r in rec3["rows"] if r["verdict"] == "FAIL"} <= {
         "ABS warning lamp", "Bulb check", "Lamp check"}, rec3["rows"]
+    # No bulb check at power-up: one fault, said as such -- not every lamp missing.
+    rows4 = [r for r in rec4["rows"] if r["verdict"] == "FAIL"]
+    assert [r["id"] for r in rows4] == ["Bulb check"], rec4["rows"]
+    assert "no lamp seen lit at power-up" in rows4[0]["detail"]
+    # The element page says so too, at its head: not all green under a FAIL.
+    head = (s.out_dir / rec4["elements"]).read_text().split("<h2>")[1]
+    assert head.startswith("Not passing") and "no lamp seen lit at power-up" in head
