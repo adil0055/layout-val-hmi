@@ -123,9 +123,9 @@ layoutval go --webcam --can --dbc cluster.dbc
 ```
 
 Aim the webcam at the cluster and press **Start camera** (with `--webcam` it
-starts by itself). Once the camera's exposure is held, the page streams
-frames to the computer, and the computer does the rest -- nobody picks a
-frame, marks a corner or types a resolution:
+starts by itself). The page streams frames to the computer, and the computer
+does the rest -- nobody picks a frame, marks a corner, types a resolution or
+touches a camera setting:
 
 1. **Power cycle.** Ignition off until the screen is dark and still (if it
    stays lit, the bus is let sleep as well), then on, recording the start-up:
@@ -136,8 +136,33 @@ frame, marks a corner or types a resolution:
    taken round the content. Without a resolution, the display's size comes
    from its shape: a common cluster resolution when its proportions match one
    (1920 x 720, 1280 x 480, ...), else its own.
-3. **Reference.** The running screen at rest.
-4. **Teach.** Every signal the cluster receives is tried, state by state: a
+3. **Setting the camera.** A webcam left on automatic exposes for the room,
+   and the display is the brightest thing in it: the screen comes out blown,
+   white strokes bloom into each other, and a dial's ticks and numerals merge
+   into one shape. So the computer sets the camera up for the display, from
+   what the display looks like through it:
+   - **exposure**, so the brightest content -- on every colour channel, so a
+     red lamp's red is not clipped either -- sits just under white, with
+     almost nothing clipped;
+   - **white balance**, so the display's white and grey text comes out grey
+     (red as strong as blue);
+   - **focus**, swept for the sharpest picture of the display, then fixed;
+   - **sharpening** off: it rings round every white stroke.
+
+   Everything is then held, the start-up is recorded again with the camera
+   as it now is, and the same settings are put on the camera on every later
+   run -- a reference and a test taken at two exposures differ by more than
+   any layout fault. What was set, and each step that got there, goes to
+   `camera.json`. This needs a browser that lets a page set the camera
+   (Chrome or Edge; the Image Capture controls) and a webcam that offers the
+   controls; what it does not offer is left as it is (many only offer
+   exposure), and with none the run goes on with the camera on automatic.
+4. **Reference.** The running screen at rest. The camera is on a stand, so
+   elements down to 4 px across are kept (a hand-held photo needs 9), and a
+   region that is big and mostly empty -- a dial's scale ring with every tick
+   and numeral along it, or strokes joined by a glow -- is split into its
+   parts.
+5. **Teach.** Every signal the cluster receives is tried, state by state: a
    bit flipped, each value of a value table (never `SNA`/`Init`/`Invalid`), a
    number swept to both ends and across its range. What each state shows is
    compared with the rest screen just before it:
@@ -153,20 +178,20 @@ frame, marks a corner or types a resolution:
    - what changed on its own while the cluster was taught -- an odometer, a
      trip counter, a clock -- is left out of the layout check and listed as
      not checked, since it would fail for being right.
-5. **Lamp check.** Every lamp state learnt, then all lamps together: which
+6. **Lamp check.** Every lamp state learnt, then all lamps together: which
    lamps were lit, recognised by symbol, and whether that was right
    (**missing**, **unexpected**, **wrong colour**, **unknown symbol**,
    **position**, **order**, **not flashing**/**flashing**, **moves between
    shots**).
-6. **Validate.** The layout at rest against the reference.
+7. **Validate.** The layout at rest against the reference.
 
 **Test again** then tests a cluster against what was taught -- the same one
-after a change, or the next one off the line: a power cycle (every lamp lit
-in the bulb check, each in its place), the lamp check and the layout. **Teach
-again** starts over. Everything goes to `auto-HHMMSS/` in the output folder:
-`auto.json` (the run), `teach.json`, `lamp-check.json`, `lamps.json` with the
-symbols, and pictures of the display found, the bulb check, the lamps and the
-named elements.
+after a change, or the next one off the line: the camera set as it was, a
+power cycle (every lamp lit in the bulb check, each in its place), the lamp
+check and the layout. **Teach again** starts over. Everything goes to
+`auto-HHMMSS/` in the output folder: `auto.json` (the run), `camera.json`,
+`teach.json`, `lamp-check.json`, `lamps.json` with the symbols, and pictures
+of the display found, the bulb check, the lamps and the named elements.
 
 **Frames are picked by watching them.** After each state is sent, a frame is
 of that state once the screen has changed from how it was and then settled:

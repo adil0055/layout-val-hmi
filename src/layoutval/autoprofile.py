@@ -44,6 +44,7 @@ def segment_reference(
     min_thickness_px: int = 9,
     max_area_fraction: float = 0.25,
     close_kernel: int = 5,
+    split: bool = True,
 ) -> list[tuple[int, int, int, int, int]]:
     """Lit regions of a rectified frame, as ``(x, y, w, h, area)``.
 
@@ -75,6 +76,12 @@ def segment_reference(
     than an element ever should, that is evidence the threshold is too low, and
     it is raised until that stops being true. The same correction covers the
     unusually bright screen the old code could only warn about.
+
+    **A region that is big and mostly empty is split** (``split``, see
+    :func:`_split`): a dial's scale ring joins every tick and numeral along it
+    into one region, and a camera's bloom does the same with the glow round
+    bright strokes. One "element" a quarter of a dial wide measures nothing,
+    and hid 20, 40, 60, 80 and 140 on an overexposed webcam photograph.
     """
     gray = to_gray(reference)
     ceiling = max_area_fraction * gray.size
@@ -104,14 +111,16 @@ def segment_reference(
 
     kernel = np.ones((close_kernel, close_kernel), np.uint8) if close_kernel > 1 else None
     best: list[tuple[int, int, int, int, int]] = []
+    best_level, best_labels, best_ids = None, None, []
     for level in levels:
         _, mask = cv2.threshold(gray, level, 255, cv2.THRESH_BINARY)
         if kernel is not None:
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
 
         oversized = any(stats[i, cv2.CC_STAT_AREA] > ceiling for i in range(1, count))
         found = []
+        found_ids = []
         for i in range(1, count):
             area = int(stats[i, cv2.CC_STAT_AREA])
             if not (min_area_px <= area <= ceiling):
@@ -130,6 +139,7 @@ def segment_reference(
                 int(stats[i, cv2.CC_STAT_HEIGHT]),
                 area,
             ))
+            found_ids.append(i)
         if not oversized and found:
             # Nothing is swallowing the screen at this level, so stop here.
             # Climbing further to collect more components is a mistake: a
@@ -137,15 +147,93 @@ def segment_reference(
             # fragments do not match between reference and validate. Tried the
             # other way round first, maximising the count, and it turned a
             # passing run into "6 pass, 31 fail".
-            best = found
+            best, best_level, best_labels, best_ids = found, level, labels, found_ids
             break
         if not best:
-            best = found
+            best, best_level, best_labels, best_ids = found, level, labels, found_ids
+
+    if split and best_labels is not None and len(best) >= SPLIT_MIN_REGIONS:
+        # Big against the typical element on the same screen, not against
+        # the frame: black padding round a display must not change it, and
+        # a frame with three words on it has nothing to split.
+        typical = float(np.median([r[2] * r[3] for r in best]))
+        out = []
+        for r, label in zip(best, best_ids):
+            x, y, w, h, area = r
+            own = best_labels[y:y + h, x:x + w] == label
+            out += _split(gray, own, (x, y), best_level, min_area_px, min_thickness_px,
+                          typical) or [r]
+        best = list(dict.fromkeys(out))
 
     # Reading order, so the ids come out the same way twice and a report reads
     # down the screen rather than in whatever order the labeller happened to go.
     best.sort(key=lambda r: (r[1], r[0]))
     return best
+
+
+#: A region is split when its box is this many times the typical element's...
+SPLIT_BOX = 25.0
+#: ...and it fills less than this share of its box: a ring of ticks, not a block.
+SPLIT_FILL = 0.3
+#: A region this many times the typical element is tried at higher thresholds
+#: however full it is: a dial's face lit by an overexposed camera, with the
+#: numerals on it.
+SPLIT_BIG = 60.0
+#: Fewer regions than this and there is no typical element to go by.
+SPLIT_MIN_REGIONS = 8
+
+
+def _split(gray: np.ndarray, own: np.ndarray, at: tuple[int, int], level: int,
+           min_area: int, min_thick: int, typical: float, depth: int = 0
+           ) -> list[tuple[int, int, int, int, int]] | None:
+    """A big region in its parts, or None to keep it whole.
+
+    Tried in turn: higher thresholds inside it (bloom is dimmer than the
+    strokes it joins), as fractions of the way from its box's background to
+    its brightest strokes -- the same pixels however the frame round it is
+    padded; then, for a mostly empty one, opening away lines thinner than a
+    stroke (a scale's ring is a hairline, its ticks are not). The first that
+    gives three or more parts of element size, holding a good share of the
+    region's light, is taken; a part still big is split again, down to three
+    levels.
+    """
+    h, w = own.shape
+    area = int(own.sum())
+    sparse = w * h >= SPLIT_BOX * typical and area < SPLIT_FILL * w * h
+    big = w * h >= SPLIT_BIG * typical
+    if depth > 3 or not (sparse or big):
+        return None
+    x0, y0 = at
+    patch = gray[y0:y0 + h, x0:x0 + w]
+    floor = float(np.median(patch))
+    top = float(np.percentile(patch[own], 99))
+    tries = [("level", int(floor + f * (top - floor))) for f in (0.3, 0.45, 0.6, 0.75)]
+    if sparse:
+        tries += [("open", k) for k in (3, 5)]
+    for how, arg in tries:
+        if how == "level":
+            if arg <= level:
+                continue
+            m = ((patch > arg) & own).astype(np.uint8)
+        else:
+            m = cv2.morphologyEx(own.astype(np.uint8), cv2.MORPH_OPEN,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (arg, arg)))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        n, lab, st, _ = cv2.connectedComponentsWithStats(m)
+        parts = [k for k in range(1, n)
+                 if st[k, cv2.CC_STAT_AREA] >= min_area
+                 and min(st[k, cv2.CC_STAT_WIDTH], st[k, cv2.CC_STAT_HEIGHT]) >= min_thick]
+        held = sum(int(st[k, cv2.CC_STAT_AREA]) for k in parts)
+        if len(parts) < 3 or held < 0.3 * area:
+            continue
+        out = []
+        for k in parts:
+            px, py, pw, ph, pa = (int(v) for v in st[k, :5])
+            sub = lab[py:py + ph, px:px + pw] == k
+            out += _split(gray, sub, (x0 + px, y0 + py), level, min_area, min_thick, typical,
+                          depth + 1) or [(x0 + px, y0 + py, pw, ph, pa)]
+        return out
+    return None
 
 
 def structure(gray: np.ndarray, box: tuple[int, int, int, int], pad: int = 3) -> float:

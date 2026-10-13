@@ -663,6 +663,33 @@ a bar's gradient fill does not. And it must keep 2% clear of the frame's edge,
 where the display's rim and a laptop's status icons live and a hand-held pose
 is least certain. Up to 200 elements are kept.
 
+A webcam on a stand does not shake, and the one-button run says so
+(`steady_camera`): there a region need only be 20 px and 4 px across, which
+is what a dial's minor ticks are. Through the page, on the simulated cluster,
+the layout check went from 54 elements to 112, every one passing.
+
+**Big, mostly empty regions are split.** One threshold for the whole screen
+joins whatever touches at that level: a dial's scale ring joins every tick and
+numeral along it, and an overexposed camera's bloom joins neighbouring white
+strokes through the glow between them. On a real webcam photograph of a
+cluster, blown out, the inventory had boxes a quarter of a dial wide and no
+20, 40, 60, 80 or 140 at all. What is big is judged against the typical
+element on the same screen -- the median box, once there are 8 or more --
+not against the frame, so black padding round a display changes nothing and a
+screen with three words on it has nothing to split. A region is split when its
+box is 25 times the typical element's and less than 30% of it is lit (a ring,
+not a block), or 60 times however full it is (a dial face lit by the bloom,
+numerals on it). The split tries, in turn, thresholds 30%, 45%, 60% and 75%
+of the way from the box's background to its brightest strokes -- bloom is
+dimmer than the strokes it joins, and the levels are the same whatever is
+round the box -- and, for a sparse region, opening away lines thinner than a
+stroke (a scale's ring is a hairline; its ticks are not). The first try giving
+three or more element-sized parts that hold at least 30% of the region's light
+is taken, and a part still big is split again, three levels down. On the
+blown-out photograph, with the overlay cleaned off, 72 elements became 135, and
+the left dial's numerals came out one each. Splitting needs nothing from the
+camera, so it also covers a webcam that offers no controls.
+
 ### Teach-in over CAN: lamps by symbol, elements by sweep
 
 `canbus.py` is the tester's side of the bus: every signal of a DBC held and
@@ -818,9 +845,63 @@ every bulb-check frame, still, sized like the lamps, and on no lamp: the
 needles sweeping through the bulb check made twenty "lamps" on the dials
 before.
 
-**Teach, then test.** The first run teaches: display, reference, discovery,
-lamp check, validate. Later runs test against it: power cycle (every lamp lit
-in the bulb check, in its place), lamp check, validate. The lamp check starts
+**Setting the camera** (`camtune.py`). A webcam on automatic exposes for the
+room, and in a room a lit display is the brightest thing: blown out, its white
+strokes bloom into each other, its white balance follows whatever else is in
+view, and its sharpening rings round every stroke. The page reports what its
+camera can be set to (W3C Image Capture: `getCapabilities`/`getSettings`) when
+the run starts; once the display is located, `Tuner` sets the camera for the
+display alone, measured on the display region of the frames:
+
+- *sharpening* to its minimum, white balance and focus to manual at their
+  current values, so nothing moves under the measurement;
+- *exposure* (`exposureTime` with `exposureMode: manual`, else
+  `exposureCompensation`): the brightest content is the 99.8th percentile of
+  the brightest channel -- a display is mostly dark, its strokes a few percent
+  of it, and the brightest channel keeps a red lamp's red from clipping -- and
+  is brought into 200-240 with at most 0.05% of the display at 250 or over.
+  Clipped, the level says nothing of how far over it is, so the exposure is
+  halved (or brought halfway back to the setting last known too dark); below
+  clipping a camera's response is near enough straight, and one step of
+  225/level lands on it. Exposure is held under one frame at 30 fps
+  (`exposureTime` 333), past which a webcam drops its frame rate;
+- *focus*: seven points across `focusDistance`, then four finer ones round the
+  best, by the variance of the Laplacian;
+- *white balance*: red over blue of what on the display is bright, not
+  saturated and not clipped -- its white and grey text -- at two colour
+  temperatures 800 K apart, and the temperature where it is 1 solved for;
+- *exposure* again, four steps at most, since white balance moved the
+  channels.
+
+The run says which settings it wants by number (`camera: {seq, set}` in the
+progress the page reads back); the page applies them with `applyConstraints`
+(one at a time if the camera refuses the lot, so one it does not take does not
+keep the others off) and sends every later frame with the number of the
+settings it was taken with (`X-Camera-Seq`) and what the camera says it took
+(`X-Camera-Settings`). A frame is used only when it carries the latest number,
+and only 0.6 s after the first one does -- a webcam takes a few frames to move
+its exposure and longer to move its lens. A page that has not applied them in
+8 s will not (an older page, or a browser without the controls), and the run
+goes on with the camera as it is; so does one whose camera offers nothing.
+What the camera reports it took, where it reports it, is kept rather than what
+was asked (a camera rounds to its steps), written to `camera.json` with each
+step, and put on the camera before every later run of the same session. After
+tuning, the start-up is recorded again and the display located again with the
+camera as it now is: focus moves the picture a little, and the reference must
+have the exposure the test will.
+
+Through the page, with a simulated webcam that starts blown (exposure 260, a
+colour cast, focus off, sharpening on), it came to exposure 86.5 (brightest
+content 221, nothing clipped), focus 0.417 against a true 0.42, white balance
+5824 K (red over blue 1.004) and sharpening 0, in about 28 s. Saturation and
+contrast are left as the camera has them: neither moves a measured position,
+and a symbol's colour is judged against a reference taken with the same
+camera.
+
+**Teach, then test.** The first run teaches: display, camera, reference,
+discovery, lamp check, validate. Later runs test against it: camera set as
+taught, power cycle (every lamp lit in the bulb check, in its place), lamp
+check, validate. The lamp check starts
 with the rest screen as it is now and measures against that, not the
 teach-in's -- minutes or days old; and after a lamp a number lit, the number
 is driven past where it lit (a "letting go" step, not checked), for the same
@@ -1204,7 +1285,8 @@ src/layoutval/
 ├── canbus.py         the tester's side of a CAN bus, worked out from a DBC (Rig), sent cyclically
 ├── lamps.py          lamps by symbol, elements by sweep, and the lamp check
 ├── discover.py       the teach-in from the DBC alone: every signal tried, lamps and elements found
-├── autorun.py        the one-button run: power cycle, display, reference, teach, check, validate
+├── autorun.py        the one-button run: power cycle, display, camera, reference, teach, check, validate
+├── camtune.py        the webcam set up for the display: exposure, white balance, focus, sharpening
 ├── autoprofile.py    inventory from the reference frame, when none is authored
 ├── authoring.py      assisted annotation — the only place a model belongs
 ├── repeatability.py  σ, from a static screen

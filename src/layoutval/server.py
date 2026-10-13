@@ -462,6 +462,12 @@ class CaptureSession:
         self.discovery = discovery
         #: The one-button run (layoutval.autorun), while there is one.
         self.auto: Any = None
+        #: The camera stays where it is between shots (a webcam on a stand, as
+        #: the one-button run has): thinner elements can be measured.
+        self.steady_camera = False
+        #: The webcam's settings as the one-button run set them up for the
+        #: display (layoutval.camtune), given to it again on every later run.
+        self.camera_settings: dict[str, Any] = {}
         self.lamp_lib: Any = None
         self.teach_summary: dict[str, Any] | None = None
         self._teach_files: dict[str, dict[int, Path]] = {}
@@ -849,7 +855,8 @@ class CaptureSession:
 
     # -- one button: from the webcam's frames to a report ---------------------
 
-    def auto_start(self, log=None, teach: bool | None = None) -> dict[str, Any]:
+    def auto_start(self, log=None, teach: bool | None = None,
+                   camera: dict | None = None) -> dict[str, Any]:
         """Start the automatic run (layoutval.autorun), or say how the one going is.
 
         The first run teaches; later ones test against what it taught, unless
@@ -860,17 +867,23 @@ class CaptureSession:
         with self.lock:
             if self.auto is not None and self.auto.running:
                 return self.auto.progress.to_dict()
-            self.auto = AutoRun(self, log=log, teach=teach)
+            self.auto = AutoRun(self, log=log, teach=teach, camera=camera)
         self.auto.start()
         return self.auto.progress.to_dict()
 
-    def auto_frame(self, data: bytes) -> dict[str, Any]:
-        """A frame from the page's webcam, for the run; how it is going."""
+    def auto_frame(self, data: bytes, camera: int = 0,
+                   report: dict | None = None) -> dict[str, Any]:
+        """A frame from the page's webcam, for the run; how it is going.
+
+        ``camera`` is the number of the camera settings the page had put on
+        the camera when it took the frame, and ``report`` what the camera says
+        it is set to.
+        """
         run = self.auto
         if run is None:
             raise ValueError("no automatic run: start one first")
         if not run.progress.done:
-            run.feed.put(data)
+            run.feed.put(data, camera, report)
         return run.progress.to_dict()
 
     def auto_stop(self) -> dict[str, Any]:
@@ -1992,11 +2005,16 @@ class CaptureSession:
         # having nothing to measure. Only ever replaces an inventory this made
         # earlier -- an authored profile is the better answer and is left alone.
         if self.auto_profile and (self.profile is None or self._profile_is_auto):
+            # A camera on a stand does not smear, so what a hand-held photo
+            # could not measure -- a dial's minor ticks, 4-8 px across --
+            # can be measured from it.
+            steady = dict(min_thickness_px=4, min_area_px=20) if self.steady_camera else {}
             found = profile_from_reference(
                 segment_from,
                 valid=seen,
                 screen=self.profile.screen if self.profile else "auto",
                 display_size=self.display_size,
+                **steady,
             )
             self.profile = found
             self._profile_is_auto = True
@@ -3277,20 +3295,52 @@ function paintAuto(p) {
   $("autoteach").style.display = RUN || !taught ? "none" : "";
   $("autostop").style.display = RUN ? "" : "none";
   if (!p) return;
-  const names = {starting: "Starting", power: "Power cycle", locate: "Finding the display",
+  const names = {starting: "Starting", camera: "Setting the camera", power: "Power cycle",
+    locate: "Finding the display",
     reference: "Reference", teach: "Teaching", lamps: "Checking lamps", validate: "Validating"};
   $("autowhat").textContent = p.done ? "done" : (names[p.phase] || p.phase);
   $("autohint").textContent = p.done ? "" : (p.steps ? `${p.step} of ${p.steps}: ` : "") + (p.detail || "");
-  const order = ["starting", "power", "locate", "reference", "teach", "lamps", "validate"];
+  const order = ["starting", "power", "locate", "camera", "reference", "teach", "lamps", "validate"];
   const k = Math.max(0, order.indexOf(p.phase));
   const within = p.steps ? p.step / p.steps : 0;
   $("autofill").style.width = (p.done ? 100 : Math.round(100 * (k + within) / order.length)) + "%";
 }
+// The camera is set up by the computer: it says what to put on the camera
+// ("camera": {seq, set}), the page puts it there and says, with every frame
+// after, which settings that frame was taken with and what the camera took.
+let CAM_SEQ = 0, CAM_REPORT = null;
+const CAM_KEYS = ["exposureMode", "exposureTime", "exposureCompensation", "whiteBalanceMode",
+                  "colorTemperature", "focusMode", "focusDistance", "sharpness"];
+function camInfo() {
+  const track = CAM && CAM.getVideoTracks()[0];
+  let caps = {}, settings = {};
+  try { caps = track.getCapabilities ? track.getCapabilities() : {}; } catch (e) {}
+  try { settings = track.getSettings ? track.getSettings() : {}; } catch (e) {}
+  const pick = o => Object.fromEntries(CAM_KEYS.filter(k => k in o).map(k => [k, o[k]]));
+  return {caps: pick(caps), settings: pick(settings)};
+}
+async function applyCam(set) {
+  const track = CAM && CAM.getVideoTracks()[0];
+  if (!track) return;
+  try { await track.applyConstraints({advanced: [set]}); }
+  catch (e) {
+    // One the camera refuses should not keep the others off it.
+    for (const [k, v] of Object.entries(set)) {
+      try { await track.applyConstraints({advanced: [{[k]: v}]}); } catch (e2) {}
+    }
+  }
+  LOCK_WANT = {...LOCK_WANT, ...set};
+  CAM_REPORT = camInfo().settings;
+}
 async function autoPost(what, body) {
   const json = !(body instanceof Blob);
+  const headers = {"Content-Type": json ? "application/json" : "image/jpeg"};
+  if (!json) {
+    headers["X-Camera-Seq"] = String(CAM_SEQ);
+    if (CAM_REPORT) headers["X-Camera-Settings"] = JSON.stringify(CAM_REPORT);
+  }
   const r = await fetch(`/auto/${what}?t=${TOKEN}`, {method: "POST",
-    body: json ? JSON.stringify(body || {}) : body,
-    headers: {"Content-Type": json ? "application/json" : "image/jpeg"}});
+    body: json ? JSON.stringify(body || {}) : body, headers});
   const s = await r.json();
   if (!r.ok) throw new Error(s.detail || r.status);
   return s;
@@ -3301,13 +3351,20 @@ async function autoRun(teach) {
   $("result").style.display = "none";
   paintAuto(null);
   try {
-    let p = await autoPost("start", teach === undefined ? {} : {teach});
+    CAM_SEQ = 0; CAM_REPORT = null;
+    const asked = {camera: camInfo()};
+    if (teach !== undefined) asked.teach = teach;
+    let p = await autoPost("start", asked);
     paintAuto(p);
     while (RUN && !p.done) {
       if (CAM !== RUN.stream) { await autoPost("stop"); break; }
       const t0 = performance.now();
       p = await autoPost("frame", await grabJpeg());
       paintAuto(p);
+      if (p.camera && p.camera.seq > CAM_SEQ) {
+        await applyCam(p.camera.set);
+        CAM_SEQ = p.camera.seq;
+      }
       // A varying gap: frames at a steady rate near a flash's half period
       // would all land in the same half, and a flashing lamp look steady
       // or dark.
@@ -3985,13 +4042,23 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if what == "start":
                 try:
-                    teach = json.loads(body or b"{}").get("teach")
-                except (ValueError, AttributeError):
-                    teach = None
-                payload = self.session.auto_start(log=None if quiet else _print_flush,
-                                                  teach=None if teach is None else bool(teach))
+                    asked = json.loads(body or b"{}")
+                except ValueError:
+                    asked = {}
+                teach = asked.get("teach") if isinstance(asked, dict) else None
+                camera = asked.get("camera") if isinstance(asked, dict) else None
+                payload = self.session.auto_start(
+                    log=None if quiet else _print_flush,
+                    teach=None if teach is None else bool(teach),
+                    camera=camera if isinstance(camera, dict) else None)
             elif what == "frame":
-                payload = self.session.auto_frame(body)
+                try:
+                    seq = int(self.headers.get("X-Camera-Seq") or 0)
+                    report = json.loads(self.headers.get("X-Camera-Settings") or "null")
+                except ValueError:
+                    seq, report = 0, None
+                payload = self.session.auto_frame(
+                    body, seq, report if isinstance(report, dict) else None)
             elif what == "stop":
                 payload = self.session.auto_stop()
             else:

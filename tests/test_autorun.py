@@ -298,6 +298,37 @@ class MiniCluster:
         return img
 
 
+def test_a_page_that_does_not_set_the_camera_leaves_it_as_it_is(tmp_path, monkeypatch):
+    # An older page, or a browser without the controls: frames keep coming,
+    # never with the settings asked for. The run goes on without them.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(A, "CAMERA_ACK_S", 0.5)
+    session = SimpleNamespace(lamp_lib=None, reference=None, out_dir=tmp_path,
+                              camera_settings={})
+    caps = {"exposureMode": ["continuous", "manual"],
+            "exposureTime": {"min": 1, "max": 2000, "step": 1}}
+    run = A.AutoRun(session, camera={"caps": caps, "settings": {"exposureTime": 260}})
+    run._display = lambda f: f
+    jpg = cv2.imencode(".jpg", cv2.cvtColor(screen(), cv2.COLOR_GRAY2BGR))[1].tobytes()
+    stop = threading.Event()
+
+    def page():
+        while not stop.is_set():
+            run.feed.put(jpg, 0)                 # always the settings it started with
+            time.sleep(0.03)
+
+    threading.Thread(target=page, daemon=True).start()
+    try:
+        assert run._tune() == ""
+        with pytest.raises(A.CameraIgnored):
+            run._camera_look({"exposureTime": 80})
+    finally:
+        stop.set()
+    assert run.summary["camera"]["tuned"] is False and "did not" in run.summary["camera"]["why"]
+    assert session.camera_settings == {}
+
+
 @pytest.fixture
 def quick(monkeypatch):
     for name, value in {"REACT_S": 0.6, "SETTLE_S": 0.12, "SETTLE_SPAN_S": 0.8,
@@ -335,19 +366,34 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
                        can=cluster, discovery=Discovery(rig))
     faults: list[str] = []
     stop = threading.Event()
+    # A webcam left on automatic: exposed for the room, so the screen is blown.
+    caps = {"exposureMode": ["continuous", "manual"],
+            "exposureTime": {"min": 1, "max": 2000, "step": 1}}
+    webcam = {"exposureMode": "continuous", "exposureTime": 260}
+    applied = {"seq": 0}
+
+    def expose(img):
+        f = img.astype(np.float32) * (webcam["exposureTime"] / 100.0)
+        f += 0.8 * cv2.GaussianBlur(np.clip(f - 200, 0, None), (0, 0), 4)    # bloom
+        return np.clip(f, 0, 255).astype(np.uint8)
 
     def pump():                        # the page: frames, as fast as it can
         while not stop.is_set():
-            ok, jpg = cv2.imencode(".jpg", cam.shoot(cluster.screen(faults)),
+            ok, jpg = cv2.imencode(".jpg", expose(cam.shoot(cluster.screen(faults))),
                                    [cv2.IMWRITE_JPEG_QUALITY, 95])
             try:
-                s.auto_frame(jpg.tobytes())
+                p = s.auto_frame(jpg.tobytes(), applied["seq"], dict(webcam))
             except ValueError:
-                pass
+                time.sleep(0.02)
+                continue
+            if p.get("camera") and p["camera"]["seq"] > applied["seq"]:
+                webcam.update(p["camera"]["set"])
+                applied["seq"] = p["camera"]["seq"]
             time.sleep(0.02)
 
     def run(**kw):
-        s.auto_start(**kw)
+        applied["seq"] = 0
+        s.auto_start(camera={"caps": caps, "settings": dict(webcam)}, **kw)
         deadline = time.monotonic() + 240
         while not s.auto.progress.done and time.monotonic() < deadline:
             time.sleep(0.2)
@@ -366,6 +412,10 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
         stop.set()
     rows = {r["id"]: r for r in rec["rows"]}
     assert rows["Display"]["verdict"] == "PASS", rows["Display"]
+    # The camera was set up for the display, and is held there.
+    assert summary["camera"]["tuned"] and rows["Camera"]["verdict"] == "PASS", summary["camera"]
+    assert s.camera_settings["exposureMode"] == "manual"
+    assert s.camera_settings["exposureTime"] < 200, s.camera_settings
     lamps = summary["teach"]["lamps"]
     assert "ABS warning lamp" in lamps, lamps
     assert any(n.startswith("Buckle driver") for n in lamps), lamps
@@ -379,8 +429,10 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
     assert rows["Layout"]["verdict"] == "PASS", rows["Layout"]
     assert s.lamp_lib is not None and (s.auto.folder / "auto.json").is_file()
 
-    # The second run tests: no teaching, the bulb check and every lamp as taught.
+    # The second run tests: no teaching, the bulb check and every lamp as taught,
+    # with the camera given the settings it was taught with.
     assert summary2["mode"] == "test" and "teach" not in summary2
+    assert summary2["camera"] == {"settings": s.camera_settings, "tuned": False}
     rows2 = {r["id"]: r for r in rec2["rows"]}
     assert rows2["Bulb check"]["verdict"] == "PASS", rec2["rows"]
     assert rows2["Lamp check"]["verdict"] == "PASS", rec2["rows"]

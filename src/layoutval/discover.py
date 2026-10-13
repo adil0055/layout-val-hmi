@@ -63,6 +63,8 @@ DARK = 70
 SAME_LAMP = 0.6
 #: ...and this close, as a share of a lamp's size.
 SAME_PLACE = 0.35
+#: A change smaller than this many pixels is a speck of noise, not a change.
+MIN_CHANGE_PX = 12
 
 ENDINGS = re.compile(r"(_?(tt_?req|req|rq|request|sts|stat|status|state|ind|cmd|disp|dsp|"
                      r"actl|act|lamp|lmp|tt|telltale)|_(b|d|no))+$", re.I)
@@ -254,7 +256,8 @@ class Discovery:
                 continue
             changed = (L.change(before, L._median(shots)) >= change_level) & ~drift
             changed = cv2.morphologyEx(changed.astype(np.uint8), cv2.MORPH_OPEN,
-                                       np.ones((2, 2), np.uint8)).astype(bool)
+                                       np.ones((2, 2), np.uint8))
+            changed = _at_least(changed, MIN_CHANGE_PX)
             deltas = [L.lit_delta(before, s) for s in shots]
             lit = L.blobs(np.max(deltas, axis=0), level)
             # A lamp lights where nothing was: a letter that turns into
@@ -455,6 +458,14 @@ def bulb_slots(baseline: np.ndarray, bulb: list[np.ndarray], level: float
         return []
     size = float(np.median([max(b[2], b[3]) for b in boxes]))
     return [b for b in boxes if max(b[2], b[3]) <= 2.5 * size and max(b[2], b[3]) >= 0.3 * size]
+
+
+def _at_least(mask: np.ndarray, px: int) -> np.ndarray:
+    """``mask`` less the specks smaller than ``px``: noise, not a change."""
+    n, lab, st, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
+    keep = np.zeros(n, bool)
+    keep[1:] = st[1:, cv2.CC_STAT_AREA] >= px
+    return keep[lab]
 
 
 def _release(sp: SignalProbes, lit: Probe):

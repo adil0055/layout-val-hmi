@@ -81,6 +81,11 @@ POWER_MAX_S = 40.0
 #: Back at rest, how long the screen is given to come all the way back: a
 #: gauge is often damped, and slow to fall back.
 RETURN_S = 8.0
+#: After the camera's settings change, frames are let pass this long: a webcam
+#: takes a few frames to move its exposure, and longer to move its lens.
+CAMERA_SETTLE_S = 0.6
+#: A page that has not put settings on the camera after this long will not.
+CAMERA_ACK_S = 8.0
 #: A page that stops sending frames for this long has gone.
 STALL_S = 20.0
 #: Bulb check: a start-up frame with at least this share of the most compact
@@ -103,6 +108,10 @@ class Stopped(Exception):
     """Stop pressed, or the page went away."""
 
 
+class CameraIgnored(Exception):
+    """The page did not put the settings asked for on the camera."""
+
+
 # -- frames -------------------------------------------------------------------
 
 class FrameFeed:
@@ -111,13 +120,18 @@ class FrameFeed:
     def __init__(self) -> None:
         self._cv = threading.Condition()
         self._seq = 0
-        self._item: tuple[int, float, bytes] | None = None
+        self._item: tuple[int, float, bytes, int] | None = None
         self.closed = False
+        #: What the camera says it is set to, as the page last reported it.
+        self.camera_report: dict | None = None
 
-    def put(self, data: bytes) -> int:
+    def put(self, data: bytes, camera: int = 0, report: dict | None = None) -> int:
+        """A frame, and which camera settings (by their number) it was taken with."""
         with self._cv:
             self._seq += 1
-            self._item = (self._seq, time.monotonic(), data)
+            self._item = (self._seq, time.monotonic(), data, int(camera))
+            if report:
+                self.camera_report = report
             self._cv.notify_all()
             return self._seq
 
@@ -126,8 +140,8 @@ class FrameFeed:
             self.closed = True
             self._cv.notify_all()
 
-    def next(self, after: int, timeout: float = STALL_S) -> tuple[int, float, bytes]:
-        """The first frame newer than ``after``: (sequence, arrival time, data)."""
+    def next(self, after: int, timeout: float = STALL_S) -> tuple[int, float, bytes, int]:
+        """The first frame newer than ``after``: (sequence, arrival time, data, camera)."""
         end = time.monotonic() + timeout
         with self._cv:
             while not self.closed and (self._item is None or self._item[0] <= after):
@@ -380,18 +394,26 @@ class Progress:
     done: bool = False
     record: dict[str, Any] | None = None
     log: list[str] = field(default_factory=list)
+    #: Settings for the page to put on the camera: {"seq": n, "set": {...}}.
+    camera: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"phase": self.phase, "detail": self.detail, "step": self.step,
-                "steps": self.steps, "done": self.done, "record": self.record}
+                "steps": self.steps, "done": self.done, "record": self.record,
+                "camera": self.camera}
 
 
 class AutoRun:
     """The whole sequence, for one session, on its own thread."""
 
     def __init__(self, session, *, teach: bool | None = None, keep_shots: bool = False,
+                 camera: dict | None = None,
                  log: Callable[[str], None] | None = None) -> None:
         self.s = session
+        #: What the page's camera can be set to and is set to: {"caps", "settings"}.
+        self.camera = camera or {}
+        self._camera_seq = 0
+        self._camera_seen = 0
         #: Teach (learn the cluster: display, reference, lamps), or test a
         #: cluster against what was taught. Taught already, a run tests.
         self.teach = (session.lamp_lib is None or session.reference is None) \
@@ -435,8 +457,9 @@ class AutoRun:
     def _frame(self) -> tuple[float, np.ndarray, bytes]:
         from layoutval.server import decode_upload
 
-        seq, t, data = self.feed.next(self._seq)
+        seq, t, data, camera = self.feed.next(self._seq)
         self._seq = seq
+        self._camera_seen = camera
         return t, decode_upload(data), data
 
     def _undistort(self, frame: np.ndarray) -> np.ndarray:
@@ -486,6 +509,81 @@ class AutoRun:
                     return frames
         return frames
 
+    # -- the camera -------------------------------------------------------------
+
+    def _controllable(self) -> bool:
+        from layoutval.camtune import controls
+        return bool(controls(self.camera.get("caps") or {}))
+
+    def _camera_look(self, settings: dict, shots: int = 2) -> list[np.ndarray]:
+        """Have the page put ``settings`` on the camera; frames taken with them.
+
+        Frames come tagged with the number of the settings they were taken
+        with, and the first moments after a change are let pass: a webcam
+        takes a few frames to move its exposure, and longer to move its lens.
+        """
+        self._camera_seq += 1
+        n = self._camera_seq
+        self.progress.camera = {"seq": n, "set": dict(settings)}
+        asked = time.monotonic()
+        since = None
+        frames: list[np.ndarray] = []
+        while True:
+            t, f, _ = self._frame()
+            if self._camera_seen < n:
+                if time.monotonic() - asked > CAMERA_ACK_S:
+                    raise CameraIgnored("the page did not set the camera")
+                continue
+            if since is None:
+                since = t
+            if t - since < CAMERA_SETTLE_S:
+                continue
+            frames.append(f)
+            if len(frames) >= shots:
+                return frames
+
+    def _tune(self) -> str:
+        """Set the camera up for the display (layoutval.camtune); what it came to."""
+        from layoutval.camtune import Tuner, controls
+
+        caps = self.camera.get("caps") or {}
+        can = controls(caps)
+        if not can:
+            self.summary["camera"] = {"tuned": False,
+                                      "why": "nothing on it can be set from this browser"}
+            return ""
+        self._say("camera", "setting the camera up for the display: " + ", ".join(can))
+        tuner = Tuner(caps, self.camera.get("settings") or {}, self._camera_look,
+                      region=self._display, log=self._log)
+        try:
+            final = tuner.run()
+        except CameraIgnored as exc:
+            self.summary["camera"] = {"tuned": False, "why": str(exc)}
+            return ""
+        report = self.feed.camera_report or {}
+        # What the camera says it took, where it says: steps round values.
+        final = {k: report.get(k, v) for k, v in final.items()}
+        self.s.camera_settings = final
+        self.summary["camera"] = {"tuned": True, "settings": final, "steps": tuner.steps}
+        try:
+            (self.folder / "camera.json").write_text(json.dumps(
+                {"settings": final, "steps": tuner.steps, "capabilities": caps}, indent=2,
+                default=str))
+        except OSError:
+            pass
+        bits = []
+        if "exposureTime" in final:
+            bits.append(f"exposure {final['exposureTime']:g}")
+        elif "exposureCompensation" in final:
+            bits.append(f"exposure {final['exposureCompensation']:+g} EV")
+        if "colorTemperature" in final:
+            bits.append(f"white balance {float(final['colorTemperature']):.0f} K")
+        if "focusDistance" in final:
+            bits.append(f"focus {float(final['focusDistance']):g}")
+        if "sharpness" in final:
+            bits.append(f"sharpening {final['sharpness']:g}")
+        return "set for the display and held: " + ", ".join(bits)
+
     def _send(self, values: dict[str, Any]) -> float:
         self.s.can.apply(values)
         return time.monotonic() + self.latency
@@ -527,12 +625,23 @@ class AutoRun:
 
     def _run(self) -> dict[str, Any]:
         s = self.s
+        s.steady_camera = True              # a webcam on a stand, not a hand
         self.folder.mkdir(parents=True, exist_ok=True)
         rows: list[dict[str, Any]] = []
         can = s.can is not None
         taught = getattr(s, "discovery", None) is not None or s.plan is not None
         teaching = self.teach or not s.is_calibrated or s.reference is None
         self.summary["mode"] = "teach" if teaching else "test"
+
+        # The camera as it was set up when taught: a test seen at another
+        # exposure would differ from its reference everywhere.
+        if not teaching and s.camera_settings and self._controllable():
+            self._say("camera", "setting the camera as it was when taught")
+            try:
+                self._camera_look(s.camera_settings)
+                self.summary["camera"] = {"settings": s.camera_settings, "tuned": False}
+            except CameraIgnored as exc:
+                self.summary["camera"] = {"tuned": False, "why": str(exc)}
 
         # 1-2: the display.
         if can:
@@ -542,6 +651,17 @@ class AutoRun:
             run_frames = self._still_frames()
         if teaching:
             where = self._locate(dark, run_frames, startup)
+            tuned = self._tune()
+            if tuned:
+                # Everything from here on with the camera as it now is: the
+                # start-up and the display again (focus moves the picture a
+                # little), at the exposure the reference will have.
+                rows.append({"id": "Camera", "verdict": "PASS", "detail": tuned})
+                if can:
+                    dark, run_frames, startup = self._power_cycle()
+                else:
+                    run_frames = self._still_frames()
+                where = self._locate(dark, run_frames, startup)
             rows.append({"id": "Display", "verdict": "PASS", "detail": where})
         elif s.reference_camera is not None:
             with s.lock:
