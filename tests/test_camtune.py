@@ -145,3 +145,37 @@ def test_gain_goes_down_before_the_exposure_does():
     held_gain = FakeWebcam()
     C.Tuner(CAPS, start, held_gain.look).run()          # no gain control: left at 800
     assert final["exposureTime"] > 6 * held_gain.settings["exposureTime"]
+
+
+def test_two_exposures_show_the_dim_parts_and_keep_the_text_crisp():
+    # White text, and a dial's ticks ten times dimmer. At the exposure that
+    # keeps the text under white the ticks are down in the noise; four times
+    # longer they are plain, and the text clips and glows. Put together: the
+    # ticks brought up with a fifth of the noise, the text under white, and
+    # the long one's glow round the text mostly left out.
+    scene = np.full((200, 400, 3), 2, np.uint8)
+    cv2.putText(scene, "120", (40, 120), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (235, 235, 235), 6)
+    for x in range(250, 380, 18):
+        cv2.line(scene, (x, 60), (x, 100), (24, 24, 24), 3)
+    cam = FakeWebcam()
+    cam.scene = scene.astype(np.float32)
+    settings = {**AUTO, "colorTemperature": TRUE_K, "focusDistance": BEST_FOCUS, "sharpness": 0}
+    short = cam.shoot({**settings, "exposureTime": 95})
+    long = cam.shoot({**settings, "exposureTime": 380})
+    out = C.fuse(short, long)
+
+    def stretched(a):                     # the short one alone, brought up the same way
+        return 255 * np.sqrt(np.clip(a.astype(np.float32), 0, 255) / 255)
+
+    ticks, background = (slice(70, 90), slice(250, 380)), (slice(170, 190), slice(40, 200))
+    assert short[ticks].max() < 40 and long[ticks].max() > 80
+    assert out[ticks].max() > 70
+    assert out[background].std() < 0.3 * stretched(short)[background].std()
+    assert 200 < out[50:130, 40:200].max() <= 250                 # the text: under white
+    clipped = (long.max(axis=2) >= C.HDR_CLIP).astype(np.uint8)
+    away = cv2.distanceTransform(1 - clipped, cv2.DIST_L2, 3)
+    ring = (away > 4) & (away < 12)                                 # where the long one glows
+    naive = np.where(long.max(axis=2, keepdims=True) < C.HDR_CLIP, long / 4.0, short)
+    assert out[ring].mean() < stretched(short)[ring].mean() + 15 < stretched(naive)[ring].mean()
+    assert C.bracket(CAPS, {"exposureTime": 95})["exposureTime"] == 380
+    assert C.bracket({"exposureTime": {"min": 1, "max": 120}}, {"exposureTime": 95}) is None

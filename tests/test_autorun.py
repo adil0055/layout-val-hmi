@@ -487,6 +487,9 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
     assert summary["camera"]["tuned"] and rows["Camera"]["verdict"] == "PASS", summary["camera"]
     assert s.camera_settings["exposureMode"] == "manual"
     assert s.camera_settings["exposureTime"] < 200, s.camera_settings
+    # The layout's pictures in two exposures, the later runs' too.
+    assert summary["hdr"] and s.reference_hdr
+    assert not any(r["id"] == "Camera" and r["verdict"] != "PASS" for r in rec2["rows"] + rec3["rows"])
     lamps = summary["teach"]["lamps"]
     assert "ABS warning lamp" in lamps, lamps
     assert any(n.startswith("Buckle driver") for n in lamps), lamps

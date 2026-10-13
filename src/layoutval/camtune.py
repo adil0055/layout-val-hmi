@@ -265,3 +265,78 @@ class Tuner:
 #: What the tuner sets and hands back, to be given to the camera again later.
 _SETTABLE = ("exposureMode", "exposureTime", "exposureCompensation", "whiteBalanceMode",
              "colorTemperature", "focusMode", "focusDistance", "sharpness", "iso")
+
+
+# -- two exposures, one picture -----------------------------------------------
+#
+# Set for the display, the camera keeps the white text just under white -- and
+# the display's dim parts, ten times darker, fall into black with it: the dial
+# faces, a gauge's scale ring, its minor ticks, grey labels. No one exposure
+# holds both. So the pictures the layout is measured on are taken twice, as a
+# phone's HDR does: at the exposure set, and HDR_GAIN times longer, and put
+# together -- the longer one where it does not clip (and is not next to
+# something that does: a clipped stroke glows), the shorter one elsewhere.
+
+#: The longer exposure, times the one set for the display...
+HDR_GAIN = 4.0
+#: ...worth taking only if the camera can go at least this much longer.
+HDR_MIN_GAIN = 1.5
+#: The put-together picture is brought back to 8 bits with this gamma: what is
+#: dim comes up, the white text stays just under white.
+HDR_GAMMA = 2.0
+#: The longer exposure is used below this level...
+HDR_CLIP = 235.0
+#: ...fading out over this many levels below it...
+HDR_FADE = 40.0
+#: ...and where, brought down to the short one, it is within this of it (in
+#: the short one's levels, and as a share of them).
+HDR_AGREE_ABS = 4.0
+HDR_AGREE_REL = 0.15
+
+
+def bracket(caps: dict, settings: dict) -> dict | None:
+    """The longer exposure to go with ``settings``, or None if the camera has none."""
+    caps = caps or {}
+    if "exposureTime" in settings and _range(caps, "exposureTime"):
+        lo, hi = _range(caps, "exposureTime")
+        t = float(settings["exposureTime"])
+        longer = min(hi, t * HDR_GAIN)
+        if longer < HDR_MIN_GAIN * t:
+            return None
+        return {**settings, "exposureMode": "manual", "exposureTime": longer}
+    if "exposureCompensation" in settings and _range(caps, "exposureCompensation"):
+        lo, hi = _range(caps, "exposureCompensation")
+        ev = float(settings["exposureCompensation"])
+        longer = min(hi, ev + math.log2(HDR_GAIN))
+        if longer - ev < math.log2(HDR_MIN_GAIN):
+            return None
+        return {**settings, "exposureCompensation": longer}
+    return None
+
+
+def fuse(short: np.ndarray, long: np.ndarray, gain: float = HDR_GAIN) -> np.ndarray:
+    """One picture out of the same view at two exposures (8-bit BGR, ``long`` the brighter).
+
+    How much brighter is measured, from what is neither in the noise nor near
+    clipping in either -- a camera rounds an exposure to its steps, and its
+    response is not quite straight -- with ``gain`` for when there is too
+    little to measure it on.
+    """
+    s = short.astype(np.float32)
+    lg = long.astype(np.float32)
+    ms, ml = s.max(axis=2), lg.max(axis=2)
+    ok = (ms > 20) & (ml < HDR_CLIP - 20)
+    k = float(np.median(ml[ok] / ms[ok])) if int(ok.sum()) > 200 else gain
+    k = max(1.2, k)
+    # Not where the long one clips; and only where it says what the short one
+    # does, brought down to it -- a dim tick is the same in both, a clipped
+    # stroke's glow is in the long one alone.
+    near = cv2.dilate((ml >= HDR_CLIP).astype(np.uint8), np.ones((5, 5), np.uint8))
+    w = np.clip((HDR_CLIP - ml) / HDR_FADE, 0.0, 1.0) * (1.0 - near)
+    tol = HDR_AGREE_ABS + HDR_AGREE_REL * ms
+    off = np.abs(ml / k - ms)
+    w *= np.clip(2.0 - off / tol, 0.0, 1.0)
+    w = cv2.GaussianBlur(w.astype(np.float32), (0, 0), 1.0)
+    lin = w[..., None] * (lg / k) + (1.0 - w[..., None]) * s        # the short one's units
+    out = 255.0 * np.power(np.clip(lin, 0.0, 255.0) / 255.0, 1.0 / HDR_GAMMA)
+    return np.clip(out + 0.5, 0, 255).astype(np.uint8)

@@ -91,6 +91,8 @@ RETURN_S = 8.0
 CAMERA_SETTLE_S = 0.6
 #: A page that has not put settings on the camera after this long will not.
 CAMERA_ACK_S = 8.0
+#: Frames of each exposure for a picture in two (camtune.fuse).
+HDR_SHOTS = 3
 #: A page that stops sending frames for this long has gone.
 STALL_S = 20.0
 #: Bulb check: a start-up frame with at least this share of the most compact
@@ -668,6 +670,32 @@ class AutoRun:
             bits.append(f"gain ISO {final['iso']:g}")
         return "set for the display and held: " + ", ".join(bits)
 
+    def _hdr(self) -> np.ndarray | None:
+        """The screen as it is now, in one picture from two exposures (camtune.fuse).
+
+        None where the camera was not set up, or cannot go longer. The camera
+        is left at the exposure set for the display.
+        """
+        from layoutval.camtune import bracket, fuse
+
+        s = self.s
+        if not s.camera_settings or not self._controllable():
+            return None
+        longer = bracket(self.camera.get("caps") or {}, s.camera_settings)
+        if longer is None:
+            return None
+        try:
+            short = self._camera_look(s.camera_settings, shots=HDR_SHOTS)
+            long = self._camera_look(longer, shots=HDR_SHOTS)
+            self._camera_look(s.camera_settings, shots=1)
+        except CameraIgnored:
+            return None
+
+        def median(fs):
+            return np.median(np.stack(fs), axis=0).astype(np.uint8)
+
+        return fuse(median(short), median(long))
+
     def _send(self, values: dict[str, Any]) -> float:
         self.s.can.apply(values)
         return time.monotonic() + self.latency
@@ -748,8 +776,13 @@ class AutoRun:
                 where = self._locate(dark, run_frames, startup)
             rows.append({"id": "Display", "verdict": "PASS", "detail": where})
         elif s.reference_camera is not None:
+            frame = run_frames[-1][0]
+            if s.reference_hdr:
+                # Compared with the reference, taken the same way.
+                hdr = self._hdr()
+                frame = hdr if hdr is not None else frame
             with s.lock:
-                held = s._held_pose(self._undistort(run_frames[-1][0]))
+                held = s._held_pose(self._undistort(frame))
             if held is not None:
                 self._H = held[0]
                 self.summary["camera_moved_px"] = round(float(held[1]), 2)
@@ -761,12 +794,19 @@ class AutoRun:
             # 3: reference.
             self._say("reference", "taking the reference: the screen at rest")
             raw = np.median(np.stack([f for f, _ in run_frames[-3:]]), axis=0).astype(np.uint8)
+            # In two exposures where the camera can: the white text crisp and
+            # the display's dim parts (dial faces, rings, minor ticks) seen.
+            hdr = self._hdr()
+            self.summary["hdr"] = hdr is not None
             with s.lock:
-                ref = s._record(s._reference(raw, f"{self.stamp}-reference"))
+                ref = s._record(s._reference(raw if hdr is None else hdr,
+                                             f"{self.stamp}-reference", hdr=hdr is not None))
             if ref.verdict == "FAILED":
                 return self._finish("FAILED", f"Reference: {ref.detail}", rows)
             rows.append({"id": "Reference", "verdict": "PASS",
-                         "detail": f"{len(s.profile) if s.profile else 0} elements on the rest screen"})
+                         "detail": f"{len(s.profile) if s.profile else 0} elements on the rest screen"
+                                   + ("; in two exposures, so the dim parts are seen too"
+                                      if hdr is not None else "")})
             # 4: teach.
             if can and taught:
                 lib, teach_rows = self._teach(rest, bulb)
@@ -786,8 +826,20 @@ class AutoRun:
                     self.level, react_s=1.0, shots_steady=3)
         frames = [f for f, _ in got.shots]
         raw = np.median(np.stack(frames), axis=0).astype(np.uint8) if len(frames) > 1 else frames[0]
+        shot = raw
+        if s.reference_hdr:
+            hdr = self._hdr()
+            if hdr is not None:
+                shot = hdr
+            else:
+                rows.append({"id": "Camera", "verdict": "REVIEW",
+                             "detail": "the reference was taken in two exposures and the camera "
+                                       "would not take the second now: the layout is compared "
+                                       "with a picture taken another way"})
         with s.lock:
-            val = s._record(s._validate(raw, f"{self.stamp}-validate"))
+            # Lamps lit at rest are looked for in the plain picture: the lamp
+            # library's rest screen was taken so.
+            val = s._record(s._validate(shot, f"{self.stamp}-validate", lamps_from=raw))
         from layoutval.server import _payload
         payload = _payload(val)
         verdict = val.verdict

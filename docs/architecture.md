@@ -939,6 +939,26 @@ tuning, the start-up is recorded again and the display located again with the
 camera as it now is: focus moves the picture a little, and the reference must
 have the exposure the test will.
 
+**Two exposures for the layout's pictures** (`camtune.bracket`, `fuse`). Set
+for the white text, the display's dim parts -- dial faces, scale rings, minor
+ticks, grey labels, ten times darker -- fall into black: a real webcam's
+picture so set lost all of them, where on automatic it had them and the text
+blown (7.5% of a dial's lit pixels at 255, ticks merged into numerals). No one
+exposure holds both, so the reference and every validation are taken at the
+exposure set and `HDR_GAIN` (4) times longer, three frames each, and put
+together in the short one's units: the long one, divided by the ratio between
+them as measured from pixels unclipped and out of the noise in both, where it
+is under 235 and agrees with the short one to 4 levels and 15% -- a clipped
+stroke's glow is in the long one alone, a dim tick in both -- and the short
+one elsewhere. A gamma of 2 brings it back to 8 bits: the text stays under
+white, the dim parts come up. On a test scene the ticks came up as bright as
+stretching the short exposure would make them, with a fifth of its noise, and
+the glow round the text from 54 to 34 against a background of 21. What is
+compared with such a reference is taken the same way (`reference_hdr`): the
+validation, and a later run's check that the camera has not moved. Lamps lit
+at rest are looked for in the plain picture, as the lamp library's rest
+screen was taken. A camera that cannot go 1.5 times longer gets one exposure.
+
 Through the page, with a simulated webcam that starts blown (exposure 260, a
 colour cast, focus off, sharpening on), it came to exposure 86.5 (brightest
 content 221, nothing clipped), focus 0.417 against a true 0.42, white balance

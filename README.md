@@ -160,7 +160,22 @@ touches a camera setting:
 
    Only the display's content is measured -- what lit up at ignition on -- so
    a lamp in the room, or its reflection on the glass, does not set the
-   exposure. Everything is then held, the start-up is recorded again with the camera
+   exposure.
+
+   That exposure is short, and the picture looks dark: the display's white
+   text is about ten times brighter than its dial faces, and a camera holds
+   one or the other. On automatic it holds the dim parts and the text blows
+   out and glows -- a dial's ticks and numerals merge; set for the text, the
+   dim parts fall into black. So the pictures the layout is measured on, the
+   reference and every validation, are taken twice, as a phone's HDR does:
+   at the exposure set and four times longer, put together -- the longer
+   one where it neither clips nor glows, the shorter one elsewhere -- and
+   brought back to 8 bits with the dim parts lifted. The dial faces, rings,
+   minor ticks and grey labels are seen, with a fifth of the noise of
+   brightening the short one, and the text stays crisp. Lamps are looked at
+   in the plain picture: they are the brightest thing there.
+
+   Everything is then held, the start-up is recorded again with the camera
    as it now is, and the same settings are put on the camera on every later
    run -- a reference and a test taken at two exposures differ by more than
    any layout fault. What was set, and each step that got there, goes to

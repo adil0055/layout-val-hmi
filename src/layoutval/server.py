@@ -468,6 +468,9 @@ class CaptureSession:
         #: The webcam's settings as the one-button run set them up for the
         #: display (layoutval.camtune), given to it again on every later run.
         self.camera_settings: dict[str, Any] = {}
+        #: The reference was put together from two exposures (camtune.fuse), and
+        #: what is compared with it must be too.
+        self.reference_hdr = False
         self.lamp_lib: Any = None
         self.teach_summary: dict[str, Any] | None = None
         self._teach_files: dict[str, dict[int, Path]] = {}
@@ -1937,10 +1940,11 @@ class CaptureSession:
             f"{where}"
         )
 
-    def _reference(self, frame: np.ndarray, base: str) -> CaptureRecord:
+    def _reference(self, frame: np.ndarray, base: str, hdr: bool = False) -> CaptureRecord:
         rec = CaptureRecord(name=f"{base}.jpg", action="reference",
                             when=datetime.now().isoformat(timespec="seconds"))
         self._store(rec.name, frame)
+        self.reference_hdr = hdr
         if not self.is_calibrated:
             rec.verdict = "FAILED"
             rec.detail = "do Calibrate first -- there is no display mapping yet."
@@ -2620,7 +2624,8 @@ class CaptureSession:
         ones = np.full(shape[:2], 255, np.uint8)
         return self.calibration.geometry.rectify(self._undistort(ones), H) > 250
 
-    def _validate(self, frame: np.ndarray, base: str) -> CaptureRecord:
+    def _validate(self, frame: np.ndarray, base: str,
+                  lamps_from: np.ndarray | None = None) -> CaptureRecord:
         rec = CaptureRecord(name=f"{base}.jpg", action="validate",
                             when=datetime.now().isoformat(timespec="seconds"))
         self._store(rec.name, frame)
@@ -2790,7 +2795,8 @@ class CaptureSession:
                            self.calibration.geometry.display_size,
                            tol_fail=self.profile.defaults.tol_fail)
         if self.lamp_lib is not None and self.can is not None:
-            self._lamps_in_validate(report, undistorted, H)
+            self._lamps_in_validate(
+                report, undistorted if lamps_from is None else self._undistort(lamps_from), H)
         self._store(f"{base}-rectified.png", live)
 
         if self.edge_check and hand_held:
