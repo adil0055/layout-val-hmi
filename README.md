@@ -109,96 +109,148 @@ them; it is also slightly more accurate and needs no lens solve at all. Without
 a board, the border route asks the cluster for nothing, which is the only thing
 that is true of a production cluster.
 
-### Over CAN: every lamp and element found, named and checked
+### Over CAN: Start camera, and everything else is automatic
 
 A layout check that compares against a reference only knows elements as
 places (`auto@312,75`), and it never sees a telltale that is off when the
 reference is taken. Driving the cluster over CAN fixes both: switch a signal
 on, and whatever lights up is that signal's lamp, named by construction.
+With a webcam and the cluster's CAN matrix, the whole run is one button:
 
 ```bash
 pip install 'layoutval[can]'          # python-can, cantools, msgpack
-layoutval go --webcam --can --teach-plan ../hmi/can/teach_plan.json
+layoutval go --webcam --can --dbc cluster.dbc
 ```
+
+Aim the webcam at the cluster and press **Start camera** (with `--webcam` it
+starts by itself). Once the camera's exposure is held, the page streams
+frames to the computer, and the computer does the rest -- nobody picks a
+frame, marks a corner or types a resolution:
+
+1. **Power cycle.** Ignition off until the screen is dark and still (if it
+   stays lit, the bus is let sleep as well), then on, recording the start-up:
+   boot, the **bulb check**, the running screen.
+2. **Finding the display.** What lit up between ignition off and on is the
+   screen's content; the corners finder looks for the display's outline round
+   it and is held to containing it, and where it finds none the outline is
+   taken round the content. Without a resolution, the display's size comes
+   from its shape: a common cluster resolution when its proportions match one
+   (1920 x 720, 1280 x 480, ...), else its own.
+3. **Reference.** The running screen at rest.
+4. **Teach.** Every signal the cluster receives is tried, state by state: a
+   bit flipped, each value of a value table (never `SNA`/`Init`/`Invalid`), a
+   number swept to both ends and across its range. What each state shows is
+   compared with the rest screen just before it:
+   - a symbol lighting where the screen was empty, from a state, is a
+     **lamp** -- learnt by its symbol and colour, steady or flashing; ABS
+     `On` and `Flash` are one lamp, and so is every door's;
+   - a number lights lamps too, at the end of its range (fuel low, coolant
+     hot): those are lamps where they light in one of the bulb check's places;
+   - a change to what was drawn is an **element**, named after the signal
+     ("Vehicle speed", "Fuel level"); what no signal changes is **unknown**;
+   - a lamp lit in the bulb check that no signal lit is an **unknown lamp**,
+     with its place;
+   - what changed on its own while the cluster was taught -- an odometer, a
+     trip counter, a clock -- is left out of the layout check and listed as
+     not checked, since it would fail for being right.
+5. **Lamp check.** Every lamp state learnt, then all lamps together: which
+   lamps were lit, recognised by symbol, and whether that was right
+   (**missing**, **unexpected**, **wrong colour**, **unknown symbol**,
+   **position**, **order**, **not flashing**/**flashing**, **moves between
+   shots**).
+6. **Validate.** The layout at rest against the reference.
+
+**Test again** then tests a cluster against what was taught -- the same one
+after a change, or the next one off the line: a power cycle (every lamp lit
+in the bulb check, each in its place), the lamp check and the layout. **Teach
+again** starts over. Everything goes to `auto-HHMMSS/` in the output folder:
+`auto.json` (the run), `teach.json`, `lamp-check.json`, `lamps.json` with the
+symbols, and pictures of the display found, the bulb check, the lamps and the
+named elements.
+
+**Frames are picked by watching them.** After each state is sent, a frame is
+of that state once the screen has changed from how it was and then settled:
+a frame that matches one from a moment before -- a still screen, or a flash
+that has come round again. A needle's sweep is waited out; a flashing lamp is
+shot across its flash (1.3 s); a state that changes nothing costs 1.5 s and is
+reported as such. A pixel has changed when it moved by more than the camera's
+noise *and* by more than 30% of its brightness, so a backlight's PWM banding,
+tens of levels on white text, is not a change while a lamp lighting is. The
+start-up is over when the screen has stayed still for 6 s, longer than any
+bulb check stands still.
+
+**Everything about the bus comes from the DBC** and is written to
+`rig-detected.json` at start: the cluster's node (the one receiving most and
+sending least), the messages to send and their cycle times, the ignition
+signal (KL15, `Ignition_Status`, `PowerMode`, ... -- not network management's
+"KL15 active") and its On/Off values, each message's alive counter and CRC
+(AUTOSAR E2E style, CRC-8 SAE J1850 over the frame's ID and data by default),
+and rest values that say "not available" replaced by quiet ones. Where a
+matrix needs telling, `--rig rig.json` corrects it, in the same fields:
+`names` for what to call a signal, `e2e_default` for another CRC
+(`crc8_h2f`, `xor`, `sum`) or data ID, `exclude` for signals to leave alone,
+`rest` for rest values, and `when` for a signal that only shows with another
+set (`{"TCU_GearActual": {"TCU_GearSel": "D"}}`). Signals that changed nothing
+are listed in the result, so it is clear which to look at.
 
 `--can` takes any bus python-can opens, as `INTERFACE[:CHANNEL][@BITRATE]`:
 `udp_multicast` (the default: a virtual bus over the network, no hardware --
 the HMI listens on the same with `python3 main.py --can`), `socketcan:vcan0`,
-`pcan:PCAN_USBBUS1@500000`, `kvaser:0@500000`. The **teach plan** says what to
-switch on and what it is called; the HMI's `can/teach_plan.json` covers its 31
-lamps and 15 readouts and names its DBC, which `--dbc` can override. Every
-signal and value in it is checked against the DBC before the server starts.
+`pcan:PCAN_USBBUS1@500000`, `kvaser:0@500000`.
 
-The page gains an **Over CAN** card, used with this computer's webcam (the run
-is a couple of hundred shots, taken on its own) after the Corners step:
+The page's **Over CAN** card still runs a hand-written teach plan
+(`--teach-plan plan.json`) step by step, for a cluster whose matrix needs
+more telling than `rig.json` gives.
 
-- **Teach from CAN** (about four minutes). With
-  everything at rest it shoots the screen five times, which is the reference
-  and how much the screen differs from itself. Then each lamp alone, shot
-  across its flash when it flashes; then all lamps together; then each readout
-  driven through a few values. Each lamp is learnt by its **symbol** -- the
-  change its lighting makes -- with its colour, whether it flashes, where it lit
-  alone and where it sat with all of them on. The rest screen's elements are
-  named after the sweep that changes them ("Speed", "Gear", "Odometer"), and
-  whatever no step changes is reported as **unknown**: a scale numeral, a label.
-  Named elements are what reports show from then on, and the names survive
-  retaking the Reference. Everything is saved in `teach/` under the output
-  folder: `lamps.json`, the templates, `teach.json`, and every shot.
-- **Check lamps** switches each lamp on in turn and then all together, and for
-  each state says which lamps were lit, recognised by symbol, and whether that
-  was right: **missing**, **unexpected** (another lamp lit), **wrong colour**
-  (its symbol in another colour), **unknown symbol** (with the lamp it looks
-  most like), **position** (against where it lit in the same state when taught,
-  to the profile's tolerance), **order** (along the strip), **not flashing** or
-  **flashing**, and **moves between shots**.
-- **Validate** as before; with lamps taught, a lamp lit while the bus has every
-  lamp off is a failure, by name.
-
-Lamps are recognised by what they look like rather than where they are,
-because where they are can depend on what else is lit: the HMI's strip shows
-only lit lamps, centred, so every lamp lit alone lights in the same middle
-slot. Their places are checked in the states they were taught in -- alone, and
-all together, where the strip's order and spacing are learnt -- and in any
-other state only which are lit, their colour and their order. Two lamps can
+Lamps are recognised by what they look like rather than where they are, and
+then their places are checked. On a production cluster (and the HMI) every
+lamp has a fixed slot: a lamp found at the same place alone and in the bulb
+check is held to that place in every state. A display that instead shows only
+the lit lamps, closed up in a strip, is recognised as such, and its lamps are
+checked in the states they were taught in, and by their order. Two lamps can
 share a symbol (cruise control set is green, ready is white): colour tells
 them apart.
 
-Measured through the simulated webcam at 1.3, 0.8 and 0.55 camera px per
-display px, on the HMI's own framebuffer captured over CAN: all 31 lamps found
-alone and the 28 that can be lit together all found in order, each placed to
-within 1 px of where it was taught; a lamp's own symbol matched at 0.998-1.0
-and a symbol no lamp has at 0.68-0.73, against a line at 0.82. Every fault put
-in was caught and named as what it was: a lamp missing, another in its place,
-moved 3 px (measured 3.0-3.2), drawn in another colour, a symbol it has never
-seen, a flashing lamp held steady, two lamps swapped in the strip. A lamp
-moved 1 px passes at 0.8 and is for review at 0.55, where measuring it reads
-1.5 px.
+Measured end to end, the way it is used: the HMI running as a cluster on
+the virtual bus in bench mode (dark until a tester sends the ignition),
+`layoutval go --webcam --can --dbc can/cluster.dbc`, and the page in Chromium
+with its webcam fed the HMI's screen through the simulated camera (0.8 camera
+px per display px, tilted and rolled, noise and PWM banding). Nothing was
+clicked or typed: the page was opened, and later **Test again** pressed.
 
-And end to end, the way it is used: the real HMI listening on the virtual
-bus, layoutval sending real CAN to it, the page in Chromium with its webcam
-fed the HMI's screen through the simulated camera (0.8 camera px per display
-px), corners found automatically. The teach-in took 4 minutes and learnt all
-31 lamps (28 lit together) and named 12 elements of 81, the rest unknown;
-Check lamps took 2.5 minutes and passed all 33 states; Validate passed 81 of
-81. The first such run failed 7 of 33 states on a correct screen: every
-flashing lamp came back half lit in some shot, because a capture is a short
-mean of frames and a flash that switches during it leaves the lamp half lit.
-A lamp at half its light is now still that lamp.
+| | classic design | BMW design |
+|---|---|---|
+| display found from | its outline | what lit up (a black screen has no visible edge) |
+| size worked out | 1416 x 664 (it is 1790 x 870) | 1416 x 504 (it is 1920 x 720) |
+| signals tried | 58, in 134 states | the same |
+| lamps learnt | 32, every one by name; fixed slots | 31; fixed slots |
+| elements named | Vehicle speed, Engine speed, Fuel level, Outside temperature, Selected gear | Vehicle speed, Selected gear, E power, Driver message |
+| left out, changed by themselves while taught | 6, the range readout among them | none |
+| teach, then check | 17 min: lamps 60 of 62 states, layout 54 of 54 | 14 min: lamps 62 of 62, layout 10 of 10 |
+| test again | 7 min: bulb check 31 of 31, lamps 60 of 62, layout 54 of 54 | 6 min: 31 of 31, 62 of 62, 10 of 10 |
 
-The teach-in found three things wrong with the HMI itself, since fixed there:
-the flashing lamps (seat belt, collision, ESC, immobiliser, lane departure)
-never showed unless an indicator was on; a flashing lamp's slot vanished in
-the dark half of its flash, so every lamp after it jumped sideways every
-380 ms; and with most lamps lit the strip runs into a third row over the gear
-letter and the speedometer (a design matter, left as it is).
+The two states for review are the classic design's shift prompt, which fades
+rather than flashes and was seen as steady once and flashing once. Signals
+that changed nothing were the ones that show only with another set (the gear
+engaged, in D), or not at all on that design.
 
-Two limits. A real webcam is noisier and less steady than the simulated one,
-and nothing here has been measured on one yet; set its exposure by hand
-before teaching (the slider), and keep the room's light as it is between
-teaching and checking, because a lamp is found by how much it changes the
-screen against the rest shot. And what a sweep names is only what the rest
-screen already shows: something drawn only when a signal is on (the cruise set
-speed) is recorded as that signal's side effect, not as an element.
+Getting there found things to fix on both sides. The HMI's cluster checked
+its frames on the display's thread, and while that thread drew a frame for
+the frame server the 20 ms messages looked lost and the failsafe lamps lit;
+it now checks them on reception, as an ECU does. On this side: a backlight's
+PWM banding read as the screen never standing still; the bulb check stands
+still long enough to be taken for the running screen; the DBC's rest value
+for the fuel level sits inside the low-fuel lamp's hysteresis, so the lamp
+stayed lit after a sweep ended low; frames arriving at a steady rate near a
+flash's half period all landed in one half; and on the black BMW screen the
+outline round the gauges cut off the top row of lamps. Each is described in
+[docs/architecture.md](docs/architecture.md).
+
+Two limits. Nothing here has been measured on a real webcam yet, only on the
+simulated one; a real one is noisier, so keep the room's light as it is
+between teaching and testing, since a lamp is found by how much it changes the
+screen. And a signal that shows only with another set first is reported as
+changing nothing until `rig.json` says so.
 
 ## Quick start (the parts, spelled out)
 

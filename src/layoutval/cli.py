@@ -445,25 +445,32 @@ def _sam3_args(c: argparse.ArgumentParser) -> None:
 
 def _can_args(c: argparse.ArgumentParser) -> None:
     c.add_argument("--can", nargs="?", const="udp_multicast", default=None, metavar="BUS",
-                   help="drive the cluster over CAN for the teach-in and lamp check: "
-                        "udp_multicast (default: virtual, over the network, no "
-                        "hardware), socketcan:vcan0, pcan:PCAN_USBBUS1@500000, ...")
-    c.add_argument("--teach-plan", default=None, metavar="FILE",
-                   help="what to switch on and what it is called, e.g. the HMI's "
-                        "can/teach_plan.json; needed with --can")
+                   help="drive the cluster over CAN: udp_multicast (default: virtual, "
+                        "over the network, no hardware), socketcan:vcan0, "
+                        "pcan:PCAN_USBBUS1@500000, ...")
     c.add_argument("--dbc", default=None, metavar="FILE",
-                   help="the CAN database; default the one the teach plan names")
+                   help="the cluster's CAN matrix (DBC); with --can, everything else -- "
+                        "the cluster's node, the ignition, counters and CRCs, cycle "
+                        "times, what every signal shows -- is worked out from it")
+    c.add_argument("--rig", default=None, metavar="FILE",
+                   help="corrections to what was worked out from the DBC (rig.json: "
+                        "names, the E2E algorithm, signals to leave alone, ...); see "
+                        "the rig-detected.json written at start")
+    c.add_argument("--teach-plan", default=None, metavar="FILE",
+                   help="a hand-written list of what to switch on, instead of trying "
+                        "every signal")
 
 
 def _can_setup(args: argparse.Namespace):
-    """(driver, plan) for --can, or (None, None). Stops with a reason if it cannot start."""
+    """(driver, plan, discovery) for --can, or Nones. Stops with a reason if it cannot start."""
     if not getattr(args, "can", None):
-        if getattr(args, "teach_plan", None):
-            raise SystemExit("error: --teach-plan needs --can (the bus to drive the cluster on)")
-        return None, None
+        for flag in ("teach_plan", "rig"):
+            if getattr(args, flag, None):
+                raise SystemExit(f"error: --{flag.replace('_', '-')} needs --can "
+                                 "(the bus to drive the cluster on)")
+        return None, None, None
     if not args.teach_plan:
-        raise SystemExit("error: --can needs --teach-plan: the HMI's can/teach_plan.json, "
-                         "or one written for this cluster")
+        return _can_discover(args)
     from layoutval.lamps import TeachPlan
 
     try:
@@ -494,7 +501,46 @@ def _can_setup(args: argparse.Namespace):
     print(f"CAN: {driver.bus_spec.get('interface')} {driver.bus_spec.get('channel', '')}".rstrip()
           + f", {len(plan.lamps)} lamps and {len(plan.elements)} elements to teach "
             f"from {Path(args.teach_plan).name}")
-    return driver, plan
+    return driver, plan, None
+
+
+def _can_discover(args: argparse.Namespace):
+    """--can with a DBC alone: the rig worked out from it, every signal to be tried."""
+    if not args.dbc:
+        raise SystemExit("error: --can needs the cluster's CAN matrix: --dbc FILE")
+    dbc = Path(args.dbc)
+    if not dbc.is_file():
+        raise SystemExit(f"error: --dbc {dbc}: no such file")
+    try:
+        from layoutval.canbus import CanDriver, Rig
+        from layoutval.discover import Discovery
+    except ImportError as exc:
+        raise SystemExit(f"error: --can needs python-can and cantools: {exc} "
+                         "(pip install 'layoutval[can]')")
+    try:
+        rig = Rig.load(Path(args.rig), dbc) if args.rig else Rig.detect(dbc)
+    except Exception as exc:
+        raise SystemExit(f"error: {Path(args.rig or dbc).name}: {exc}")
+    out = Path(getattr(args, "out", None) or ".")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "rig-detected.json").write_text(json.dumps(rig.to_dict(), indent=2, default=str))
+    try:
+        driver = CanDriver(rig, args.can)
+    except ImportError as exc:
+        raise SystemExit(f"error: --can needs python-can, cantools and msgpack: {exc} "
+                         "(pip install 'layoutval[can]')")
+    except Exception as exc:
+        raise SystemExit(f"error: CAN bus {args.can!r}: {exc}")
+    discovery = Discovery(rig)
+    ign = rig.ignition["signal"] if rig.ignition else "none found"
+    print(f"CAN: {driver.bus_spec.get('interface')} {driver.bus_spec.get('channel', '')}".rstrip()
+          + f"; cluster {rig.cluster_node or '?'}, ignition {ign}, "
+            f"{len(rig.send)} messages sent ({len(rig.e2e)} with E2E), "
+            f"{len(discovery.signals)} signals to try. "
+            f"Worked out from {dbc.name}: see {out / 'rig-detected.json'}")
+    for note in rig.notes:
+        print(f"  note: {note}")
+    return driver, None, discovery
 
 
 def cmd_capture_server(args: argparse.Namespace) -> int:
@@ -577,7 +623,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
                                      display_size=display_size),
         )
 
-    can_driver, teach_plan = _can_setup(args)
+    can_driver, teach_plan, discovery = _can_setup(args)
     session = CaptureSession(
         Path(args.out),
         profile=profile,
@@ -609,6 +655,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         sam3_prompt=getattr(args, "sam3_prompt", None),
         can=can_driver,
         teach_plan=teach_plan,
+        discovery=discovery,
     )
     if getattr(args, "sam3_url", None):
         _report_sam3(args.sam3_url)

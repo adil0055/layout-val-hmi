@@ -8,12 +8,15 @@ the name comes from the signal that was sent, not from anyone labelling a
 picture.
 
 Lamps are learnt by their **symbol**: the change their lighting makes, kept as
-a template, with their lens colour and whether they flash. A lamp's place may
-depend on what else is lit -- a strip that shows only lit lamps, centred, puts
-every lamp lit alone in the same middle slot -- so a lamp is recognised by what
-it looks like, and its place is then checked against where it was taught in
-the same state: alone, or all lit together, where the order and spacing of
-the strip are learnt.
+a template, with their lens colour and whether they flash. A lamp is
+recognised by what it looks like, not by where it is, and then its place is
+checked. On a production cluster every lamp has a slot of its own and lights
+there whatever else is lit; a lamp found at the same place alone, with all
+lamps lit and in the bulb check is taken to be *fixed* and is held to that
+place in every state. Some displays instead show only the lit lamps, closed
+up in a strip -- every lamp lit alone then sits in the same middle slot -- and
+a lamp whose place changes like that is checked only in the states it was
+taught in (alone, all lit, bulb check), and by its order along the strip.
 
 Elements are named by the sweep that changes them: an element found on the
 rest screen whose own box changes in most of a sweep's states is that sweep's
@@ -58,6 +61,10 @@ LIGHT_RANGE = (0.3, 2.0)
 LOCAL_MARGIN = 0.05
 #: Hues further apart than this (OpenCV units, 0..180) are different lamp colours.
 HUE_TOLERANCE = 18.0
+#: A lamp found this close (px) to where it lit alone, all lit together and in
+#: the bulb check has a fixed slot. A strip that closes up moves lamps by a
+#: whole slot; the camera's noise moves a centre a fraction of a pixel.
+FIXED_PX = 2.5
 #: Of an element's box, the part that must change in a sweep state to count.
 COVERAGE_MIN = 0.12
 #: A shot whose lamp energy is below this share of its brightest shot is "off".
@@ -347,6 +354,12 @@ class Lamp:
     offset: tuple[int, int] | None = None
     """Where the lamp's box starts inside its template. Padding round a lamp
     by the frame's edge is clipped, so it is not always the same each side."""
+    states: dict[str, dict] = field(default_factory=dict)
+    """Each state that lights it: label -> {"set": signals, "flashing": bool}.
+    ABS On is steady, ABS Flash flashes: one lamp, two states."""
+    slot_check: tuple[float, float] | None = None
+    fixed: bool | None = None
+    """Lights at one place whatever else is lit (None: not known yet)."""
 
     @property
     def energy(self) -> float:
@@ -364,6 +377,9 @@ class Lamp:
             "order_all": self.order_all,
             "also_changed": [list(b) for b in self.also],
             "offset": None if self.offset is None else list(self.offset),
+            "states": self.states,
+            "slot_check": None if self.slot_check is None else [round(c, 2) for c in self.slot_check],
+            "fixed": self.fixed,
         }
 
 
@@ -376,6 +392,7 @@ class Detection:
     hue: float | None
     flashing: bool | None = None
     lit_in: int = 1                  # shots it was lit in
+    shot: int = -1                   # which shot, for a reading of one
     moved_px: float = 0.0            # how far its place wandered between those shots
     looks_like: str | None = None    # unknown: the lamp it is nearest to
     wrong_colour_of: str | None = None  # unknown: a lamp's symbol, in another colour
@@ -419,6 +436,9 @@ class Library:
         matches no lamp's symbol well enough is "unknown".
         """
         readings = [self._find_one(lit_delta(self.baseline, s), s) for s in shots]
+        for k, r in enumerate(readings):
+            for d in r:
+                d.shot = k
         merged: list[Detection] = []
         names = {d.name for r in readings for d in r if d.name != "unknown"}
         for name in names:
@@ -456,7 +476,8 @@ class Library:
         ys = [d.centre[1] for d in ds]
         centre = (float(np.median(xs)), float(np.median(ys)))
         moved = max(math.hypot(x - centre[0], y - centre[1]) for x, y in zip(xs, ys))
-        flashing = None if shots < 3 else len(ds) < shots
+        seen = {d.shot for d in ds}
+        flashing = None if shots < 3 else turns([k in seen for k in range(shots)]) >= 2
         return Detection(best.name, best.box, centre, best.score, best.hue, flashing,
                          lit_in=len(ds), moved_px=moved, looks_like=best.looks_like,
                          wrong_colour_of=best.wrong_colour_of)
@@ -585,7 +606,10 @@ class Library:
                 hue=d["hue"], colour_ratio=0.0, strength=d["strength"], flashed=d["flashed"],
                 slot_all=None if d["slot_all"] is None else tuple(d["slot_all"]),
                 order_all=d["order_all"], also=[tuple(b) for b in d["also_changed"]],
-                offset=None if d.get("offset") is None else tuple(d["offset"])))
+                offset=None if d.get("offset") is None else tuple(d["offset"]),
+                states=d.get("states", {}),
+                slot_check=None if d.get("slot_check") is None else tuple(d["slot_check"]),
+                fixed=d.get("fixed")))
         return cls(baseline=cv2.imread(str(directory / "lamps-baseline.png")), lamps=lamps,
                    lit_floor=raw["lit_floor"], change_floor=raw["change_floor"],
                    lamp_size=tuple(raw["lamp_size"]),
@@ -645,13 +669,25 @@ def _overlap(a, b) -> float:
 
 
 def _flashing(deltas: list[np.ndarray], box, level: float) -> bool | None:
-    """Lit in some shots and dark in others: None when there were too few shots to say."""
+    """Lit and dark by turns across the shots: None when there were too few to say."""
     if len(deltas) < 3:
         return None
     x, y, w, h = _clip(box, deltas[0].shape)
     energy = [float(np.clip(d[y:y + h, x:x + w] - level, 0, None).sum()) for d in deltas]
     top = max(energy)
-    return bool(top > 0 and min(energy) < BLINK_RATIO * top)
+    if top <= 0:
+        return False
+    return turns([e >= BLINK_RATIO * top for e in energy]) >= 2
+
+
+def turns(lit: list[bool]) -> int:
+    """How often a lamp went on or off across shots taken in order.
+
+    A flash does so at least twice in the shots of a flashing state, which
+    span more than one of its periods; a lamp that comes on during the first
+    shot, or goes off during the last, does so once and is not flashing.
+    """
+    return sum(1 for a, b in zip(lit, lit[1:]) if a != b)
 
 
 # -- teaching ----------------------------------------------------------------
@@ -750,32 +786,7 @@ def learn(plan: TeachPlan, captured: dict[str, list[np.ndarray]]) -> tuple[Libra
     # All lit together: each lamp's slot, and the strip's order and pitch.
     all_report: list[dict[str, Any]] = []
     if "all" in captured and lamps:
-        # Looked for everywhere: lit together they may spread well past where
-        # any one of them lights alone -- every lamp alone lights in a
-        # centred strip's middle slot.
-        lib.zone = None
-        dets = lib.find(captured["all"])
-        named = [d for d in dets if d.name != "unknown"]
-        for order, d in enumerate(named):
-            lamp = lib.get(d.name)
-            if lamp is not None and lamp.slot_all is None:
-                lamp.slot_all, lamp.order_all = d.centre, order
-        seen = [d.name for d in named]
-        twice = sorted({n for n in seen if seen.count(n) > 1})
-        if twice:
-            problems.append(f"all lamps: {', '.join(twice)} recognised more than once")
-        wandered = [f"{d.name} ({d.moved_px:.0f} px)" for d in named if d.moved_px > 2.0]
-        if wandered:
-            problems.append("all lamps: moved between shots, as a strip that reflows "
-                            "while a lamp flashes does: " + ", ".join(wandered))
-        unknown = [d for d in dets if d.name == "unknown"]
-        if unknown:
-            problems.append(f"all lamps: {len(unknown)} lit symbol(s) matched no lamp")
-        lib.pitch = _pitch([d.centre for d in named], th)
-        all_report = [d.to_dict() for d in dets]
-        # Where lamps light, from lamps: what else changed with them (a set
-        # speed, the lane graphic) is not a place a lamp is looked for.
-        _set_zone(lib, extra=[d.box for d in named])
+        all_report = learn_all(lib, captured["all"], problems)
 
     # Elements: what each sweep changes, state by state.
     sweeps: list[dict[str, Any]] = []
@@ -812,6 +823,7 @@ def learn(plan: TeachPlan, captured: dict[str, list[np.ndarray]]) -> tuple[Libra
 
     summary = {
         "lamps": [lamp.to_dict() for lamp in lamps],
+        "layout": layout(lib),
         "all_lit": all_report,
         "lamp_size": [round(tw, 1), round(th, 1)],
         "pitch": None if lib.pitch is None else round(lib.pitch, 2),
@@ -822,6 +834,90 @@ def learn(plan: TeachPlan, captured: dict[str, list[np.ndarray]]) -> tuple[Libra
     }
     summary["_sweeps"] = sweeps            # for naming; not serialised
     return lib, summary
+
+
+def learn_all(lib: Library, shots: list[np.ndarray], problems: list[str]) -> list[dict[str, Any]]:
+    """Every lamp lit at once: each lamp's slot, and the strip's order and pitch.
+
+    Looked for everywhere: lit together they may spread well past where any
+    one of them lights alone -- every lamp alone lights in a centred strip's
+    middle slot.
+    """
+    lib.zone = None
+    dets = lib.find(shots)
+    named = [d for d in dets if d.name != "unknown"]
+    for order, d in enumerate(named):
+        lamp = lib.get(d.name)
+        if lamp is not None and lamp.slot_all is None:
+            lamp.slot_all, lamp.order_all = d.centre, order
+    seen = [d.name for d in named]
+    twice = sorted({n for n in seen if seen.count(n) > 1})
+    if twice:
+        problems.append(f"all lamps: {', '.join(twice)} recognised more than once")
+    wandered = [f"{d.name} ({d.moved_px:.0f} px)" for d in named if d.moved_px > 2.0]
+    if wandered:
+        problems.append("all lamps: moved between shots, as a strip that reflows "
+                        "while a lamp flashes does: " + ", ".join(wandered))
+    unknown = [d for d in dets if d.name == "unknown"]
+    if unknown:
+        problems.append(f"all lamps: {len(unknown)} lit symbol(s) matched no lamp")
+    lib.pitch = _pitch([d.centre for d in named], lib.lamp_size[1])
+    # Where lamps light, from lamps: what else changed with them (a set
+    # speed, the lane graphic) is not a place a lamp is looked for.
+    _set_zone(lib, extra=[d.box for d in named])
+    _settle_fixed(lib)
+    return [d.to_dict() for d in dets]
+
+
+def learn_bulb_check(lib: Library, shots: list[np.ndarray], problems: list[str]) -> list[dict[str, Any]]:
+    """The bulb check at power-up: where each lamp sits when every one is lit.
+
+    A production cluster lights every lamp for a few seconds when the
+    ignition comes on, lamps that can never be lit together over CAN
+    included. Their places then are what a later bulb check is held to.
+    """
+    zone, lib.zone = lib.zone, None
+    dets = lib.find(shots)
+    named = [d for d in dets if d.name != "unknown"]
+    for d in named:
+        lamp = lib.get(d.name)
+        if lamp is not None and lamp.slot_check is None:
+            lamp.slot_check = d.centre
+    missing = [lamp.name for lamp in lib.lamps if lamp.slot_check is None]
+    if missing:
+        problems.append(f"bulb check: not lit -- {', '.join(missing)}")
+    lib.zone = zone
+    _set_zone(lib, extra=[d.box for d in named])
+    _settle_fixed(lib)
+    return [d.to_dict() for d in dets]
+
+
+def _settle_fixed(lib: Library) -> None:
+    """Which lamps have a slot of their own: the same place in every state seen.
+
+    One lamp that moves means a strip that closes up, and then no lamp is
+    taken to be fixed: in a centred strip of seven, the middle lamp lights in
+    the middle slot both alone and with all lit, by coincidence. A lamp seen
+    in one state only stays unknown (None), and is checked as a lamp of a
+    strip would be.
+    """
+    stays: dict[str, bool] = {}
+    for lamp in lib.lamps:
+        places = [p for p in (lamp.slot_all, lamp.slot_check) if p is not None]
+        if places:
+            stays[lamp.name] = all(math.hypot(p[0] - lamp.centre[0], p[1] - lamp.centre[1])
+                                   <= FIXED_PX for p in places)
+    closes_up = not all(stays.values())
+    for lamp in lib.lamps:
+        lamp.fixed = None if lamp.name not in stays else (stays[lamp.name] and not closes_up)
+
+
+def layout(lib: Library) -> str:
+    """"fixed slots", "closes up" (a strip of only the lit lamps) or "unknown"."""
+    known = [lamp.fixed for lamp in lib.lamps if lamp.fixed is not None]
+    if not known:
+        return "unknown"
+    return "fixed slots" if all(known) else "closes up"
 
 
 def _set_zone(lib: Library, extra: list[tuple[int, int, int, int]] = ()) -> None:
@@ -927,13 +1023,16 @@ class LampResult:
 
 
 def check(lib: Library, found: list[Detection], expected: list[str], *,
-          where: str = "", tol_warn: float = 1.5, tol_fail: float = 2.5) -> list[LampResult]:
+          where: str = "", tol_warn: float = 1.5, tol_fail: float = 2.5,
+          flashing: dict[str, bool] | None = None) -> list[LampResult]:
     """These detections against the lamps that should be lit.
 
-    ``where`` is "alone" or "all" when this is exactly a state the lamps were
-    taught in: each is then expected where it was taught, to the tolerance.
-    In any other state the strip may lay them out differently, so only which
-    lamps are lit, their colour and their order are checked.
+    A lamp with a fixed slot is expected in its slot, to the tolerance,
+    whatever else is lit. Any other lamp is expected where it was taught when
+    ``where`` names that state exactly ("alone", "all" lit together, the bulb
+    "check"); in any other state a strip that closes up may lay it out
+    differently, so only that it is lit, its colour and its order along the
+    strip are checked.
     """
     out: list[LampResult] = []
     by_name: dict[str, list[Detection]] = {}
@@ -956,10 +1055,14 @@ def check(lib: Library, found: list[Detection], expected: list[str], *,
         r = LampResult(name, "PASS", None, True, True, d.centre, colour=hue_name(d.hue),
                        flashing=d.flashing)
         want = None
-        if lamp is not None and where == "alone":
+        if lamp is not None and lamp.fixed:
+            want = lamp.centre
+        elif lamp is not None and where == "alone":
             want = lamp.centre
         elif lamp is not None and where == "all":
             want = lamp.slot_all
+        elif lamp is not None and where == "check":
+            want = lamp.slot_check
         if want is not None:
             r.dx, r.dy = d.centre[0] - want[0], d.centre[1] - want[1]
             off = math.hypot(r.dx, r.dy)
@@ -969,21 +1072,33 @@ def check(lib: Library, found: list[Detection], expected: list[str], *,
                 r.verdict, r.reason = "REVIEW", "position_marginal"
         if d.moved_px > tol_fail:
             r.verdict, r.reason = "FAIL", r.reason or "moves_between_shots"
-        if lamp is not None and lamp.blinks and d.flashing is False:
+        blinks = (flashing or {}).get(name, lamp.blinks if lamp is not None else None)
+        if where == "check":
+            blinks = False                            # the bulb check holds every lamp steady
+        if blinks and d.flashing is False:
             r.verdict, r.reason = _worse(r.verdict, "REVIEW"), r.reason or "not_flashing"
-        if lamp is not None and not lamp.blinks and d.flashing:
+        if blinks is False and d.flashing:
             r.verdict, r.reason = _worse(r.verdict, "REVIEW"), r.reason or "flashing"
         out.append(r)
         for extra in ds[1:]:
             out.append(LampResult(name, "FAIL", "shown_twice", True, True, extra.centre,
                                   colour=hue_name(extra.hue)))
     side = [b for name in expected if lib.get(name) is not None for b in lib.get(name).also]
+    # An expected lamp's own place: a symbol there that matches nothing is
+    # that lamp at another brightness -- one that fades rather than flashes
+    # (the HMI's shift prompt, 15% to full) matches its own symbol only when
+    # bright enough. A wrong symbol in its place still leaves it missing.
+    own = [d.box for name in expected for d in by_name.get(name, [])]
+    own += [lib.get(name).box for name in expected
+            if lib.get(name) is not None and lib.get(name).fixed]
     for name, ds in by_name.items():
         if name in expected:
             continue
         for d in ds:
             if name == "unknown" and any(_overlap(d.box, b) > 0.3 for b in side):
                 continue                  # what the expected lamp's signals also change
+            if name == "unknown" and any(_overlap(d.box, b) > 0.3 for b in own):
+                continue                  # the expected lamp, dim
             reason = "unknown_symbol" if name == "unknown" else "unexpected"
             if name == "unknown" and d.wrong_colour_of:
                 reason = f"unknown_symbol: {d.wrong_colour_of}'s symbol in {hue_name(d.hue)}"
@@ -991,10 +1106,12 @@ def check(lib: Library, found: list[Detection], expected: list[str], *,
                 reason = f"unknown_symbol: nearest is {d.looks_like} ({d.score:.2f})"
             out.append(LampResult(name, "FAIL", reason, False, True, d.centre,
                                   colour=hue_name(d.hue), flashing=d.flashing))
-    # Order along the strip, as when all were lit.
+    # Order along the strip, as when all were lit: lamps without a slot of
+    # their own (one with a slot is already held to its place).
     shown = [r for r in out if r.expected and r.found and r.reason != "shown_twice"]
     ranked = [(lib.get(r.name).order_all, r) for r in shown
-              if lib.get(r.name) is not None and lib.get(r.name).order_all is not None]
+              if lib.get(r.name) is not None and lib.get(r.name).order_all is not None
+              and not lib.get(r.name).fixed]
     if len(ranked) >= 2:
         row = max(1.0, lib.lamp_size[1])
         seen = sorted(ranked, key=lambda t: (round(t[1].centre[1] / row), t[1].centre[0]))

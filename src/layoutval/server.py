@@ -450,12 +450,18 @@ class CaptureSession:
         sam3_prompt: str | None = None,
         can: Any = None,
         teach_plan: Any = None,
+        discovery: Any = None,
     ) -> None:
         self.lock = threading.Lock()
         #: The CAN tester (layoutval.canbus.CanDriver) and what to switch on
-        #: with it (layoutval.lamps.TeachPlan): the CAN teach-in and lamp check.
+        #: with it: every signal the DBC has the cluster receive
+        #: (layoutval.discover.Discovery), or a hand-written plan
+        #: (layoutval.lamps.TeachPlan).
         self.can = can
         self.plan = teach_plan
+        self.discovery = discovery
+        #: The one-button run (layoutval.autorun), while there is one.
+        self.auto: Any = None
         self.lamp_lib: Any = None
         self.teach_summary: dict[str, Any] | None = None
         self._teach_files: dict[str, dict[int, Path]] = {}
@@ -565,6 +571,9 @@ class CaptureSession:
         self._lens_K: tuple[Any, np.ndarray | None] = (None, None)
         self.reference_edges: np.ndarray | None = None
         self.screen_mask: np.ndarray | None = None
+        #: Where the screen changed on its own while it was taught over CAN
+        #: (a trip counter, a range, a clock): not compared, element or not.
+        self.changing_mask: np.ndarray | None = None
         self.history: list[CaptureRecord] = []
 
         if profile is not None and profile.reference_path:
@@ -630,7 +639,7 @@ class CaptureSession:
                     drift_alarm_px=self.drift_alarm_px)
                 self.reference = None
                 self.reference_camera = None
-                self.reference_edges = self.screen_mask = None
+                self.reference_edges = self.screen_mask = self.changing_mask = None
                 if self._profile_is_auto:
                     self.profile = None
                     self._profile_is_auto = False
@@ -669,7 +678,7 @@ class CaptureSession:
                     drift_alarm_px=self.drift_alarm_px)
                 self.reference = None
                 self.reference_camera = None
-                self.reference_edges = self.screen_mask = None
+                self.reference_edges = self.screen_mask = self.changing_mask = None
                 if self._profile_is_auto:
                     self.profile = None
                     self._profile_is_auto = False
@@ -715,6 +724,7 @@ class CaptureSession:
             ),
             "captures": len(self.history),
             "can": self._can_status(),
+            "auto": (None if self.auto is None else self.auto.progress.to_dict()),
         }
 
     @property
@@ -820,17 +830,55 @@ class CaptureSession:
     # the step's shots one by one. See layoutval.lamps for what is learnt.
 
     def _can_status(self) -> dict[str, Any] | None:
-        if self.can is None or self.plan is None:
+        if self.can is None or (self.plan is None and self.discovery is None):
             return None
         lib = self.lamp_lib
+        if self.plan is not None:
+            what = {"plan": self.plan.path.name if self.plan.path else "",
+                    "lamps_in_plan": len(self.plan.lamps),
+                    "elements_in_plan": len(self.plan.elements)}
+        else:
+            what = {"plan": Path(self.discovery.path).name,
+                    "signals": len(self.discovery.signals)}
         return {
             "bus": getattr(self.can, "bus_spec", {}),
-            "plan": self.plan.path.name if self.plan.path else "",
-            "lamps_in_plan": len(self.plan.lamps),
-            "elements_in_plan": len(self.plan.elements),
+            **what,
             "taught": lib is not None,
             "lamps_learnt": len(lib.lamps) if lib is not None else 0,
         }
+
+    # -- one button: from the webcam's frames to a report ---------------------
+
+    def auto_start(self, log=None, teach: bool | None = None) -> dict[str, Any]:
+        """Start the automatic run (layoutval.autorun), or say how the one going is.
+
+        The first run teaches; later ones test against what it taught, unless
+        ``teach`` says to teach again.
+        """
+        from layoutval.autorun import AutoRun
+
+        with self.lock:
+            if self.auto is not None and self.auto.running:
+                return self.auto.progress.to_dict()
+            self.auto = AutoRun(self, log=log, teach=teach)
+        self.auto.start()
+        return self.auto.progress.to_dict()
+
+    def auto_frame(self, data: bytes) -> dict[str, Any]:
+        """A frame from the page's webcam, for the run; how it is going."""
+        run = self.auto
+        if run is None:
+            raise ValueError("no automatic run: start one first")
+        if not run.progress.done:
+            run.feed.put(data)
+        return run.progress.to_dict()
+
+    def auto_stop(self) -> dict[str, Any]:
+        run = self.auto
+        if run is None:
+            raise ValueError("no automatic run")
+        run.stop()
+        return run.progress.to_dict()
 
     def can_start(self, mode: str) -> dict[str, Any]:
         """Begin a teach-in or a lamp check: the steps the page is to capture."""
@@ -1332,7 +1380,7 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
-        self.reference_edges = self.screen_mask = None
+        self.reference_edges = self.screen_mask = self.changing_mask = None
 
     def _note_sampling_ratio(self, rec: CaptureRecord, geometry: Any) -> None:
         ratio = geometry.sampling_ratio()
@@ -1584,7 +1632,7 @@ class CaptureSession:
         # meaningless.  Drop it rather than let it be compared across.
         self.reference = None
         self.reference_camera = None
-        self.reference_edges = self.screen_mask = None
+        self.reference_edges = self.screen_mask = self.changing_mask = None
         return rec
 
     def _propose(self, frame: np.ndarray, base: str,
@@ -1840,7 +1888,7 @@ class CaptureSession:
             )
         self.reference = None
         self.reference_camera = None
-        self.reference_edges = self.screen_mask = None
+        self.reference_edges = self.screen_mask = self.changing_mask = None
         return rec
 
     def _why_no_board(self, frame: np.ndarray, saved_as: str) -> str:
@@ -2362,6 +2410,8 @@ class CaptureSession:
         ok = live_seen & self._reference_seen()
         if self.screen_mask is not None and self.screen_mask.shape == ok.shape:
             ok &= self.screen_mask
+        if self.changing_mask is not None and self.changing_mask.shape == ok.shape:
+            ok &= ~self.changing_mask
         h, w = ok.shape[:2]
         rim = round(0.02 * min(h, w))
         ok[:rim] = False
@@ -2853,6 +2903,18 @@ button.ghost.live{background:#1D5B8A;border-color:#3E8FD0}
   <div class="step" data-a="validate"><b>3 Validate</b><span>screen under test</span></div>
 </div>
 
+<div class="card" id="autocard" style="display:none">
+  <b>Automatic</b> <span id="autowhat" style="color:#8B9AA3;font-size:12.5px"></span>
+  <div id="autobar" style="height:6px;background:#22303A;border-radius:3px;margin-top:10px;overflow:hidden">
+    <div id="autofill" style="height:100%;width:0;background:#4CA3DD;transition:width .3s"></div></div>
+  <div class="hint" id="autohint"></div>
+  <div style="display:flex;gap:8px;margin-top:10px">
+    <button id="autogo" class="ghost">Test again</button>
+    <button id="autoteach" class="ghost">Teach again</button>
+    <button id="autostop" class="ghost">Stop</button>
+  </div>
+</div>
+
 <div class="card" id="cancard" style="display:none">
   <b>Over CAN</b> <span id="canwhat" style="color:#8B9AA3;font-size:12.5px"></span>
   <div style="display:flex;gap:8px;margin-top:10px">
@@ -2932,6 +2994,8 @@ const $ = id => document.getElementById(id);
 let CAM = null, AUTO = null, LOCKED = null, LOCK_WANT = {}, EXPO = null;
 const CAN_CAM = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 const WANT_CAM = new URLSearchParams(location.search).get("cam") === "1";
+// The whole run starts by itself when the webcam does, unless &auto=0.
+const AUTO_START = new URLSearchParams(location.search).get("auto") !== "0";
 const SHOOT = () => CAM ? "Capture from webcam" : "Take photo";
 
 document.querySelectorAll(".step").forEach(el => {
@@ -3116,7 +3180,9 @@ async function refresh() {
 const CAN_FRAMES = 2;
 let CAN_RUN = null;
 function paintCan() {
-  const c = STATUS && STATUS.can;
+  // The step-by-step card is for a hand-written teach plan; from the DBC
+  // alone, the Automatic card does it all.
+  const c = STATUS && STATUS.can && STATUS.can.lamps_in_plan !== undefined ? STATUS.can : null;
   $("cancard").style.display = c ? "block" : "none";
   if (!c || CAN_RUN) return;
   $("canwhat").textContent = `${c.lamps_in_plan} lamps, ${c.elements_in_plan} elements · ` +
@@ -3191,6 +3257,75 @@ async function canRun(mode) {
   $("canstop").style.display = "none";
   await refresh();
 }
+// --- one button: everything, from the webcam's frames ----------------------
+// Once the webcam has settled and its exposure is held, the page just keeps
+// sending the computer frames; the computer drives the cluster, decides from
+// the frames when it has reacted and which to keep, and says how it is going.
+let RUN = null, RUN_DONE = false;
+async function grabJpeg() {
+  const v = $("cam"), cv = document.createElement("canvas");
+  cv.width = v.videoWidth; cv.height = v.videoHeight;
+  await nextFrame(v);
+  cv.getContext("2d").drawImage(v, 0, 0, cv.width, cv.height);
+  return await new Promise(r => cv.toBlob(r, "image/jpeg", 0.95));
+}
+function paintAuto(p) {
+  $("autocard").style.display = CAM ? "block" : "none";
+  const taught = !!(STATUS && STATUS.can && STATUS.can.taught);
+  $("autogo").style.display = RUN ? "none" : "";
+  $("autogo").textContent = taught ? "Test again" : "Run";
+  $("autoteach").style.display = RUN || !taught ? "none" : "";
+  $("autostop").style.display = RUN ? "" : "none";
+  if (!p) return;
+  const names = {starting: "Starting", power: "Power cycle", locate: "Finding the display",
+    reference: "Reference", teach: "Teaching", lamps: "Checking lamps", validate: "Validating"};
+  $("autowhat").textContent = p.done ? "done" : (names[p.phase] || p.phase);
+  $("autohint").textContent = p.done ? "" : (p.steps ? `${p.step} of ${p.steps}: ` : "") + (p.detail || "");
+  const order = ["starting", "power", "locate", "reference", "teach", "lamps", "validate"];
+  const k = Math.max(0, order.indexOf(p.phase));
+  const within = p.steps ? p.step / p.steps : 0;
+  $("autofill").style.width = (p.done ? 100 : Math.round(100 * (k + within) / order.length)) + "%";
+}
+async function autoPost(what, body) {
+  const json = !(body instanceof Blob);
+  const r = await fetch(`/auto/${what}?t=${TOKEN}`, {method: "POST",
+    body: json ? JSON.stringify(body || {}) : body,
+    headers: {"Content-Type": json ? "application/json" : "image/jpeg"}});
+  const s = await r.json();
+  if (!r.ok) throw new Error(s.detail || r.status);
+  return s;
+}
+async function autoRun(teach) {
+  if (RUN || !CAM) return;
+  RUN = {stream: CAM};
+  $("result").style.display = "none";
+  paintAuto(null);
+  try {
+    let p = await autoPost("start", teach === undefined ? {} : {teach});
+    paintAuto(p);
+    while (RUN && !p.done) {
+      if (CAM !== RUN.stream) { await autoPost("stop"); break; }
+      const t0 = performance.now();
+      p = await autoPost("frame", await grabJpeg());
+      paintAuto(p);
+      // A varying gap: frames at a steady rate near a flash's half period
+      // would all land in the same half, and a flashing lamp look steady
+      // or dark.
+      const wait = 60 + 120 * Math.random() - (performance.now() - t0);
+      if (wait > 0) await sleep(wait);
+    }
+    if (p.done && p.record) { show(p.record); RUN_DONE = true; }
+  } catch (e) {
+    show({verdict: "FAILED", detail: String(e.message || e)});
+  }
+  RUN = null;
+  paintAuto(null);
+  await refresh();
+}
+$("autogo").onclick = () => autoRun();
+$("autoteach").onclick = () => autoRun(true);
+$("autostop").onclick = async () => { try { await autoPost("stop"); } catch (e) {} };
+
 $("canteach").onclick = () => canRun("teach");
 $("cancheck").onclick = () => canRun("check");
 $("canstop").onclick = () => { if (CAN_RUN) CAN_RUN.stop = true; };
@@ -3418,6 +3553,8 @@ async function lockCam(stream) {
     catch (e) { LOCKED = ""; }
   }
   setupExposure();
+  // Start camera is all it takes: the run begins once the picture is held.
+  if (AUTO_START && !RUN && !RUN_DONE) setTimeout(autoRun, 500);
   paintCam();
 }
 
@@ -3526,6 +3663,7 @@ function stopCam() {
 function paintCam() {
   if (AUTO && (action !== "intrinsics" || !CAM)) stopAuto();
   $("camwrap").style.display = CAM ? "block" : "none";
+  paintAuto(null);
   // The slider once the camera has settled; a line saying why not, where it cannot.
   $("exprow").style.display = CAM && EXPO !== null ? "flex" : "none";
   $("camexp").style.display = EXPO ? "" : "none";
@@ -3732,6 +3870,8 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.server.quiet:  # type: ignore[attr-defined]
             return
+        if self.path.startswith("/auto/frame"):
+            return                  # the automatic run's stream: several a second
         print(f"  {self.address_string()} {fmt % args}")
 
     # -- routes -------------------------------------------------------------
@@ -3835,6 +3975,33 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, payload)
 
+    def _auto(self, what: str) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_UPLOAD_BYTES:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"detail": "too large"})
+            return
+        body = self.rfile.read(length) if length else b""
+        quiet = self.server.quiet  # type: ignore[attr-defined]
+        try:
+            if what == "start":
+                try:
+                    teach = json.loads(body or b"{}").get("teach")
+                except (ValueError, AttributeError):
+                    teach = None
+                payload = self.session.auto_start(log=None if quiet else _print_flush,
+                                                  teach=None if teach is None else bool(teach))
+            elif what == "frame":
+                payload = self.session.auto_frame(body)
+            elif what == "stop":
+                payload = self.session.auto_stop()
+            else:
+                self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
+                return
+        except ValueError as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"detail": str(exc)})
+            return
+        self._json(HTTPStatus.OK, payload)
+
     def do_POST(self) -> None:  # noqa: N802
         url = urlparse(self.path)
         if not self._authorised(parse_qs(url.query)):
@@ -3848,6 +4015,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if url.path.startswith("/can/"):
             self._can(url.path[len("/can/"):])
+            return
+        if url.path.startswith("/auto/"):
+            self._auto(url.path[len("/auto/"):])
             return
         if url.path != "/upload":
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
@@ -3957,6 +4127,10 @@ def _distort_points(points: np.ndarray, intrinsics: Any, new_k: np.ndarray) -> n
     raw, _ = cv2.projectPoints(rays.reshape(-1, 1, 3), np.zeros(3), np.zeros(3),
                                intrinsics.K, intrinsics.dist)
     return raw.reshape(-1, 2)
+
+
+def _print_flush(message: str) -> None:
+    print(f"  {message}", flush=True)
 
 
 def _read_mode(body: bytes) -> str:

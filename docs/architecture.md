@@ -732,6 +732,100 @@ any state, the order along the strip is checked against the all-lit order,
 and only lamps outside the longest run in order are flagged, so two lamps
 swapped flag two, not the strip.
 
+### Discovery: the teach-in from the DBC alone
+
+`discover.py` replaces the teach plan with the matrix. `canbus.Rig` works the
+bus out of the DBC (cluster node, messages and cycle times, ignition, E2E
+counters and CRCs, quiet rest values; `rig.json` corrects any of it), and
+`Discovery` lists every signal the cluster receives with the states to try:
+each bit flipped, each value of a value table but the ones meaning "not
+available", each number at 5, 25, 60 and 95% of its range -- ordered away
+from the end its rest value is nearer, so that it comes back to rest from the
+far side. A warning with hysteresis is why: the HMI's low fuel lamp lights at
+12% and lets go at 15%, and its DBC's rest value is 14%, so a sweep that
+ended low left the lamp lit for the rest of the run.
+
+Each signal is looked at as soon as its states and the rest after it are
+shot (`look`), on a thread of its own while the next signal is shot, and its
+frames are let go; `learn` then puts the signals together. A **lamp** is a
+symbol lighting where the rest screen was empty -- 90% of it on pixels with
+nothing drawn within 3 px -- because a letter turning into another (P to D)
+lights pixels the old one did not use. A number's symbols are lamps only in
+one of the bulb check's places (`bulb_slots`: compact symbols lit throughout
+the bulb check where the rest screen is dark), since a readout's digits come
+and go in dark places too. One lamp is one symbol in one place and colour,
+whatever lights it: ABS On and Flash, every door, the coolant request and
+the coolant temperature at 95%. Two learnt templates are both noisy and
+match each other less well than either matches a frame (0.74-0.78 for the
+same lamp through the page), so one lamp is a symbol within a third of a lamp
+of the other, in its colour, matching at 0.6. A lamp is flashing when it went
+on and off at least twice across a state's shots -- a flash does, over more
+than one period -- not merely when it was dark in one: dark in the first shot
+only, it came on late. Each signal's change, less its lamps, names
+the rest screen's elements (`name_elements`), and what changed between the
+rest before a signal and the rest after it changed on its own (`_drift`):
+the elements there -- the odometer, the trip -- are left out of the layout
+check.
+
+### The one-button run
+
+`autorun.py` runs the whole sequence on a thread of its own, fed by the
+page: the page only streams the webcam's frames (`/auto/frame`) and shows
+what comes back. Nothing is told which frame to use.
+
+**`watch`** decides that, for every state sent: frames arriving within the
+run's own delay of sending are of the state before -- the delay from a state
+sent to the first frame showing it, measured at ignition off and on (the
+longer of the two, between 0.12 and 1 s; through the page and the simulated
+webcam it came out at 0.14-0.44 s, which is why it is measured, not fixed);
+a change is a frame unlike every
+frame the screen showed before (one, or both halves of a flash); settled is a
+frame matching one 0.25-1.2 s older -- still, or a flash come round. Then
+shots are taken across 1.3 s, or 0.7 s when nothing moved in that time (no
+flash has longer halves). A state that changes nothing is given 1.5 s. Frames
+are compared small (480 px wide), and a pixel has changed when it moved by
+more than the noise and by more than 30% of its brightness: a backlight's PWM
+banding through a camera is a gain on each row, ±8% in the simulated camera,
+which is 40 levels on white text -- with an absolute threshold the screen
+never stood still. The noise is measured once the picture is still, since the
+cluster may be part way through starting when the camera opens.
+
+Frames at a steady rate near a flash's half period all land in the same half,
+and a flashing lamp then looks steady, or is never seen lit: through the page
+the frames came about every 0.35 s and the HMI flashes in 0.38 s halves, and
+the traction-control lamp's Flash state was "missing". So the page leaves a
+varying gap between frames (60-180 ms on top of the time a frame takes), and a
+lamp-check state that does not pass is looked at again for 2.5 s before it is
+reported ("seen twice"). A symbol that matches nothing, in the place of a lamp
+the state lights, is that lamp at another brightness: the HMI's shift prompt
+fades between 15% and full rather than flashing, and at a quarter of its light
+it no longer matches its own symbol. A wrong symbol in that place still leaves
+the lamp missing, so the fault is not lost.
+
+**The power cycle** gives the display and the bulb check. Ignition off until
+dark and still (and the bus asleep, if that is what it takes); ignition on,
+recording ten frames a second, until the screen has stayed still for 6 s --
+a bulb check can stand still for several seconds, and was taken for the
+running screen when 2.5 s was enough. What lit up locates the display
+(`lit_region`, over the running screen and the whole start-up: the bulb check
+lights lamps the running screen leaves dark, and on the BMW design's black
+screen the outline round the gauges alone cut the top row of lamps off; the
+corners finder's outline must hold 97% of it, else the outline is taken round
+it), and the start-up frames with the most compact
+symbols lit where the running screen is dark are the bulb check
+(`bulb_frames`). A bulb-check symbol is an unknown lamp only if it is lit in
+every bulb-check frame, still, sized like the lamps, and on no lamp: the
+needles sweeping through the bulb check made twenty "lamps" on the dials
+before.
+
+**Teach, then test.** The first run teaches: display, reference, discovery,
+lamp check, validate. Later runs test against it: power cycle (every lamp lit
+in the bulb check, in its place), lamp check, validate. The lamp check starts
+with the rest screen as it is now and measures against that, not the
+teach-in's -- minutes or days old; and after a lamp a number lit, the number
+is driven past where it lit (a "letting go" step, not checked), for the same
+hysteresis.
+
 ---
 
 ## 10. The residual check
@@ -1107,8 +1201,10 @@ src/layoutval/
 ├── residual.py       advisory: what you did not model
 ├── profile.py        the element inventory and its reference patches
 ├── teachin.py        differential teach-in against CAN signals
-├── canbus.py         the tester's side of a CAN bus: a DBC's signals, sent cyclically
-├── lamps.py          CAN teach-in: lamps by symbol, elements by sweep, and the lamp check
+├── canbus.py         the tester's side of a CAN bus, worked out from a DBC (Rig), sent cyclically
+├── lamps.py          lamps by symbol, elements by sweep, and the lamp check
+├── discover.py       the teach-in from the DBC alone: every signal tried, lamps and elements found
+├── autorun.py        the one-button run: power cycle, display, reference, teach, check, validate
 ├── autoprofile.py    inventory from the reference frame, when none is authored
 ├── authoring.py      assisted annotation — the only place a model belongs
 ├── repeatability.py  σ, from a static screen
@@ -1165,6 +1261,17 @@ Stated plainly, because the alternative is someone discovering them later:
   different places, aligned in display space, and the darkest value each pixel
   takes across them -- reflections move with the camera and the content does
   not, and a reflection only ever adds light.
+- **The one-button run is measured only through the simulated webcam.** A
+  real one has its own noise, auto-everything until the page locks it, and
+  rolling-shutter flicker; the run measures its noise and its delay, but none
+  of it has met a real camera yet. A cluster's signals that show only with
+  another set first (the gear engaged shows in D) are reported as changing
+  nothing until `rig.json` says so (`when`), and a lamp lit only by the
+  cluster's own logic from several signals at once is found in the bulb check
+  but stays an unknown lamp. A display's size worked out from its shape is a
+  few percent off (the HMI's 1790 x 870 came out 1424 x 670 from the camera's
+  side view), which scales every number but leaves comparisons with the
+  reference -- taken through the same size -- as they were.
 - **`--edges` is validated on photographs moved in software, not re-taken.**
   Two bench photographs warped to new poses, with the drawing shifted inside
   its edges, keep the edge in the plane of the pixels by construction. A real

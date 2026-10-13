@@ -1,9 +1,11 @@
 """The CAN teach-in and the lamp check, on a small cluster of its own.
 
-The cluster here draws its lamps the way the HMI does: a strip in which only
+The cluster here draws its lamps in either of two ways: a strip in which only
 lit lamps take space, centred, so every lamp lit alone lights in the same
-middle slot, and a flashing lamp keeps its slot through the flash. Each state
-is shot through the simulated camera and rectified back, as the server does.
+middle slot; or, as a production cluster (and the HMI) does, every lamp in a
+fixed slot of its own. A flashing lamp keeps its slot through the flash. Each
+state is shot through the simulated camera and rectified back, as the server
+does.
 """
 
 from __future__ import annotations
@@ -70,8 +72,12 @@ LAMPS = [  # name, signal, drawing, colour, flashes
 ]
 
 
-def render(state: dict, *, blink_on: bool | float = True, faults: dict | None = None) -> np.ndarray:
-    """The cluster in ``state``; ``faults`` draws it wrong on purpose."""
+def render(state: dict, *, blink_on: bool | float = True, faults: dict | None = None,
+           fixed: bool = False) -> np.ndarray:
+    """The cluster in ``state``; ``faults`` draws it wrong on purpose.
+
+    ``fixed``: every lamp in a slot of its own, else a strip of the lit ones.
+    """
     faults = faults or {}
     img = np.full((DS[1], DS[0], 3), (14, 12, 10), np.uint8)
     cv2.circle(img, (160, 170), 70, (70, 60, 50), 2, cv2.LINE_AA)
@@ -80,18 +86,26 @@ def render(state: dict, *, blink_on: bool | float = True, faults: dict | None = 
     cv2.putText(img, "km/h", (138, 215), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
     cv2.putText(img, "TRIP", (430, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
     lit = []
-    for name, sig, draw, colour, flashes in LAMPS:
+    for slot, (name, sig, draw, colour, flashes) in enumerate(LAMPS):
         on = bool(state.get(sig))
         if sig == "ready":
             on = bool(state.get("ready")) and not state.get("cruise")
         if on:
-            lit.append((name, draw, colour, flashes))
+            lit.append((slot, name, draw, colour, flashes))
     order = faults.get("order")
     if order:
-        lit.sort(key=lambda t: order.index(t[0]) if t[0] in order else 99)
-    width = len(lit) * SIZE + (len(lit) - 1) * GAP
+        if fixed:      # swapped slots
+            slots = sorted(t[0] for t in lit)
+            lit.sort(key=lambda t: order.index(t[1]) if t[1] in order else 99)
+            lit = [(k,) + t[1:] for k, t in zip(slots, lit)]
+        else:
+            lit.sort(key=lambda t: order.index(t[1]) if t[1] in order else 99)
+    count = len(LAMPS) if fixed else len(lit)
+    width = count * SIZE + (count - 1) * GAP
     x0 = DS[0] // 2 - width // 2
-    for k, (name, draw, colour, flashes) in enumerate(lit):
+    for k, (slot, name, draw, colour, flashes) in enumerate(lit):
+        if fixed:
+            k = slot
         if flashes and not blink_on:
             continue                         # its slot kept, dark
         if flashes and blink_on is not True:
@@ -106,6 +120,11 @@ def render(state: dict, *, blink_on: bool | float = True, faults: dict | None = 
         img[y:y + SIZE, x:x + SIZE] = np.maximum(img[y:y + SIZE, x:x + SIZE], tile)
     if faults.get("stranger"):
         cv2.drawMarker(img, (DS[0] // 2, ROW_Y), AMBER, cv2.MARKER_TILTED_CROSS, 24, 3)
+    if faults.get("stranger_at"):
+        slot = next(k for k, (n, *_) in enumerate(LAMPS) if n == faults["stranger_at"])
+        width = len(LAMPS) * SIZE + (len(LAMPS) - 1) * GAP
+        x = DS[0] // 2 - width // 2 + slot * (SIZE + GAP) + SIZE // 2
+        cv2.drawMarker(img, (x, ROW_Y), RED, cv2.MARKER_TILTED_CROSS, 24, 3)
     return img
 
 
@@ -196,9 +215,9 @@ def test_a_readout_is_named_by_the_sweep_that_changes_it(taught):
     assert mapping["digits"] == "Speed"
 
 
-def check(lib, cam, state, expected, where="alone", **faults):
+def check(lib, cam, state, expected, where="alone", fixed=False, **faults):
     steps = [{"set": state, "shots": 6}]
-    found = lib.find(shots_of(cam, steps[0], faults=faults))
+    found = lib.find(shots_of(cam, steps[0], faults=faults, fixed=fixed))
     return L.check(lib, found, expected, where=where)
 
 
@@ -282,6 +301,22 @@ def test_a_flash_caught_switching_is_still_the_lamp(taught, camera):
     assert next(r for r in results if r.name == "Seat belt").flashing is True
 
 
+def test_a_lamp_that_fades_is_that_lamp_even_dim(fixed, camera):
+    lib, _ = fixed
+    # The HMI's shift prompt fades between 15% and full: dim, it no longer
+    # matches its own symbol, and was an "unknown symbol" in its own place.
+    phases = [True, 0.3, 0.25, True, 0.3, 0.25]
+    state = {"belt": 1, "brake": 1}
+    shots = [shoot(camera, render(state, blink_on=b, fixed=True)) for b in phases]
+    results = L.check(lib, lib.find(shots), ["Brake", "Seat belt"], where="")
+    assert not [r for r in results if r.name == "unknown"], [r.to_dict() for r in results]
+    # A symbol that is not the lamp's, in its place, is still a fault: the lamp is missing.
+    shots = [shoot(camera, render({"brake": 1}, fixed=True, faults={"stranger_at": "Seat belt"}))
+             for _ in range(3)]
+    results = L.check(lib, lib.find(shots), ["Brake", "Seat belt"], where="")
+    assert ("Seat belt", "missing") in _reasons(results), [r.to_dict() for r in results]
+
+
 def test_two_lamps_swapped_in_the_strip_fail_and_only_they_do(taught, camera):
     lib, _ = taught
     lit = [lamp.name for lamp in lib.lamps if lamp.slot_all is not None]
@@ -311,6 +346,44 @@ def test_a_strip_that_jumps_as_a_lamp_flashes_is_caught(taught, camera):
         shots.append(shoot(camera, render(state)))
     results = L.check(lib, lib.find(shots), ["Brake", "Seat belt", "ABS", "High beam"])
     assert ("ABS", "moves_between_shots") in _reasons(results)
+
+
+def test_a_strip_that_closes_up_is_not_taken_for_fixed_slots(taught):
+    lib, summary = taught
+    # The middle lamp lights in the middle slot alone and all lit, by chance.
+    assert summary["layout"] == "closes up"
+    assert not any(lamp.fixed for lamp in lib.lamps)
+
+
+@pytest.fixture(scope="module")
+def fixed(camera):
+    captured = {s["id"]: shots_of(camera, s, fixed=True) for s in PLAN.steps()}
+    return L.learn(PLAN, captured)
+
+
+def test_fixed_slots_are_found_as_such(fixed):
+    lib, summary = fixed
+    assert summary["layout"] == "fixed slots"
+    # Cruise ready is never lit with all the others: seen alone only.
+    assert {lamp.name: lamp.fixed for lamp in lib.lamps} == {
+        n: (None if n == "Cruise ready" else True) for n, *_ in LAMPS}
+
+
+def test_a_fixed_slot_is_checked_whatever_else_is_lit(fixed, camera):
+    lib, _ = fixed
+    state = {"brake": 1, "abs": 1, "beam": 1}
+    names = ["Brake", "ABS", "High beam"]
+    assert L.verdict(check(lib, camera, state, names, where="", fixed=True)) == "PASS"
+    # Not a taught state; a strip could not be held to a place here, a slot is.
+    results = check(lib, camera, state, names, where="", fixed=True, shift={"ABS": (3, 0)})
+    assert _reasons(results) == {("ABS", "position")}
+
+
+def test_two_fixed_lamps_swapped_fail_by_place(fixed, camera):
+    lib, _ = fixed
+    results = check(lib, camera, {"brake": 1, "abs": 1}, ["Brake", "ABS"], where="",
+                    fixed=True, order=["ABS", "Brake"])
+    assert _reasons(results) == {("Brake", "position"), ("ABS", "position")}
 
 
 def test_the_library_survives_a_save_and_load(taught, camera, tmp_path):
