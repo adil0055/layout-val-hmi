@@ -2006,9 +2006,10 @@ class CaptureSession:
         # earlier -- an authored profile is the better answer and is left alone.
         if self.auto_profile and (self.profile is None or self._profile_is_auto):
             # A camera on a stand does not smear, so what a hand-held photo
-            # could not measure -- a dial's minor ticks, 4-8 px across --
-            # can be measured from it.
-            steady = dict(min_thickness_px=4, min_area_px=20) if self.steady_camera else {}
+            # could not measure -- a dial's minor ticks, 4-8 px across, and
+            # a tick's short stroke -- can be measured from it.
+            steady = (dict(min_thickness_px=4, min_area_px=20, short_strokes=True)
+                      if self.steady_camera else {})
             found = profile_from_reference(
                 segment_from,
                 valid=seen,
@@ -2845,6 +2846,8 @@ input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events
 .PASS,.OK{color:#4FB584}.FAIL,.FAILED{color:#E8695C}.REVIEW{color:#DCA83F}
 .detail{color:#C2CED6;font-size:13.5px;margin-top:4px}
 img.shot{width:100%;border-radius:8px;border:1px solid #2B373D;margin-top:10px;display:block}
+a.sheet{display:block;margin-top:12px;padding:12px;border-radius:9px;background:#1E272C;
+        border:1px solid #2B373D;color:#9CCBF0;text-align:center;font-weight:600;text-decoration:none}
 table{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
 td{padding:5px 4px;border-bottom:1px solid #222C31}
 td:last-child{text-align:right;color:#9DADB5;font-variant-numeric:tabular-nums}
@@ -3310,7 +3313,7 @@ function paintAuto(p) {
 // after, which settings that frame was taken with and what the camera took.
 let CAM_SEQ = 0, CAM_REPORT = null;
 const CAM_KEYS = ["exposureMode", "exposureTime", "exposureCompensation", "whiteBalanceMode",
-                  "colorTemperature", "focusMode", "focusDistance", "sharpness"];
+                  "colorTemperature", "focusMode", "focusDistance", "sharpness", "iso"];
 function camInfo() {
   const track = CAM && CAM.getVideoTracks()[0];
   let caps = {}, settings = {};
@@ -3838,6 +3841,7 @@ function show(res) {
     html += "<table>" + res.rows.map(r =>
       `<tr><td class="${r.verdict}">${esc(r.id)}</td><td>${esc(r.detail)}</td></tr>`).join("") + "</table>";
   }
+  if (res.elements) html += `<a class="sheet" href="/shot/${encodeURI(res.elements)}?t=${TOKEN}" target="_blank" rel="noopener">Every element on its own, with its name</a>`;
   if (res.overlay) html += `<img class="shot" src="/shot/${res.overlay}?t=${TOKEN}" alt="annotated capture">`;
   box.innerHTML = html;
   box.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -3908,9 +3912,12 @@ class _Handler(BaseHTTPRequestHandler):
         given = (query.get("t") or [""])[0]
         return token_matches(given, self.server.token)  # type: ignore[attr-defined]
 
-    def _send(self, code: HTTPStatus, body: bytes, content_type: str) -> None:
+    def _send(self, code: HTTPStatus, body: bytes, content_type: str,
+              headers: dict[str, str] | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         # A capture page has no business being framed or sniffed, and the
         # results are per-run, so nothing here should be cached.
@@ -3969,8 +3976,14 @@ class _Handler(BaseHTTPRequestHandler):
         if out not in target.parents or not target.is_file():
             self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
             return
-        kind = "image/png" if target.suffix == ".png" else "image/jpeg"
-        self._send(HTTPStatus.OK, target.read_bytes(), kind)
+        kind = {".png": "image/png", ".html": "text/html; charset=utf-8"}.get(
+            target.suffix, "image/jpeg")
+        # A page of pictures written by a run (layoutval.elementsheet): it
+        # runs nothing and loads nothing, and is held to that.
+        extra = ({"Content-Security-Policy": "default-src 'none'; img-src data:; "
+                                              "style-src 'unsafe-inline'"}
+                 if target.suffix == ".html" else None)
+        self._send(HTTPStatus.OK, target.read_bytes(), kind, extra)
 
     def _set_mode(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)

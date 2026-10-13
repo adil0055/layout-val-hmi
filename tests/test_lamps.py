@@ -10,6 +10,7 @@ does.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 
@@ -384,6 +385,40 @@ def test_two_fixed_lamps_swapped_fail_by_place(fixed, camera):
     results = check(lib, camera, {"brake": 1, "abs": 1}, ["Brake", "ABS"], where="",
                     fixed=True, order=["ABS", "Brake"])
     assert _reasons(results) == {("Brake", "position"), ("ABS", "position")}
+
+
+def _glowing(img: np.ndarray, k: float) -> np.ndarray:
+    """Every lamp's light spread round it, as a camera farther off sees it."""
+    lamps = np.clip(img.astype(np.float32) - render({}, fixed=True).astype(np.float32), 0, None)
+    return np.clip(img + k * cv2.GaussianBlur(lamps, (0, 0), 6), 0, 255).astype(np.uint8)
+
+
+def test_a_bulb_check_whose_lamps_glow_into_each_other_finds_each_in_its_place(fixed, camera):
+    # Every lamp lit at once, each one's glow across the gap to the next: read
+    # blob by blob, the light in each lamp's margin is its neighbours' and
+    # most match nothing. A real webcam's bulb check lost 11 of 31 so.
+    lib = copy.deepcopy(fixed[0])
+    every = {sig: 1 for _, sig, *_ in LAMPS}
+    shots = [shoot(camera, _glowing(render(every, fixed=True), 2.0)) for _ in range(3)]
+    assert len([d for d in lib.find(shots) if d.name != "unknown"]) <= 3
+    for lamp in lib.lamps:
+        lamp.slot_check = None
+    problems: list[str] = []
+    L.learn_bulb_check(lib, shots, problems)
+    # Cruise ready is never lit with cruise set: not lit, rightly.
+    assert problems == ["bulb check: not lit -- Cruise ready"], problems
+    for lamp in lib.lamps:
+        if lamp.slot_check is not None:
+            assert math.dist(lamp.slot_check, lamp.centre) < 1.5, lamp.name
+    # A lamp that really is not lit stays not lit.
+    lib = copy.deepcopy(fixed[0])
+    for lamp in lib.lamps:
+        lamp.slot_check = None
+    shots = [shoot(camera, _glowing(render(every, fixed=True, faults={"missing": ["ABS"]}), 2.0))
+             for _ in range(3)]
+    problems = []
+    L.learn_bulb_check(lib, shots, problems)
+    assert problems == ["bulb check: not lit -- ABS, Cruise ready"], problems
 
 
 def test_the_library_survives_a_save_and_load(taught, camera, tmp_path):

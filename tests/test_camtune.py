@@ -47,7 +47,7 @@ class FakeWebcam:
         self.looks = 0
 
     def shoot(self, s: dict) -> np.ndarray:
-        gain = s["exposureTime"] / 100.0
+        gain = s["exposureTime"] / 100.0 * s.get("iso", 100) / 100.0
         img = self.scene * gain
         over = np.clip(img - 200, 0, None)
         img = img + 0.8 * cv2.GaussianBlur(over, (0, 0), 6)                  # bloom
@@ -103,3 +103,45 @@ def test_a_camera_with_nothing_to_set_is_left_alone():
     assert C.Tuner({}, {}, lambda s: calls.append(s) or [display()]).run() == {}
     assert not calls
     assert C.controls(CAPS) == ["exposure", "white balance", "focus", "sharpness"]
+    assert C.controls({**CAPS, "iso": {"min": 50, "max": 800}})[-1] == "gain"
+
+
+def test_a_lamp_in_view_that_is_not_the_display_does_not_set_the_exposure():
+    # A room's lamp, or its reflection on the glass, inside the display's
+    # outline: it clips at any exposure a display wants. Measured with it,
+    # the exposure is cut until it does not, and the display goes dark.
+    class Lamp(FakeWebcam):
+        def shoot(self, s):
+            img = super().shoot(s).astype(np.float32)
+            yy, xx = np.mgrid[0:img.shape[0], 0:img.shape[1]]
+            blob = np.exp(-((xx - 600) ** 2 + (yy - 40) ** 2) / (2 * 9.0 ** 2))
+            img += (3000.0 * s["exposureTime"] / 100.0 * blob)[..., None]
+            return np.clip(img, 0, 255).astype(np.uint8)
+
+    content = cv2.dilate((display().max(axis=2) > 30).astype(np.uint8),
+                         np.ones((9, 9), np.uint8)) > 0
+    assert not content[40, 600]
+    caps = {k: CAPS[k] for k in ("exposureMode", "exposureTime")}
+    cam = Lamp()
+    C.Tuner(caps, AUTO, cam.look, mask=content).run()
+    level, clip = C.brightest(cam.shoot(cam.settings), content)
+    assert C.BAND[0] <= level <= C.BAND[1] and clip <= C.CLIP_MAX, (level, clip)
+    # The same without being told what the display is: turned right down.
+    blind = Lamp()
+    C.Tuner(caps, AUTO, blind.look).run()
+    assert blind.settings["exposureTime"] < 0.5 * cam.settings["exposureTime"]
+
+
+def test_gain_goes_down_before_the_exposure_does():
+    # Left on automatic in a dim room, the camera's gain is up. As a camera
+    # does in a bright scene: gain to its lowest, so the exposure the display
+    # needs is the longest it can be.
+    cam = FakeWebcam()
+    caps = {**CAPS, "iso": {"min": 100, "max": 1600, "step": 100}}
+    start = {**AUTO, "iso": 800}
+    final = C.Tuner(caps, start, cam.look).run()
+    level, clip = C.brightest(cam.shoot(cam.settings))
+    assert final["iso"] == 100 and C.BAND[0] <= level <= C.BAND[1] and clip <= C.CLIP_MAX
+    held_gain = FakeWebcam()
+    C.Tuner(CAPS, start, held_gain.look).run()          # no gain control: left at 800
+    assert final["exposureTime"] > 6 * held_gain.settings["exposureTime"]

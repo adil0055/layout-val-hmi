@@ -130,12 +130,18 @@ touches a camera setting:
 1. **Power cycle.** Ignition off until the screen is dark and still (if it
    stays lit, the bus is let sleep as well), then on, recording the start-up:
    boot, the **bulb check**, the running screen.
-2. **Finding the display.** What lit up between ignition off and on is the
-   screen's content; the corners finder looks for the display's outline round
-   it and is held to containing it, and where it finds none the outline is
-   taken round the content. Without a resolution, the display's size comes
-   from its shape: a common cluster resolution when its proportions match one
-   (1920 x 720, 1280 x 480, ...), else its own.
+2. **Finding the display.** What got brighter between ignition off and on is
+   the screen's content (the room a webcam on automatic brightens with the
+   screen dark is not); the corners finder looks for the display's outline
+   round it and is held to containing it. Without a resolution, the
+   display's size comes from the outline's shape: a common cluster resolution
+   when its proportions match one (1920 x 720, 1280 x 480, ...), else its
+   own. Where no outline is found -- a black bezel in a dark room -- an
+   upright box is taken round the content, one display pixel to a camera
+   pixel: the content's shape is not the display's, so it is not stretched to
+   a resolution. If the content runs off the edge of the camera's picture,
+   the run stops at once and says which edge: aim the camera so all of the
+   display is in view, with a little room round it.
 3. **Setting the camera.** A webcam left on automatic exposes for the room,
    and the display is the brightest thing in it: the screen comes out blown,
    white strokes bloom into each other, and a dial's ticks and numerals merge
@@ -147,9 +153,14 @@ touches a camera setting:
    - **white balance**, so the display's white and grey text comes out grey
      (red as strong as blue);
    - **focus**, swept for the sharpest picture of the display, then fixed;
-   - **sharpening** off: it rings round every white stroke.
+   - **sharpening** off: it rings round every white stroke;
+   - **gain** (ISO) to its lowest first, where the camera lets a page set it,
+     as a camera does in a bright scene, so the exposure is as long as it can
+     be (most desktop webcams do not offer it to a browser).
 
-   Everything is then held, the start-up is recorded again with the camera
+   Only the display's content is measured -- what lit up at ignition on -- so
+   a lamp in the room, or its reflection on the glass, does not set the
+   exposure. Everything is then held, the start-up is recorded again with the camera
    as it now is, and the same settings are put on the camera on every later
    run -- a reference and a test taken at two exposures differ by more than
    any layout fault. What was set, and each step that got there, goes to
@@ -158,7 +169,8 @@ touches a camera setting:
    controls; what it does not offer is left as it is (many only offer
    exposure), and with none the run goes on with the camera on automatic.
 4. **Reference.** The running screen at rest. The camera is on a stand, so
-   elements down to 4 px across are kept (a hand-held photo needs 9), and a
+   elements down to 4 px across are kept (a hand-held photo needs 9), so is a
+   short crisp stroke such as a dial's tick (both its ends in view), and a
    region that is big and mostly empty -- a dial's scale ring with every tick
    and numeral along it, or strokes joined by a glow -- is split into its
    parts.
@@ -182,7 +194,9 @@ touches a camera setting:
    lamps were lit, recognised by symbol, and whether that was right
    (**missing**, **unexpected**, **wrong colour**, **unknown symbol**,
    **position**, **order**, **not flashing**/**flashing**, **moves between
-   shots**).
+   shots**). In the bulb check, with every lamp lit, a lamp not picked out
+   among the rest is looked for in its own place by its symbol alone: from
+   farther off, the lamps' light runs into each other's margins.
 7. **Validate.** The layout at rest against the reference.
 
 **Test again** then tests a cluster against what was taught -- the same one
@@ -193,12 +207,21 @@ check and the layout. **Teach again** starts over. Everything goes to
 `teach.json`, `lamp-check.json`, `lamps.json` with the symbols, and pictures
 of the display found, the bulb check, the lamps and the named elements.
 
+**Every element on its own, with its name.** At the end of a run each
+element is cut out by itself -- as the reference has it and as the run saw
+it, its box drawn round it -- and put against its name and verdict, and each
+lamp as the lamp check saw it lit: one picture each in `elements/`, and all
+of them on one page, `elements.html`, failures first. The result on the page
+links to it.
+
 **Frames are picked by watching them.** After each state is sent, a frame is
 of that state once the screen has changed from how it was and then settled:
 a frame that matches one from a moment before -- a still screen, or a flash
 that has come round again. A needle's sweep is waited out; a flashing lamp is
-shot across its flash (1.3 s); a state that changes nothing costs 1.5 s and is
-reported as such. A pixel has changed when it moved by more than the camera's
+shot across its flash (1.8 s), and a state is taken to be steady only once
+0.7 s and five frames have gone by unchanged -- at a webcam's few frames a
+second, two frames can both catch a flash lit; a state that changes nothing
+costs 1.5 s and is reported as such. A pixel has changed when it moved by more than the camera's
 noise *and* by more than 30% of its brightness, so a backlight's PWM banding,
 tens of levels on white text, is not a change while a lamp lighting is. The
 start-up is over when the screen has stayed still for 6 s, longer than any

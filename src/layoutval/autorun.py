@@ -66,8 +66,13 @@ MAX_SETTLE_S = 4.0
 #: changing: two periods of a flash at 1.1 Hz and more, so that a flashing
 #: lamp is seen to go on and off at least twice even at a few frames a second...
 WINDOW_S = 1.8
-#: ...unless nothing has changed for this long: no flash has halves longer.
+#: ...unless nothing has changed for this long: no flash has halves longer...
 STEADY_S = 0.7
+#: ...over this many frames. At the few frames a second a webcam gets through
+#: the page, two frames 0.7 s apart can both land in a flash's lit half, and
+#: the flash was taught as a steady lamp: a real webcam's high beam, and the
+#: simulated one's right indicator.
+STEADY_FRAMES = 5
 #: Shots kept of a state that flashes, and of one that does not.
 SHOTS_FLASHING = 8
 SHOTS_STEADY = 2
@@ -96,6 +101,13 @@ BULB_MIN = 3
 STARTUP_MAX = 120
 #: Of the screen's content, the share the display's outline must contain.
 CONTAIN_MIN = 0.97
+#: Content's box is taken turned only when that is this much tighter.
+TURNED_TIGHTER = 0.85
+#: Content within this share of the picture's size of its edge runs off it...
+EDGE_BAND = 0.01
+#: ...when at least this share of what lit up is there, and this many pixels.
+EDGE_SHARE = 0.002
+EDGE_MIN_PX = 60
 #: Common cluster resolutions: a display whose shape is within this of one is
 #: taken to be it.
 RESOLUTIONS = [(1920, 720), (1280, 480), (1440, 540), (2560, 960), (1920, 1080),
@@ -221,7 +233,7 @@ def watch(frames: Iterator[tuple[float, np.ndarray, Any]], before: list[np.ndarr
           level: float, *, react_s: float = REACT_S, window_s: float = WINDOW_S,
           settle_s: float = SETTLE_S, span_s: float = SETTLE_SPAN_S,
           max_settle_s: float = MAX_SETTLE_S, min_px: int = CHANGE_PX,
-          steady_s: float = STEADY_S,
+          steady_s: float = STEADY_S, steady_frames: int = STEADY_FRAMES,
           shots_flashing: int = SHOTS_FLASHING, shots_steady: int = SHOTS_STEADY,
           still_s: float | None = None) -> Settled:
     """Wait for the screen to react, to settle, and shoot it.
@@ -275,7 +287,8 @@ def watch(frames: Iterator[tuple[float, np.ndarray, Any]], before: list[np.ndarr
         window.append((t, s, keep))
         flashing = flashing or changed_px(first, s, level) >= min_px
         span = t - window[0][0]
-        if span >= window_s or (span >= steady_s and not flashing):
+        if span >= window_s or (span >= steady_s and len(window) >= steady_frames
+                                and not flashing):
             break
     want = shots_flashing if flashing else shots_steady
     if len(window) > want:
@@ -292,10 +305,15 @@ def watch(frames: Iterator[tuple[float, np.ndarray, Any]], before: list[np.ndarr
 # -- finding the display -------------------------------------------------------
 
 def lit_region(dark: np.ndarray, on: np.ndarray, level: float = 18.0) -> np.ndarray:
-    """Where the screen lit up between ``dark`` and ``on`` (camera frames), as a mask."""
+    """Where the screen lit up between ``dark`` and ``on`` (camera frames), as a mask.
+
+    Brighter, not just different: a webcam still on automatic brightens the
+    whole room when the screen goes dark, and the room changing that way is
+    not the screen lighting up.
+    """
     a = cv2.GaussianBlur(cv2.cvtColor(dark, cv2.COLOR_BGR2GRAY), (5, 5), 0)
     b = cv2.GaussianBlur(cv2.cvtColor(on, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-    m = (cv2.absdiff(b, a) > level).astype(np.uint8)
+    m = (cv2.subtract(b, a) > level).astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(m)
     if n <= 1:
@@ -324,15 +342,66 @@ def contains(corners: np.ndarray, mask: np.ndarray) -> float:
     return float((mask & poly.astype(bool)).sum()) / total
 
 
+def cut_edges(mask: np.ndarray, valid: np.ndarray | None = None) -> list[str]:
+    """The edges of the camera's picture that what lit up runs off.
+
+    ``valid`` is the part of the picture there is (undistorting leaves a
+    border with nothing in it). Content in a band along its edge -- more than
+    a speck of it -- is content the camera does not see all of.
+    """
+    h, w = mask.shape
+    total = int(mask.sum())
+    if total == 0:
+        return []
+    if valid is None:
+        valid = np.ones(mask.shape, bool)
+    k = max(2, round(EDGE_BAND * min(h, w)))
+    inner = cv2.erode(valid.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8),
+                      borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    ys, xs = np.nonzero(mask & valid & ~inner)
+    if len(xs) < max(EDGE_MIN_PX, EDGE_SHARE * total):
+        return []
+    # Each to the side of the picture it is nearest.
+    side = np.argmin(np.stack([ys, h - 1 - ys, xs, w - 1 - xs]), axis=0)
+    counts = np.bincount(side, minlength=4)
+    names = ("top", "bottom", "left", "right")
+    return [names[i] for i in range(4) if counts[i] >= max(EDGE_MIN_PX / 2, 0.25 * len(xs))]
+
+
 def content_corners(mask: np.ndarray, margin: float = 0.01) -> np.ndarray:
-    """The tightest rectangle round the content, a little larger."""
+    """A rectangle round the content, a little larger: upright, unless the
+    content is clearly turned.
+
+    The tightest rectangle round a cluster's content is turned whenever the
+    content is not symmetric -- a readout below one gauge -- and the picture
+    taken through it came out turned and skewed though the camera was level.
+    So the upright box is taken unless the turned one is much the tighter
+    (a camera rolled well over).
+    """
     ys, xs = np.nonzero(mask)
     pts = np.column_stack([xs, ys]).astype(np.float32)
     hull = cv2.convexHull(pts)
     rect = cv2.minAreaRect(hull)
     (cx, cy), (w, h), a = rect
+    bx, by, bw, bh = cv2.boundingRect(hull)
+    if w * h >= TURNED_TIGHTER * bw * bh:
+        rect = ((bx + bw / 2.0, by + bh / 2.0), (float(bw), float(bh)), 0.0)
+        (cx, cy), (w, h), a = rect
     rect = ((cx, cy), (w * (1 + 2 * margin), h * (1 + 2 * margin)), a)
     return ordered(cv2.boxPoints(rect))
+
+
+def content_size(corners: np.ndarray) -> tuple[int, int]:
+    """A box round the content as display pixels: one per camera pixel.
+
+    The box is not the display, so its shape says nothing of the display's
+    resolution, and stretching it to a common one (16:9 made 1920 x 1080 of
+    a 2.6:1 cluster's content) only distorts it.
+    """
+    c = ordered(corners)
+    w = 0.5 * (np.linalg.norm(c[1] - c[0]) + np.linalg.norm(c[2] - c[3]))
+    h = 0.5 * (np.linalg.norm(c[3] - c[0]) + np.linalg.norm(c[2] - c[1]))
+    return int(round(w / 2.0)) * 2, int(round(h / 2.0)) * 2
 
 
 def estimate_size(corners: np.ndarray, image_size: tuple[int, int]) -> tuple[tuple[int, int], str]:
@@ -427,6 +496,11 @@ class AutoRun:
         #: The pose this run measures through: the calibration's, or where a
         #: test finds the screen's outline now (a webcam nudged since teaching).
         self._H: np.ndarray | None = None
+        #: What lit up at ignition on, in the camera's picture: the display's
+        #: content, and not a lamp in the room beside it.
+        self._lit: np.ndarray | None = None
+        #: Each lamp as the lamp check saw it lit, for the element pictures.
+        self._lamp_pics: dict[str, list[dict[str, Any]]] = {}
         self._thread: threading.Thread | None = None
         self.level = 12.0
         #: From a state sent to the first frame showing it: the bus, the
@@ -553,8 +627,16 @@ class AutoRun:
                                       "why": "nothing on it can be set from this browser"}
             return ""
         self._say("camera", "setting the camera up for the display: " + ", ".join(can))
+        content = None
+        if self._lit is not None:
+            # What lit up, in display space, with a margin for the edges a
+            # focus measure needs.
+            g = self.s.calibration.geometry
+            content = g.rectify((self._lit * 255).astype(np.uint8), self._H) > 127
+            k = max(3, round(0.006 * content.shape[1]))
+            content = cv2.dilate(content.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
         tuner = Tuner(caps, self.camera.get("settings") or {}, self._camera_look,
-                      region=self._display, log=self._log)
+                      region=self._display, log=self._log, mask=content)
         try:
             final = tuner.run()
         except CameraIgnored as exc:
@@ -582,6 +664,8 @@ class AutoRun:
             bits.append(f"focus {float(final['focusDistance']):g}")
         if "sharpness" in final:
             bits.append(f"sharpening {final['sharpness']:g}")
+        if "iso" in final:
+            bits.append(f"gain ISO {final['iso']:g}")
         return "set for the display and held: " + ", ".join(bits)
 
     def _send(self, values: dict[str, Any]) -> float:
@@ -720,7 +804,15 @@ class AutoRun:
         # What failed first, then what is for review, then the rest.
         order = {"FAIL": 0, "FAILED": 0, "REVIEW": 1}
         rows.sort(key=lambda r: order.get(r["verdict"], 2))
-        return self._finish(worst, detail, rows[:120], payload.get("overlay"))
+        sheet = None
+        try:
+            sheet = self._element_pictures(val)
+        except Exception:                    # pictures are for people; never the verdict
+            self._log(traceback.format_exc())
+        out = self._finish(worst, detail, rows[:120], payload.get("overlay"))
+        if sheet:
+            out["elements"] = sheet
+        return out
 
     # -- 1. power ---------------------------------------------------------------
 
@@ -822,6 +914,17 @@ class AutoRun:
                 if len(startup) else []
             for i in sorted(set(int(k) for k in picks)):
                 lit |= lit_region(dark_u, self._undistort(decode_upload(startup[i][1])))
+            self._lit = lit
+            valid = self._undistort(np.full(on.shape[:2], 255, np.uint8)) > 0
+            off = cut_edges(lit, valid)
+            if off:
+                cv2.imwrite(str(self.folder / "lit-at-ignition.png"), (lit * 255).astype(np.uint8))
+                cv2.imwrite(str(self.folder / "camera.jpg"), on_u)
+                sides = " and ".join(off)
+                self.summary["display"] = {"runs_off": off}
+                raise Stopped(f"the display runs off the {sides} of the camera's picture, so "
+                              "part of it is not seen. Aim the camera so all of the display is "
+                              "in view, with a little room round it, and press Start again")
         aspect = (s.corner_display_size[0] / s.corner_display_size[1]) if s.size_set else None
         proposal = propose_display_corners(on_u, aspect=aspect)
         how = "its outline"
@@ -839,16 +942,26 @@ class AutoRun:
                 raise Stopped("could not find the display in the picture")
             corners = content_corners(lit)
             how = "what lit up at ignition on"
+        outline = how == "its outline"
         size_note = ""
-        if not s.size_set:
-            size, why = estimate_size(corners, (on_u.shape[1], on_u.shape[0]))
+        # Estimated again on the second look, with the camera set up: the
+        # first was through a camera on automatic.
+        if not s.size_set or "display_size_estimated" in self.summary:
+            if outline:
+                size, why = estimate_size(corners, (on_u.shape[1], on_u.shape[0]))
+            else:
+                size = content_size(corners)
+                why = "the box round what lit up, as the camera sees it"
             s.set_size(*size)
             size_note = f"; taken to be {size[0]} x {size[1]}: {why}"
             self.summary["display_size_estimated"] = list(size)
         with s.lock:
             try:
+                # Corners onto the display's edge -- where there is one: a box
+                # round the content has none, and its corners would be pulled
+                # onto the ticks and numerals next to them.
                 geometry = homography_from_marked_corners(
-                    on_u, corners, display_size=s.corner_display_size, refine=True,
+                    on_u, corners, display_size=s.corner_display_size, refine=outline,
                     inset_px=s.display_inset_px)
             except RuntimeError:
                 geometry = homography_from_marked_corners(
@@ -1043,6 +1156,69 @@ class AutoRun:
         rows += [{"id": "teach", "verdict": "REVIEW", "detail": p} for p in problems]
         return lib, rows
 
+    # -- every element on its own -----------------------------------------------
+
+    def _keep_lamp_picture(self, lib, step, shots, found, results) -> None:
+        """The lamp a lamp-check step lights, cut out of the shot it is brightest in."""
+        from layoutval import lamps as L
+        from layoutval.elementsheet import COLOURS, picture
+
+        name = step.get("lamp", step["name"])
+        lamp = lib.get(name)
+        if lamp is None or not shots:
+            return
+        d = next((d for d in found if d.name == name), None)
+        box = d.box if d is not None else lamp.box
+        x, y, w, h = box
+        lit = [float(L.lit_delta(lib.baseline, s)[y:y + h, x:x + w].sum()) for s in shots]
+        r = next((r for r in results if r.name == name), None)
+        verdict = r.verdict if r is not None else "PASS"
+        self._lamp_pics.setdefault(name, []).append({
+            "state": step.get("state") or "on", "verdict": verdict,
+            "reason": r.reason if r is not None and r.reason else "",
+            "colour": L.hue_name(lamp.hue),
+            "img": picture(shots[int(np.argmax(lit))], box, COLOURS.get(verdict, (200, 200, 200)))})
+
+    def _element_pictures(self, val) -> str | None:
+        """Every element and lamp cut out against its name: elements.html, elements/."""
+        from layoutval import elementsheet as E
+
+        s = self.s
+        items: list[dict[str, Any]] = []
+        for name, pics in self._lamp_pics.items():
+            verdict = _worst([p["verdict"] for p in pics])
+            reasons = sorted({p["reason"] for p in pics if p["reason"]})
+            items.append({"name": name, "kind": "lamp", "verdict": verdict,
+                          "detail": ", ".join([pics[0]["colour"]] + reasons),
+                          "pictures": [(p["state"], p["img"]) for p in pics[:3]]})
+        now = None
+        shot = s.out_dir / f"{self.stamp}-validate-rectified.png"
+        if shot.is_file():
+            now = cv2.imread(str(shot))
+        results = {r["element_id"]: r for r in ((val.report or {}).get("elements") or [])}
+        if s.profile is not None and s.reference is not None:
+            for e in s.profile.elements:
+                r = results.get(e.id, {})
+                m = r.get("measurement") or {}
+                verdict = r.get("verdict", "")
+                colour = E.COLOURS.get(verdict, (200, 200, 200))
+                pics = [("reference", E.picture(s.reference, e.bbox))]
+                if now is not None and r:
+                    pics.append(("this run", E.picture(now, _shift(e.bbox, m.get("dx"), m.get("dy")),
+                                                       colour)))
+                if m.get("dx") is not None and m.get("dy") is not None:
+                    detail = f"moved {m['dx']:+.2f}, {m['dy']:+.2f} px"
+                else:
+                    detail = r.get("reason") or ("not measured" if r else "")
+                if r.get("reason") and m.get("dx") is not None:
+                    detail += f" ({r['reason']})"
+                items.append({"name": e.id, "kind": "element", "verdict": verdict,
+                              "detail": detail, "pictures": pics})
+        if not items:
+            return None
+        E.write(self.folder, items, f"Elements, {self.folder.name}")
+        return f"{self.folder.name}/elements.html"
+
     def _look_again(self, seconds: float = 2.5, keep: int = 12) -> list[np.ndarray]:
         """The state as it is, shot again over a longer window."""
         frames = []
@@ -1100,6 +1276,16 @@ class AutoRun:
         found = [d for d in lib.find(bulb)
                  if d.name in in_check
                  or d.name == "unknown" and _lamp_like(lib, [d.to_dict()], len(bulb))]
+        # One not read among the rest is looked for in its place, by its own
+        # symbol (the lamps beside it lit can hide it from find).
+        named = {d.name for d in found}
+        for lamp in lib.lamps:
+            if lamp.slot_check is not None and lamp.name not in named:
+                d = lib.at_place(lamp, bulb, lamp.slot_check)
+                if d is not None:
+                    found = [u for u in found
+                             if not (u.name == "unknown" and L._overlap(u.box, d.box) > 0.3)]
+                    found.append(d)
         expected = [lamp.name for lamp in lib.lamps if lamp.slot_check is not None]
         results = L.check(lib, found, expected, where="check")
         v = L.verdict(results)
@@ -1180,6 +1366,8 @@ class AutoRun:
             verdicts.append(v)
             report.append({"step": step["name"], "state": step.get("state"), "verdict": v,
                            "lamps": [r.to_dict() for r in results]})
+            if step["kind"] == "lamp":
+                self._keep_lamp_picture(lib, step, got.shots, found, results)
             if step["kind"] == "all" or (v != "PASS" and picture is None):
                 picture = L.draw_lamps(np.max(np.stack(got.shots), axis=0), found, results)
             for r in results:
@@ -1200,6 +1388,11 @@ class AutoRun:
             cv2.imwrite(str(self.folder / "lamp-check.png"), picture)
         return [{"id": "Lamp check", "verdict": verdict,
                  "detail": f"{passed} of {len(verdicts)} lamp states as expected"}] + rows
+
+
+def _shift(box, dx, dy) -> tuple[float, float, float, float]:
+    x, y, w, h = box
+    return x + (dx or 0.0), y + (dy or 0.0), w, h
 
 
 def _lamp_like(lib, dets: list[dict[str, Any]], shots: int) -> list[dict[str, Any]]:

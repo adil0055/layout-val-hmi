@@ -65,3 +65,33 @@ def test_what_hugs_the_frame_edge_is_not_an_element():
     cv2.rectangle(frame, (570, 3), (590, 20), (230, 230, 230), -1)             # a corner icon
     boxes = [tuple(map(int, e.bbox)) for e in profile_from_reference(frame)]
     assert len(boxes) == 1 and boxes[0][0] > 200
+
+
+def test_a_dials_ticks_are_kept_on_a_steady_camera_and_a_long_line_is_not():
+    """A real webcam's ticks scored 0.035-0.08 against the straight-line cut of
+    0.10: their ends fix them, but against their long sides they score low."""
+    from layoutval.autoprofile import segment_reference, structure
+
+    frame = np.full((400, 700, 3), 12, np.uint8)
+    for label, x in (("88", 60), ("120", 420), ("km/h", 250)):
+        cv2.putText(frame, label, (x, 330), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (225, 225, 225), 3,
+                    cv2.LINE_AA)
+    for k, a in enumerate(range(60, 166, 15)):
+        t = np.deg2rad(a)
+        cx, cy, d = 90 + 70 * k, 140, np.array([np.cos(t), np.sin(t)]) * 26
+        cv2.line(frame, tuple((np.array([cx, cy]) - d).astype(int)),
+                 tuple((np.array([cx, cy]) + d).astype(int)), (215, 215, 215), 4, cv2.LINE_AA)
+    cv2.line(frame, (60, 230), (640, 230), (215, 215, 215), 5, cv2.LINE_AA)
+    frame = cv2.GaussianBlur(frame, (0, 0), 1.6)
+    steady = dict(min_thickness_px=4, min_area_px=20)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    ticks = [r for r in segment_reference(frame, **steady) if r[1] < 200]
+    assert len(ticks) == 8 and all(0.03 < structure(gray, r[:4]) < 0.10 for r in ticks)
+
+    def rows(p):
+        return sorted(int(e.bbox[1]) // 100 for e in p.elements)
+
+    # Hand-held rules: neither the ticks nor the line.
+    assert rows(profile_from_reference(frame, **steady)) == [3, 3, 3]
+    # A camera on a stand: the ticks, and still not the line.
+    assert rows(profile_from_reference(frame, short_strokes=True, **steady)) == [1] * 8 + [3, 3, 3]

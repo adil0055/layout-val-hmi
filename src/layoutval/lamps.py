@@ -59,6 +59,12 @@ LOOKS_MIN = 0.55
 LIGHT_RANGE = (0.3, 2.0)
 #: A lamp is not placed where another's symbol matches better by more than this.
 LOCAL_MARGIN = 0.05
+#: A lamp looked for at its own place (Library.at_place): its symbol alone
+#: matched this well, within this share of its size of the place, with this
+#: much of its own light there (the lamps beside it add some).
+PLACE_MIN = 0.7
+PLACE_REACH = 0.3
+PLACE_LIGHT = (0.3, 3.0)
 #: Hues further apart than this (OpenCV units, 0..180) are different lamp colours.
 HUE_TOLERANCE = 18.0
 #: A lamp found this close (px) to where it lit alone, all lit together and in
@@ -452,6 +458,57 @@ class Library:
             merged.append(self._merge(same, len(shots)))
         return sorted(merged, key=lambda d: (round(d.centre[1] / max(1.0, self.lamp_size[1])),
                                              d.centre[0]))
+
+    def at_place(self, lamp: Lamp, shots: list[np.ndarray],
+                 place: tuple[float, float]) -> Detection | None:
+        """``lamp`` lit at ``place`` in these shots, looked for there by its symbol.
+
+        For the bulb check, where every lamp is lit at once. :meth:`find` reads
+        each lit blob with each lamp's template, the symbol and a margin round
+        it, and holds the light in it to about the lamp's own; with the lamps
+        beside it lit, and the camera far enough off that the margin is wider
+        than the gap between lamps, their light falls in the margin and the
+        lamp is passed over -- 11 of 31 on a real webcam. Here only the
+        symbol itself is matched, and only round the place it is known to
+        light in, still in its own colour.
+        """
+        lx, ly, lw, lh = lamp.box
+        tx, ty, _, _ = _template_origin(lamp)
+        core = lamp.template[ly - ty:ly - ty + lh, lx - tx:lx - tx + lw].astype(np.float32)
+        if core.shape != (lh, lw) or float(core.std()) < 1e-3:
+            return None
+        bx = int(round(place[0] - (lamp.centre[0] - lx)))
+        by = int(round(place[1] - (lamp.centre[1] - ly)))
+        reach = int(round(PLACE_REACH * max(lw, lh))) + 2
+        energy = max(float(core.sum()), 1e-6)
+        level = self.level
+        seen: list[tuple[float, int, tuple[int, int, int, int], np.ndarray, np.ndarray]] = []
+        for k, shot in enumerate(shots):
+            delta = lit_delta(self.baseline, shot)
+            wx, wy, ww, wh = _clip((bx - reach, by - reach, lw + 2 * reach, lh + 2 * reach),
+                                   delta.shape)
+            if ww < lw or wh < lh:
+                continue
+            res = cv2.matchTemplate(delta[wy:wy + wh, wx:wx + ww], core, cv2.TM_CCOEFF_NORMED)
+            _, score, _, (px, py) = cv2.minMaxLoc(res)
+            box = (wx + px, wy + py, lw, lh)
+            light = float(delta[box[1]:box[1] + lh, box[0]:box[0] + lw].sum()) / energy
+            if not (PLACE_LIGHT[0] <= light <= PLACE_LIGHT[1]):
+                continue
+            score = _coloured(float(score), lamp, box, delta, shot, level)
+            if score >= PLACE_MIN:
+                seen.append((score, k, box, delta, shot))
+        if not seen:
+            return None
+        score, _, box, delta, shot = max(seen, key=lambda s: s[0])
+        m = np.zeros(delta.shape, bool)
+        x, y, w, h = box
+        m[y:y + h, x:x + w] = delta[y:y + h, x:x + w] >= level
+        hue, _ = hue_signature(shot, m)
+        lit = {s[1] for s in seen}
+        flashing = None if len(shots) < 3 else turns([k in lit for k in range(len(shots))]) >= 2
+        return Detection(lamp.name, box, _centroid(delta, box, level), score, hue, flashing,
+                         lit_in=len(seen))
 
     def _settled(self, ds: list[Detection]) -> list[Detection]:
         """One lamp's readings across shots, less those read elsewhere by mistake.
@@ -883,6 +940,16 @@ def learn_bulb_check(lib: Library, shots: list[np.ndarray], problems: list[str])
         lamp = lib.get(d.name)
         if lamp is not None and lamp.slot_check is None:
             lamp.slot_check = d.centre
+    # Not read among the rest: looked for where it lit when taught (with
+    # every lamp lit, if it was seen so).
+    for lamp in lib.lamps:
+        if lamp.slot_check is None:
+            d = lib.at_place(lamp, shots, lamp.slot_all or lamp.centre)
+            if d is not None:
+                lamp.slot_check = d.centre
+                named.append(d)
+                dets = [u for u in dets if not (u.name == "unknown" and _overlap(u.box, d.box) > 0.3)]
+                dets.append(d)
     missing = [lamp.name for lamp in lib.lamps if lamp.slot_check is None]
     if missing:
         problems.append(f"bulb check: not lit -- {', '.join(missing)}")

@@ -8,6 +8,7 @@ that flashes and so never stands still, and a state that changes nothing.
 
 from __future__ import annotations
 
+import itertools
 import threading
 import time
 
@@ -73,6 +74,26 @@ def test_a_flashing_lamp_is_shot_across_its_flash():
     assert len(got.shots) == A.SHOTS_FLASHING
 
 
+
+def test_a_flash_at_a_webcams_few_frames_a_second_is_not_taken_for_steady():
+    # Through the page, a real webcam's frames came 0.6-0.7 s apart, the page
+    # varying the gap. Two of them 0.7 s apart both landed in the lit half of
+    # a 0.76 s flash, and the high beam's Flash was taught as steady.
+    period, start = 0.76, 0.6
+
+    def frames():
+        t = 0.0
+        gaps = itertools.cycle([0.72, 0.64, 0.70, 0.58, 0.68, 0.61])
+        while True:
+            img = screen(lamp=t >= start and ((t - start) % period) < period / 2)
+            yield t, blur(img), (t, img)
+            t += next(gaps)
+
+    old = A.watch(frames(), [blur(screen())], 10.0, steady_frames=2)
+    assert old.changed and not old.flashing                 # as it was
+    got = A.watch(frames(), [blur(screen())], 10.0)
+    assert got.changed and got.flashing
+
 def test_a_state_that_changes_nothing_costs_the_reaction_time_and_no_more():
     rest = screen()
     got = A.watch(stream(lambda t: rest), [blur(rest)], 10.0)
@@ -131,6 +152,56 @@ def test_where_the_screen_lit_up_and_whether_an_outline_holds_it():
     assert A.contains(small, lit) < 0.6
     box = A.content_corners(lit)
     assert A.contains(box, lit) > 0.99
+
+
+def test_a_room_a_camera_on_automatic_brightened_has_not_lit_up():
+    # Screen off, the webcam on automatic opens up: the room comes out
+    # brighter than with the screen on. Only what got brighter is the screen.
+    on = np.full((300, 400, 3), 20, np.uint8)
+    cv2.rectangle(on, (100, 80), (300, 220), (200, 200, 200), 3)
+    cv2.putText(on, "88", (150, 170), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (230, 230, 230), 3)
+    dark = np.full((300, 400, 3), 70, np.uint8)
+    dark[80:221, 100:301] = 5
+    lit = A.lit_region(dark, on)
+    assert lit[150, 170] and not lit[:60].any() and not lit[:, :80].any()
+
+
+def test_content_running_off_the_picture_is_named_by_its_edge():
+    mask = np.zeros((300, 400), bool)
+    mask[100:200, 80:320] = True
+    assert A.cut_edges(mask) == []
+    mask[250:300, 150:250] = True                     # down to the bottom edge
+    assert A.cut_edges(mask) == ["bottom"]
+    # Undistorted, the picture's edge is where there is picture.
+    valid = np.zeros((300, 400), bool)
+    valid[10:290, 10:390] = True
+    mask[:] = False
+    mask[100:200, 0:200] = True
+    assert A.cut_edges(mask & valid, valid) == ["left"]
+    mask[:] = False
+    mask[100:200, 30:200] = True                      # clear of it
+    assert A.cut_edges(mask & valid, valid) == []
+
+
+def test_a_box_round_the_content_stays_upright_unless_the_content_is_turned():
+    # Two dials and a readout under one of them: lopsided, but level.
+    mask = np.zeros((500, 900), bool)
+    yy, xx = np.mgrid[0:500, 0:900]
+    mask |= (xx - 250) ** 2 + (yy - 220) ** 2 < 150 ** 2
+    mask |= (xx - 650) ** 2 + (yy - 220) ** 2 < 150 ** 2
+    mask[380:440, 600:720] = True
+    c = A.content_corners(mask)
+    assert np.allclose(c[0, 1], c[1, 1], atol=0.5) and np.allclose(c[0, 0], c[3, 0], atol=0.5)
+    # One display pixel to a camera pixel: 700 x 370 of content, and margin.
+    w, h = A.content_size(c)
+    assert abs(w - 700 * 1.02) <= 4 and abs(h - 370 * 1.02) <= 4, (w, h)
+    assert w % 2 == 0 and h % 2 == 0
+    # Rolled well over: the turned box.
+    m = np.zeros((600, 900), np.uint8)
+    cv2.fillConvexPoly(m, cv2.boxPoints(((450, 300), (600, 200), 30.0)).astype(np.int32), 1)
+    c = A.content_corners(m.astype(bool))
+    edge = c[1] - c[0]
+    assert abs(abs(np.degrees(np.arctan2(edge[1], edge[0]))) - 30) < 3, c
 
 
 def test_the_display_size_from_its_shape():
@@ -428,6 +499,13 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
     assert rows["Lamp check"]["verdict"] == "PASS", [r for r in rec["rows"] if r["verdict"] != "PASS"]
     assert rows["Layout"]["verdict"] == "PASS", rows["Layout"]
     assert s.lamp_lib is not None and (s.auto.folder / "auto.json").is_file()
+    # Every element and lamp on its own, against its name.
+    page = s.out_dir / rec["elements"]
+    text = page.read_text()
+    assert "ABS warning lamp" in text and "this run" in text and "<script" not in text
+    pictures = list((page.parent / "elements").glob("*.png"))
+    assert len(pictures) == len(s.profile.elements) + len(s.lamp_lib.lamps) - sum(
+        1 for lamp in s.lamp_lib.lamps if lamp.name.startswith("Unknown lamp")), len(pictures)
 
     # The second run tests: no teaching, the bulb check and every lamp as taught,
     # with the camera given the settings it was taught with.

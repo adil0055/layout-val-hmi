@@ -28,6 +28,8 @@ be in the same state for the reference and for the frames measured against it.
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 
@@ -236,6 +238,16 @@ def _split(gray: np.ndarray, own: np.ndarray, at: tuple[int, int], level: int,
     return None
 
 
+#: A short stroke (``short_strokes``): this much 2-D detail at least -- a
+#: line or an edge scores under 0.02 --
+STROKE_STRUCTURE = 0.03
+#: ...no longer, corner to corner, than this many times the screen's typical
+#: element (a needle, a bar, a gauge's arc are longer)...
+STROKE_LENGTH = 2.0
+#: ...and this crisp against the frame's typical element.
+STROKE_CRISP = 0.8
+
+
 def structure(gray: np.ndarray, box: tuple[int, int, int, int], pad: int = 3) -> float:
     """How two-dimensional the detail in ``box`` is: 0 for a straight line, 1 for a dot.
 
@@ -292,6 +304,7 @@ def profile_from_reference(
     valid: np.ndarray | None = None,
     min_structure: float = 0.10,
     min_crispness: float = 0.40,
+    short_strokes: bool = False,
     **segment_kw,
 ) -> LayoutProfile:
     """Build a measurable inventory out of a reference frame.
@@ -305,6 +318,13 @@ def profile_from_reference(
     are left out: their position along their own length cannot be measured.
     So are regions with less fine detail than ``min_crispness`` of the frame's
     typical element (see :func:`crispness`).
+
+    ``short_strokes`` keeps a short, crisp stroke all the same -- a dial's
+    tick mark, both of its ends in view. Its ends fix it along its length,
+    but against its long sides they score low: on a webcam photograph of a
+    cluster, 0.035-0.08, and nine of twelve regions the straight-line cut
+    took out were ticks. The cut was set for long lines and bars under a
+    hand-held camera and moving glare; this is for a camera on a stand.
     """
     height, width = reference.shape[:2]
     profile = LayoutProfile(
@@ -325,11 +345,21 @@ def profile_from_reference(
     if valid is not None:
         seen = cv2.erode(valid.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         regions = [r for r in regions if seen[r[1]:r[1] + r[3], r[0]:r[0] + r[2]].all()]
-    regions = [r for r in regions if structure(gray, r[:4]) >= min_structure]
+    shape = {r: structure(gray, r[:4]) for r in regions}
+    strokes = []
+    if short_strokes and regions:
+        longest = STROKE_LENGTH * float(np.median([math.hypot(r[2], r[3]) for r in regions]))
+        strokes = [r for r in regions if STROKE_STRUCTURE <= shape[r] < min_structure
+                   and math.hypot(r[2], r[3]) <= longest]
+    regions = [r for r in regions if shape[r] >= min_structure]
     if regions:
         crisp = [crispness(gray, r[:4]) for r in regions]
-        floor = min_crispness * float(np.median(crisp))
-        regions = [r for r, c in zip(regions, crisp) if c >= floor]
+        typical = float(np.median(crisp))
+        regions = [r for r, c in zip(regions, crisp) if c >= min_crispness * typical]
+        # A stroke has to be as crisp as the screen's typical element: it is
+        # kept for its ends, and soft ends say little.
+        regions += [r for r in strokes if crispness(gray, r[:4]) >= STROKE_CRISP * typical]
+        regions.sort(key=lambda r: (r[1], r[0]))
     # Biggest first when there are too many: a cap that kept the top-left corner
     # of the screen and dropped the instruments would be the wrong forty.
     if len(regions) > max_elements:

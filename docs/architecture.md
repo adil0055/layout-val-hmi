@@ -666,7 +666,14 @@ is least certain. Up to 200 elements are kept.
 A webcam on a stand does not shake, and the one-button run says so
 (`steady_camera`): there a region need only be 20 px and 4 px across, which
 is what a dial's minor ticks are. Through the page, on the simulated cluster,
-the layout check went from 54 elements to 112, every one passing.
+the layout check went from 54 elements to 112, every one passing. And a short
+crisp stroke is kept although its detail is mostly one-dimensional
+(`short_strokes`): a tick's two ends fix it along its length, but against its
+long sides they score low, 0.035-0.08 on a real webcam's photograph, where
+nine of the twelve regions the 0.10 cut took out were ticks. Kept are strokes
+scoring at least 0.03 (lines and edges score under 0.02), no longer corner to
+corner than twice the screen's typical element (a needle, a bar, an arc are
+longer), and as crisp as 0.8 of the typical element.
 
 **Big, mostly empty regions are split.** One threshold for the whole screen
 joins whatever touches at that level: a dial's scale ring joins every tick and
@@ -808,8 +815,12 @@ webcam it came out at 0.14-0.44 s, which is why it is measured, not fixed);
 a change is a frame unlike every
 frame the screen showed before (one, or both halves of a flash); settled is a
 frame matching one 0.25-1.2 s older -- still, or a flash come round. Then
-shots are taken across 1.3 s, or 0.7 s when nothing moved in that time (no
-flash has longer halves). A state that changes nothing is given 1.5 s. Frames
+shots are taken across 1.8 s, or 0.7 s when nothing moved in that time (no
+flash has longer halves) and at least five frames came: through the page, a
+real webcam's frames came 0.6-0.7 s apart, two of them both landed in the lit
+half of a 0.76 s flash, and the high beam's Flash state was taught as steady.
+Five frames with the page's varying gap between them do not stay in one
+half. A state that changes nothing is given 1.5 s. Frames
 are compared small (480 px wide), and a pixel has changed when it moved by
 more than the noise and by more than 30% of its brightness: a backlight's PWM
 banding through a camera is a gain on each row, ±8% in the simulated camera,
@@ -845,16 +856,54 @@ every bulb-check frame, still, sized like the lamps, and on no lamp: the
 needles sweeping through the bulb check made twenty "lamps" on the dials
 before.
 
+What lit up is what got *brighter*, not what changed: with the screen dark a
+webcam still on automatic opens up and the whole room comes out brighter, and
+taken either way that room was "the display" -- on a real webcam the box
+round it took in a lamp on the wall and came out turned, and the picture
+through it was rotated and skewed though the camera was level. Where the
+corners finder finds no outline (a black bezel in a dark room, the usual case
+for a real cluster), the box round the content is upright unless a turned one
+is at least 15% tighter (a camera rolled well over); its corners are not
+pulled onto edges, since the edges next to them are ticks and numerals; and
+it is taken at one display pixel to a camera pixel, not stretched to a common
+resolution -- the content's shape is not the display's, and 16:9 made
+1920 x 1080 of a 2.6:1 cluster's content. The size is estimated again on the
+second look, with the camera set up. Content within 1% of the picture's edge
+(`cut_edges`; of what there is of the picture, when undistorted) means part
+of the display is out of view, and a teach-in stops there and says which
+edge, after 20 s rather than after a quarter of an hour.
+
+In the bulb check every lamp is lit at once, and each is read by its template
+-- the symbol and a margin -- with the light in it held near the lamp's own.
+From farther off the margin is wider than the gap between lamps, the
+neighbours' light falls in it, and the lamp is passed over: a real webcam's
+bulb check lost 11 of 31. A lamp not read among the rest is looked for where
+it lit when taught, by its symbol alone (`Library.at_place`: within 30% of
+its size, matched to 0.7, in its own colour, 0.3-3 times its light); lit
+glow strong enough to lose 4 of 6 lamps to the blob reading lost none to it,
+and a lamp drawn missing stayed missing.
+
 **Setting the camera** (`camtune.py`). A webcam on automatic exposes for the
 room, and in a room a lit display is the brightest thing: blown out, its white
 strokes bloom into each other, its white balance follows whatever else is in
 view, and its sharpening rings round every stroke. The page reports what its
 camera can be set to (W3C Image Capture: `getCapabilities`/`getSettings`) when
 the run starts; once the display is located, `Tuner` sets the camera for the
-display alone, measured on the display region of the frames:
+display alone, measured on what lit up at ignition on (in display space, with
+a margin for the edges a focus measure needs). Not on the whole display
+region: a lamp's reflection on the glass, or a lamp in the room that falls
+inside the outline, does not change with the ignition, and one that clips at
+every exposure a display wants would have the exposure cut until it did not
+-- in the simulated webcam, a reflection that leaves the exposure at 95.7
+measured this way cuts it to under half measured over the region:
 
 - *sharpening* to its minimum, white balance and focus to manual at their
-  current values, so nothing moves under the measurement;
+  current values, so nothing moves under the measurement; and *gain* (`iso`)
+  to its minimum where the camera offers it, as a camera lowers its gain
+  before its exposure in a bright scene -- a webcam left on automatic in a dim
+  room has it up, and the exposure the display then needs is shorter than it
+  has to be (8 times, at ISO 800 against 100), noisier and more open to
+  flicker. Most desktop webcams do not offer it to a page;
 - *exposure* (`exposureTime` with `exposureMode: manual`, else
   `exposureCompensation`): the brightest content is the 99.8th percentile of
   the brightest channel -- a display is mostly dark, its strokes a few percent
@@ -906,6 +955,17 @@ with the rest screen as it is now and measures against that, not the
 teach-in's -- minutes or days old; and after a lamp a number lit, the number
 is driven past where it lit (a "letting go" step, not checked), for the same
 hysteresis.
+
+**Every element on its own** (`elementsheet.py`). The overlay labels every
+element in place, and at a cluster's density the labels sit on each other. So
+the run ends by cutting each element out by itself -- from the reference, and
+from the frame validated, at the place it was measured at, its box drawn in
+its verdict's colour -- and each lamp from the lamp-check shot it is
+brightest in, and writes them against their names: a PNG each in
+`elements/`, and `elements.html`, one page with the pictures inside it,
+failures first. The page is served with a policy that lets it run nothing
+and load nothing but its own pictures. Making it can fail without failing the
+run: it is for people, never the verdict.
 
 ---
 
@@ -1287,6 +1347,7 @@ src/layoutval/
 ├── discover.py       the teach-in from the DBC alone: every signal tried, lamps and elements found
 ├── autorun.py        the one-button run: power cycle, display, camera, reference, teach, check, validate
 ├── camtune.py        the webcam set up for the display: exposure, white balance, focus, sharpening
+├── elementsheet.py   every element and lamp cut out against its name: elements.html
 ├── autoprofile.py    inventory from the reference frame, when none is authored
 ├── authoring.py      assisted annotation — the only place a model belongs
 ├── repeatability.py  σ, from a static screen
