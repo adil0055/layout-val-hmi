@@ -657,6 +657,7 @@ def cmd_capture_server(args: argparse.Namespace) -> int:
         teach_plan=teach_plan,
         discovery=discovery,
     )
+    session.corner_check = getattr(args, "corners", None) or "check"
     if getattr(args, "sam3_url", None):
         _report_sam3(args.sam3_url)
     server = CaptureServer(session, args.host, args.port, quiet=args.quiet)
@@ -854,6 +855,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--auto-border", action="store_true",
                    help="find the display's border automatically instead of "
                         "tapping its corners. Needs a clean scene")
+    c.add_argument("--corners", choices=("check", "auto", "manual"), default="check",
+                   help="the one-button run's display corners: found and shown on the "
+                        "page to drag and confirm (check, the default), found and used "
+                        "(auto), or tapped on the page (manual)")
     c.add_argument("--fresh-lens", action="store_true",
                    help="ignore a saved lens solve and shoot a new one")
     c.add_argument("--webcam", action="store_true",

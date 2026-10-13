@@ -467,11 +467,13 @@ class Progress:
     log: list[str] = field(default_factory=list)
     #: Settings for the page to put on the camera: {"seq": n, "set": {...}}.
     camera: dict[str, Any] | None = None
+    #: What the run waits on the person for: {"what": "corners", ...}.
+    ask: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {"phase": self.phase, "detail": self.detail, "step": self.step,
                 "steps": self.steps, "done": self.done, "record": self.record,
-                "camera": self.camera}
+                "camera": self.camera, "ask": self.ask}
 
 
 class AutoRun:
@@ -501,6 +503,12 @@ class AutoRun:
         #: What lit up at ignition on, in the camera's picture: the display's
         #: content, and not a lamp in the room beside it.
         self._lit: np.ndarray | None = None
+        #: The display's corners in the camera's picture, and how they were
+        #: had, from the first look: the second, after the camera is set up,
+        #: uses them again rather than asking twice.
+        self._corners: tuple[np.ndarray, str] | None = None
+        self._answer: Any = None
+        self._answered = threading.Event()
         #: Each lamp as the lamp check saw it lit, for the element pictures.
         self._lamp_pics: dict[str, list[dict[str, Any]]] = {}
         self._thread: threading.Thread | None = None
@@ -668,6 +676,8 @@ class AutoRun:
             bits.append(f"sharpening {final['sharpness']:g}")
         if "iso" in final:
             bits.append(f"gain ISO {final['iso']:g}")
+        if "brightness" in final and final.get("brightness") != (self.camera.get("settings") or {}).get("brightness"):
+            bits.append(f"brightness {float(final['brightness']):g}")
         return "set for the display and held: " + ", ".join(bits)
 
     def _hdr(self) -> np.ndarray | None:
@@ -737,12 +747,17 @@ class AutoRun:
 
     def _run(self) -> dict[str, Any]:
         s = self.s
+        self._started = time.monotonic()
         s.steady_camera = True              # a webcam on a stand, not a hand
         self.folder.mkdir(parents=True, exist_ok=True)
         rows: list[dict[str, Any]] = []
         can = s.can is not None
         taught = getattr(s, "discovery", None) is not None or s.plan is not None
-        teaching = self.teach or not s.is_calibrated or s.reference is None
+        nothing_taught = not s.is_calibrated or s.reference is None or (
+            can and taught and s.lamp_lib is None)
+        if self.teach is False and nothing_taught:
+            return self._finish("FAILED", "Nothing is taught yet: press Teach first, then Test.")
+        teaching = self.teach or nothing_taught
         self.summary["mode"] = "teach" if teaching else "test"
 
         # The camera as it was set up when taught: a test seen at another
@@ -811,6 +826,30 @@ class AutoRun:
             if can and taught:
                 lib, teach_rows = self._teach(rest, bulb)
                 rows += teach_rows
+                if bulb:
+                    # Each lamp as the bulb check showed it, for its picture.
+                    pic = np.max(np.stack(bulb), axis=0)
+                    for lamp in lib.lamps:
+                        self._lamp_pics.setdefault(lamp.name, []).append(
+                            self._lamp_picture(pic, lamp.box, "bulb check", "PASS", lamp))
+            # Taught: testing is for when it is asked for (Test).
+            sheet = None
+            try:
+                sheet = self._element_pictures(None)
+            except Exception:
+                self._log(traceback.format_exc())
+            worst = _worst([r["verdict"] for r in rows])
+            n_lamps = len(s.lamp_lib.lamps) if s.lamp_lib is not None else 0
+            detail = (f"Taught in {time.monotonic() - self._started:.0f} s: "
+                      f"{len(s.profile) if s.profile else 0} elements"
+                      + (f", {n_lamps} lamps" if can and taught else "")
+                      + f". Press Test to check a cluster. Everything is in {self.folder.name}/.")
+            order = {"FAIL": 0, "FAILED": 0, "REVIEW": 1}
+            rows.sort(key=lambda r: order.get(r["verdict"], 2))
+            out = self._finish(worst if worst != "PASS" else "TAUGHT", detail, rows[:120])
+            if sheet:
+                out["elements"] = sheet
+            return out
         elif s.lamp_lib is not None and bulb:
             rows += self._bulb_test(s.lamp_lib, bulb)
 
@@ -850,7 +889,7 @@ class AutoRun:
         rows += [{"id": "Layout", "verdict": "REVIEW", "detail": f} for f in payload.get("flags", [])]
         worst = _worst([r["verdict"] for r in rows])
         detail = (f"{'Taught and checked' if teaching else 'Tested'} in "
-                  f"{time.monotonic() - self._t0:.0f} s. Layout {verdict}"
+                  f"{time.monotonic() - self._started:.0f} s. Layout {verdict}"
                   + (f"; lamps {self.summary['lamp_check']}" if "lamp_check" in self.summary else "")
                   + f". Everything is in {self.folder.name}/.")
         # What failed first, then what is for review, then the rest.
@@ -875,7 +914,6 @@ class AutoRun:
         Returns the dark frame, the running screen's last frames (frame, data)
         and every start-up frame's (time, data).
         """
-        self._t0 = time.monotonic()
         can = self.s.can
         # How much a still screen changes frame to frame through this camera
         # (noise, a backlight's flicker), from the screen as it is now.
@@ -935,7 +973,6 @@ class AutoRun:
 
     def _still_frames(self) -> list[tuple[np.ndarray, bytes]]:
         """Without CAN: the screen as it is, once it is still."""
-        self._t0 = time.monotonic()
         self._say("locate", "waiting for a still picture")
         first = self._still()
         got = watch(self._camera_frames(time.monotonic()), first[-1:], noise_level(first),
@@ -953,6 +990,8 @@ class AutoRun:
         on = np.median(np.stack([f for f, _ in run_frames]), axis=0).astype(np.uint8)
         on_u = self._undistort(on)
         lit = None
+        off: list[str] = []
+        mode = s.corner_check
         if dark is not None:
             # Everything that lit at any time while starting, not just the
             # running screen: the bulb check lights lamps the running screen
@@ -969,7 +1008,7 @@ class AutoRun:
             self._lit = lit
             valid = self._undistort(np.full(on.shape[:2], 255, np.uint8)) > 0
             off = cut_edges(lit, valid)
-            if off:
+            if off and mode == "auto":
                 cv2.imwrite(str(self.folder / "lit-at-ignition.png"), (lit * 255).astype(np.uint8))
                 cv2.imwrite(str(self.folder / "camera.jpg"), on_u)
                 sides = " and ".join(off)
@@ -977,24 +1016,32 @@ class AutoRun:
                 raise Stopped(f"the display runs off the {sides} of the camera's picture, so "
                               "part of it is not seen. Aim the camera so all of the display is "
                               "in view, with a little room round it, and press Start again")
-        aspect = (s.corner_display_size[0] / s.corner_display_size[1]) if s.size_set else None
-        proposal = propose_display_corners(on_u, aspect=aspect)
-        how = "its outline"
-        corners = None
-        if proposal is not None:
-            corners = ordered(proposal.corners)
-            if lit is not None and lit.any():
-                share = contains(corners, lit)
-                if share < CONTAIN_MIN:
-                    self._log(f"auto: the outline found holds {share:.0%} of what lit up; "
-                              "taking the outline round the content instead")
-                    corners = None
-        if corners is None:
-            if lit is None or not lit.any():
+        if self._corners is not None:
+            # As they were found -- and checked -- at the first look: the
+            # camera has not moved since.
+            corners, how = self._corners
+        else:
+            corners, how = None, ""
+            if mode != "manual":
+                aspect = (s.corner_display_size[0] / s.corner_display_size[1]) \
+                    if s.size_set else None
+                proposal = propose_display_corners(on_u, aspect=aspect)
+                if proposal is not None:
+                    corners, how = ordered(proposal.corners), "its outline"
+                    if lit is not None and lit.any():
+                        share = contains(corners, lit)
+                        if share < CONTAIN_MIN:
+                            self._log(f"auto: the outline found holds {share:.0%} of what lit "
+                                      "up; taking the outline round the content instead")
+                            corners = None
+                if corners is None and lit is not None and lit.any():
+                    corners, how = content_corners(lit), "what lit up at ignition on"
+            if mode in ("check", "manual"):
+                corners, how = self._ask_corners(on_u, corners, how, off)
+            elif corners is None:
                 raise Stopped("could not find the display in the picture")
-            corners = content_corners(lit)
-            how = "what lit up at ignition on"
-        outline = how == "its outline"
+            self._corners = (corners, how)
+        outline = how in ("its outline", "the corners you marked")
         size_note = ""
         # Estimated again on the second look, with the camera set up: the
         # first was through a camera on automatic.
@@ -1030,6 +1077,49 @@ class AutoRun:
                                    "corners": np.round(geometry.corners, 1).tolist()}
         return (f"found from {how}, {w} x {h}{size_note}; "
                 f"{ratio:.1f} camera px per display px")
+
+    def _ask_corners(self, img: np.ndarray, corners, how: str,
+                     off: list[str]) -> tuple[np.ndarray, str]:
+        """The display's corners as the person at the page has them: the ones
+        found, checked and dragged where they are off, or tapped from scratch."""
+        h, w = img.shape[:2]
+        self.folder.mkdir(parents=True, exist_ok=True)
+        name = f"{self.folder.name}/corners.jpg"
+        cv2.imwrite(str(self.s.out_dir / name), img)
+        if corners is None:
+            note = "The display was not found: tap its four corners."
+        elif how == "its outline":
+            note = "Found by its outline. Drag any corner that is off."
+        else:
+            note = ("No outline found; this is a box round what lit up. Drag the "
+                    "corners onto the display's own corners if you can see them.")
+        if off:
+            note += (f" What lit up runs off the {' and '.join(off)} of the picture: "
+                     "part of the display may be out of view.")
+        self._answer, self._answered = None, threading.Event()
+        self.progress.ask = {
+            "what": "corners", "image": name, "note": note,
+            "corners": None if corners is None
+            else (np.asarray(corners, float) / [w, h]).round(5).tolist()}
+        self._say("locate", "check the display's corners, then Use these corners")
+        while not self._answered.wait(0.3):
+            if self.feed.closed:
+                raise Stopped("stopped while the corners were being checked")
+        self.progress.ask = None
+        pts = ordered(np.asarray(self._answer, float).reshape(4, 2) * [w, h])
+        moved = corners is None or float(np.abs(pts - ordered(corners)).max()) > 2.0
+        self.summary["corners"] = "marked" if moved else "checked"
+        return pts, ("the corners you marked" if moved else how)
+
+    def answer_corners(self, corners) -> None:
+        """The corners from the page: four (x, y), each 0-1 across the picture."""
+        pts = np.asarray(corners, float)
+        if pts.shape != (4, 2) or not np.all(np.isfinite(pts)) or pts.min() < 0 or pts.max() > 1:
+            raise ValueError("four corners, each as x and y between 0 and 1")
+        if self.progress.ask is None or self.progress.ask.get("what") != "corners":
+            raise ValueError("the run is not waiting for corners")
+        self._answer = pts.tolist()
+        self._answered.set()
 
     # -- 4. teach ----------------------------------------------------------------
 
@@ -1225,11 +1315,18 @@ class AutoRun:
         lit = [float(L.lit_delta(lib.baseline, s)[y:y + h, x:x + w].sum()) for s in shots]
         r = next((r for r in results if r.name == name), None)
         verdict = r.verdict if r is not None else "PASS"
-        self._lamp_pics.setdefault(name, []).append({
-            "state": step.get("state") or "on", "verdict": verdict,
-            "reason": r.reason if r is not None and r.reason else "",
-            "colour": L.hue_name(lamp.hue),
-            "img": picture(shots[int(np.argmax(lit))], box, COLOURS.get(verdict, (200, 200, 200)))})
+        self._lamp_pics.setdefault(name, []).append(self._lamp_picture(
+            shots[int(np.argmax(lit))], box, step.get("state") or "on", verdict, lamp,
+            r.reason if r is not None and r.reason else ""))
+
+    @staticmethod
+    def _lamp_picture(img, box, state: str, verdict: str, lamp, reason: str = "") -> dict:
+        from layoutval import lamps as L
+        from layoutval.elementsheet import COLOURS, picture
+
+        return {"state": state, "verdict": verdict, "reason": reason,
+                "colour": L.hue_name(lamp.hue),
+                "img": picture(img, box, COLOURS.get(verdict, (200, 200, 200)))}
 
     def _element_pictures(self, val) -> str | None:
         """Every element and lamp cut out against its name: elements.html, elements/."""
@@ -1247,7 +1344,8 @@ class AutoRun:
         shot = s.out_dir / f"{self.stamp}-validate-rectified.png"
         if shot.is_file():
             now = cv2.imread(str(shot))
-        results = {r["element_id"]: r for r in ((val.report or {}).get("elements") or [])}
+        results = {r["element_id"]: r for r in
+                   (((val.report or {}).get("elements") or []) if val is not None else [])}
         if s.profile is not None and s.reference is not None:
             for e in s.profile.elements:
                 r = results.get(e.id, {})

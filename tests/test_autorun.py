@@ -460,6 +460,10 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
             if p.get("camera") and p["camera"]["seq"] > applied["seq"]:
                 webcam.update(p["camera"]["set"])
                 applied["seq"] = p["camera"]["seq"]
+            if p.get("ask") and p["ask"]["what"] == "corners":
+                # The person at the page: the corners found look right.
+                asked.append(p["ask"])
+                s.auto_corners(p["ask"]["corners"])
             time.sleep(0.02)
 
     def run(**kw):
@@ -471,16 +475,26 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
         assert s.auto.progress.done, s.auto.progress.to_dict()
         return s.auto.progress.record, s.auto.summary
 
+    asked: list[dict] = []
     threading.Thread(target=pump, daemon=True).start()
     try:
-        rec, summary = run()
-        # Taught: a later run tests against it, and finds a lamp that has gone.
-        assert s.auto.teach is True
-        rec2, summary2 = run()
+        # Test with nothing taught: says so, and does nothing.
+        rec0, _ = run(teach=False)
+        assert rec0["verdict"] == "FAILED" and "Teach first" in rec0["detail"], rec0
+        rec, summary = run(teach=True)
+        # Taught, and no more: testing is for when Test is pressed.
+        assert s.auto.teach is True and summary["mode"] == "teach"
+        assert rec["verdict"] in ("TAUGHT", "REVIEW") and "Press Test" in rec["detail"], rec
+        assert not any(r["id"] in ("Lamp check", "Layout", "Bulb check") for r in rec["rows"])
+        rec2, summary2 = run(teach=False)
         faults.append("abs")
-        rec3, summary3 = run()
+        rec3, summary3 = run(teach=False)
     finally:
         stop.set()
+    # The corners were found, shown, and asked about once in the teach-in
+    # (the second look, with the camera set up, used them again).
+    assert len(asked) == 1 and len(asked[0]["corners"]) == 4 and asked[0]["image"].endswith(".jpg")
+    assert summary["corners"] == "checked"
     rows = {r["id"]: r for r in rec["rows"]}
     assert rows["Display"]["verdict"] == "PASS", rows["Display"]
     # The camera was set up for the display, and is held there.
@@ -499,13 +513,16 @@ def test_start_camera_and_everything_else_is_done(tmp_path, quick):
     assert summary["teach"]["layout"] == "fixed slots"
     assert "ECM_Nothing" in " ".join(summary["teach"]["no_effect"]) or \
         "Nothing" in " ".join(summary["teach"]["no_effect"]), summary["teach"]["no_effect"]
-    assert rows["Lamp check"]["verdict"] == "PASS", [r for r in rec["rows"] if r["verdict"] != "PASS"]
-    assert rows["Layout"]["verdict"] == "PASS", rows["Layout"]
     assert s.lamp_lib is not None and (s.auto.folder / "auto.json").is_file()
-    # Every element and lamp on its own, against its name.
+    # Every element and lamp on its own, against its name: taught, as the
+    # reference and the bulb check have them...
     page = s.out_dir / rec["elements"]
     text = page.read_text()
-    assert "ABS warning lamp" in text and "this run" in text and "<script" not in text
+    assert "ABS warning lamp" in text and "bulb check" in text and "<script" not in text
+    # ...and tested, as this run saw them.
+    page = s.out_dir / rec2["elements"]
+    text = page.read_text()
+    assert "ABS warning lamp" in text and "this run" in text
     pictures = list((page.parent / "elements").glob("*.png"))
     assert len(pictures) == len(s.profile.elements) + len(s.lamp_lib.lamps) - sum(
         1 for lamp in s.lamp_lib.lamps if lamp.name.startswith("Unknown lamp")), len(pictures)

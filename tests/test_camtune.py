@@ -104,6 +104,7 @@ def test_a_camera_with_nothing_to_set_is_left_alone():
     assert not calls
     assert C.controls(CAPS) == ["exposure", "white balance", "focus", "sharpness"]
     assert C.controls({**CAPS, "iso": {"min": 50, "max": 800}})[-1] == "gain"
+    assert C.controls({**CAPS, "brightness": {"min": 0, "max": 255}})[-1] == "brightness"
 
 
 def test_a_lamp_in_view_that_is_not_the_display_does_not_set_the_exposure():
@@ -179,3 +180,38 @@ def test_two_exposures_show_the_dim_parts_and_keep_the_text_crisp():
     assert out[ring].mean() < stretched(short)[ring].mean() + 15 < stretched(naive)[ring].mean()
     assert C.bracket(CAPS, {"exposureTime": 95})["exposureTime"] == 380
     assert C.bracket({"exposureTime": {"min": 1, "max": 120}}, {"exposureTime": 95}) is None
+
+
+class Stepped(FakeWebcam):
+    """A webcam that takes an exposure only in steps, twice apart (as many do:
+    a real one's went 19, 39, 78, ...), with a brightness that is part gain,
+    part offset."""
+    STEPS = (5, 9, 17, 35, 70, 140, 280, 560)
+
+    def shoot(self, s: dict) -> np.ndarray:
+        took = max([v for v in self.STEPS if v <= s["exposureTime"]] or [self.STEPS[0]])
+        img = super().shoot({**s, "exposureTime": took}).astype(np.float32)
+        b = s.get("brightness", 128) - 128
+        return np.clip(img * (1 + b / 200.0) + 0.04 * b, 0, 255).astype(np.uint8)
+
+
+def test_an_exposure_in_steps_ends_on_the_best_one_and_brightness_closes_the_gap():
+    caps = {k: CAPS[k] for k in ("exposureMode", "exposureTime")}
+    start = {**AUTO, "exposureTime": 260}
+    # Between a step that clips and the one under it, the tuner used to end
+    # on whatever it asked last; now the best it saw.
+    cam = Stepped()
+    tuner = C.Tuner(caps, start, cam.look)
+    tuner.run()
+    level, clip = C.brightest(cam.shoot(cam.settings))
+    seen = [s["exposure"] for s in tuner.steps if "exposure" in s and s["exposure"]["clip"] <= C.CLIP_MAX]
+    assert clip <= C.CLIP_MAX and level >= max(s["level"] for s in seen) - 3, (level, tuner.steps)
+    assert level < C.BAND[0]                                  # the steps leave it short...
+    # ...and brightness brings it up, the background still dark.
+    cam = Stepped()
+    final = C.Tuner({**caps, "brightness": {"min": 0, "max": 255, "step": 1}},
+                    {**start, "brightness": 128}, cam.look).run()
+    after = cam.shoot(cam.settings)
+    level2, clip2 = C.brightest(after)
+    assert C.BAND[0] <= level2 <= C.BAND[1] and clip2 <= C.CLIP_MAX, (level2, final)
+    assert final["brightness"] > 128 and np.percentile(after.max(axis=2), 30) <= C.BRIGHT_FLOOR

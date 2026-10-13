@@ -50,6 +50,8 @@ HIGH_PCT = 99.8
 EXPOSURE_MAX = 333.0
 #: Points of a focus sweep.
 FOCUS_POINTS = 7
+#: Brightness may lift the display's background to this, no further.
+BRIGHT_FLOOR = 30.0
 
 
 def brightest(img: np.ndarray, mask: np.ndarray | None = None) -> tuple[float, float]:
@@ -119,6 +121,8 @@ def controls(caps: dict) -> list[str]:
         out.append("sharpness")
     if _range(caps, "iso"):
         out.append("gain")
+    if _range(caps, "brightness"):
+        out.append("brightness")
     return out
 
 
@@ -144,6 +148,8 @@ class Tuner:
         self._look = look
         self.region = region or (lambda f: f)
         self.mask = mask if mask is not None and mask.any() else None
+        #: The brightest content's level the exposure ended at.
+        self.level = 0.0
         self.log = log or (lambda m: None)
         self.steps: list[dict[str, Any]] = []
 
@@ -179,6 +185,8 @@ class Tuner:
             self.white()
         if "exposure" in can:
             self.exposure(steps=4)            # white balance moves the channels
+            if "brightness" in can and self.level < BAND[0]:
+                self.brighten()
         return {k: v for k, v in self.now.items() if k in _SETTABLE}
 
     def exposure(self, steps: int = 8) -> None:
@@ -196,9 +204,11 @@ class Tuner:
             value = float(self.now.get(key, 0.0))
             extra = {}
         too_dark = None                         # the brightest setting known too dark
+        tried: list[tuple[float, float, float]] = []
         for _ in range(steps):
             img = self.look({**extra, key: value})
             level, clip = brightest(img, self.mask)
+            tried.append((value, level, clip))
             self.steps.append({"exposure": {key: round(value, 3), "level": round(level, 1),
                                             "clip": round(clip, 5)}})
             if clip <= CLIP_MAX and BAND[0] <= level <= BAND[1]:
@@ -219,7 +229,72 @@ class Tuner:
             if abs(new - value) < 1e-6:
                 break                          # at the end of its range
             value = new
-        self.log(f"camera: exposure {key} {value:g}")
+        # The best seen, not the last asked for. Many webcams take an exposure
+        # only in steps -- a real one's went 19, 39, 78, ... -- and between
+        # one step that clips and the one below, asking for what lies between
+        # gets one or the other: the last asked was the darker of them, and
+        # the text came out at half white.
+        unclipped = [t for t in tried if t[2] <= CLIP_MAX]
+        best = max(unclipped, key=lambda t: t[1]) if unclipped else min(tried, key=lambda t: t[2])
+        if best[0] != tried[-1][0]:
+            self.look({**extra, key: best[0]})
+            self.steps.append({"exposure": {key: round(best[0], 3), "level": round(best[1], 1),
+                                            "clip": round(best[2], 5), "best": True}})
+        self.level = best[1]
+        stepped = [(a, b) for a in tried for b in tried
+                   if a[0] != b[0] and a[2] <= CLIP_MAX and b[2] <= CLIP_MAX
+                   and abs(math.log(_ratio(a[0], b[0], key))) > 0.2
+                   and abs(a[1] - b[1]) <= 0.03 * max(a[1], b[1], 1.0)]
+        if stepped:
+            self.log("camera: its exposure moves in steps")
+        self.log(f"camera: exposure {key} {best[0]:g}")
+
+    def brighten(self) -> None:
+        """Brightness up to the target when the exposure can only step under it.
+
+        Below a step that clips, the next one down can leave the text at half
+        white. A webcam's brightness setting raises the picture in between --
+        by a gain, or an offset, or some of each, which is measured. What
+        lifts the background (an offset) is held to BRIGHT_FLOOR: the display
+        is seen against its dark.
+        """
+        lo, hi = _range(self.caps, "brightness")
+        b0 = float(self.now.get("brightness", (lo + hi) / 2.0))
+        img0 = self.look({"brightness": b0})
+        level0, _ = brightest(img0, self.mask)
+        if level0 >= BAND[0]:
+            return
+        floor0 = _floor(img0)
+        b1 = min(hi, b0 + 0.25 * (hi - lo))
+        if b1 - b0 < 1e-6:
+            return
+        img1 = self.look({"brightness": b1})
+        level1, clip1 = brightest(img1, self.mask)
+        floor1 = _floor(img1)
+        if level1 - level0 < 3.0:
+            self.look({"brightness": b0})
+            self.log("camera: brightness does not raise the picture; left as it was")
+            return
+        per = (level1 - level0) / (b1 - b0)
+        b = b0 + (TARGET - level0) / per
+        lift = (floor1 - floor0) / (b1 - b0)
+        if lift > 0:
+            b = min(b, b0 + max(0.0, BRIGHT_FLOOR - floor0) / lift)
+        b = min(max(b, lo), hi)
+        best = (b0, level0)
+        for _ in range(3):
+            img = self.look({"brightness": b})
+            level, clip = brightest(img, self.mask)
+            self.steps.append({"brightness": {"brightness": round(b, 2), "level": round(level, 1),
+                                              "clip": round(clip, 5),
+                                              "floor": round(_floor(img), 1)}})
+            if clip <= CLIP_MAX:
+                best = max(best, (b, level), key=lambda t: t[1])
+                break
+            b = (b + best[0]) / 2.0                 # clipped: back halfway
+        self.look({"brightness": best[0]})
+        self.level = best[1]
+        self.log(f"camera: brightness {best[0]:g}")
 
     def white(self) -> None:
         """The display's white and grey content grey: red as strong as blue."""
@@ -264,7 +339,13 @@ class Tuner:
 
 #: What the tuner sets and hands back, to be given to the camera again later.
 _SETTABLE = ("exposureMode", "exposureTime", "exposureCompensation", "whiteBalanceMode",
-             "colorTemperature", "focusMode", "focusDistance", "sharpness", "iso")
+             "colorTemperature", "focusMode", "focusDistance", "sharpness", "iso", "brightness")
+
+
+def _floor(img: np.ndarray) -> float:
+    """The display's dark: most of a cluster's screen is its background."""
+    top = img.max(axis=2) if img.ndim == 3 else img
+    return float(np.percentile(top, 30))
 
 
 # -- two exposures, one picture -----------------------------------------------

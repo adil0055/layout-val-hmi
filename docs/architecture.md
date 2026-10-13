@@ -840,6 +840,18 @@ fades between 15% and full rather than flashing, and at a quarter of its light
 it no longer matches its own symbol. A wrong symbol in that place still leaves
 the lamp missing, so the fault is not lost.
 
+**The display's corners are checked** (`--corners`, default `check`). Found
+on their own they are right most of the time, and wrong now and then -- an
+outline in the room, a bezel lost in the dark -- and a wrong one spoils the
+whole teach-in. So the run shows the corners found, on the picture they were
+found on, and waits: the person drags any that is off and presses Use these
+corners (`/auto/corners`, four points as shares of the picture). Corners
+moved are the display's own, so they are fitted onto its edge and its size
+read from their shape; corners kept are used as found. The second look,
+after the camera is set up, takes them again rather than asking twice.
+`auto` uses them unchecked, as before (content off the picture's edge then
+stops the run); `manual` shows the picture with no corners, to tap.
+
 **The power cycle** gives the display and the bulb check. Ignition off until
 dark and still (and the bus asleep, if that is what it takes); ignition on,
 recording ten frames a second, until the screen has stayed still for 6 s --
@@ -905,7 +917,13 @@ measured this way cuts it to under half measured over the region:
   has to be (8 times, at ISO 800 against 100), noisier and more open to
   flicker. Most desktop webcams do not offer it to a page;
 - *exposure* (`exposureTime` with `exposureMode: manual`, else
-  `exposureCompensation`): the brightest content is the 99.8th percentile of
+  `exposureCompensation`), the best setting seen kept, not the last asked
+  for: many webcams take an exposure only in steps twice apart (a real one
+  went 19, 39, 78, ...), and between a step that clips and the one under it
+  the tuner ended on whichever it asked last -- once the darker, the text at
+  half white. Where the best step leaves the text short of 200, *brightness*
+  (part gain, part offset on a webcam; measured, not assumed) brings it up,
+  the display's background held to 30. The brightest content is the 99.8th percentile of
   the brightest channel -- a display is mostly dark, its strokes a few percent
   of it, and the brightest channel keeps a red lamp's red from clipping -- and
   is brought into 200-240 with at most 0.05% of the display at 250 or over.
@@ -967,10 +985,14 @@ contrast are left as the camera has them: neither moves a measured position,
 and a symbol's colour is judged against a reference taken with the same
 camera.
 
-**Teach, then test.** The first run teaches: display, camera, reference,
-discovery, lamp check, validate. Later runs test against it: camera set as
-taught, power cycle (every lamp lit in the bulb check, in its place), lamp
-check, validate. The lamp check starts
+**Teach, then test -- when asked.** Teaching (Start camera, or Teach) is the
+display, the camera, the reference and discovery, and ends there with what
+was learnt: its own lamp check and validation, run straight after, tested
+nothing the person had asked to test and held the next step back by minutes.
+Testing (Test, and only Test) is camera set as taught, power cycle (every
+lamp lit in the bulb check, in its place), lamp check, validate; with nothing
+taught it says so and does nothing. The page starts teaching by itself when
+nothing is taught, and never starts a test. The lamp check starts
 with the rest screen as it is now and measures against that, not the
 teach-in's -- minutes or days old; and after a lamp a number lit, the number
 is driven past where it lit (a "letting go" step, not checked), for the same

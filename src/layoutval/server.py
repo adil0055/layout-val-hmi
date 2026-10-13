@@ -471,6 +471,10 @@ class CaptureSession:
         #: The reference was put together from two exposures (camtune.fuse), and
         #: what is compared with it must be too.
         self.reference_hdr = False
+        #: The one-button run's corners: "check" -- found, then shown on the
+        #: page to drag and confirm (the default); "auto" -- found and used;
+        #: "manual" -- tapped on the page.
+        self.corner_check = "check"
         self.lamp_lib: Any = None
         self.teach_summary: dict[str, Any] | None = None
         self._teach_files: dict[str, dict[int, Path]] = {}
@@ -894,6 +898,14 @@ class CaptureSession:
         if run is None:
             raise ValueError("no automatic run")
         run.stop()
+        return run.progress.to_dict()
+
+    def auto_corners(self, corners) -> dict[str, Any]:
+        """The display's corners as checked or tapped on the page, for the run waiting on them."""
+        run = self.auto
+        if run is None or not run.running:
+            raise ValueError("no automatic run")
+        run.answer_corners(corners)
         return run.progress.to_dict()
 
     def can_start(self, mode: str) -> dict[str, Any]:
@@ -2849,7 +2861,7 @@ label.shoot.busy{background:#3A4650;color:#9DADB5}
 input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
 .hint{color:#8B9AA3;font-size:12.5px;margin-top:10px}
 .verdict{font-size:22px;font-weight:700;letter-spacing:.02em}
-.PASS,.OK{color:#4FB584}.FAIL,.FAILED{color:#E8695C}.REVIEW{color:#DCA83F}
+.PASS,.OK,.TAUGHT{color:#4FB584}.FAIL,.FAILED{color:#E8695C}.REVIEW{color:#DCA83F}
 .detail{color:#C2CED6;font-size:13.5px;margin-top:4px}
 img.shot{width:100%;border-radius:8px;border:1px solid #2B373D;margin-top:10px;display:block}
 a.sheet{display:block;margin-top:12px;padding:12px;border-radius:9px;background:#1E272C;
@@ -2936,8 +2948,8 @@ button.ghost.live{background:#1D5B8A;border-color:#3E8FD0}
     <div id="autofill" style="height:100%;width:0;background:#4CA3DD;transition:width .3s"></div></div>
   <div class="hint" id="autohint"></div>
   <div style="display:flex;gap:8px;margin-top:10px">
-    <button id="autogo" class="ghost">Test again</button>
-    <button id="autoteach" class="ghost">Teach again</button>
+    <button id="autoteach" class="ghost">Teach</button>
+    <button id="autogo" class="ghost">Test</button>
     <button id="autostop" class="ghost">Stop</button>
   </div>
 </div>
@@ -2985,6 +2997,7 @@ button.ghost.live{background:#1D5B8A;border-color:#3E8FD0}
 
 <div class="card" id="marker" style="display:none">
   <b id="marktitle">Tap the four corners of the display</b>
+  <div class="hint" id="marknote" style="color:#C2CED6"></div>
   <div class="hint" id="markhint">corner 1 of 4</div>
   <div style="position:relative;margin-top:10px">
     <img id="markimg" class="shot" style="margin:0">
@@ -3298,10 +3311,12 @@ async function grabJpeg() {
 }
 function paintAuto(p) {
   $("autocard").style.display = CAM ? "block" : "none";
-  const taught = !!(STATUS && STATUS.can && STATUS.can.taught);
-  $("autogo").style.display = RUN ? "none" : "";
-  $("autogo").textContent = taught ? "Test again" : "Run";
-  $("autoteach").style.display = RUN || !taught ? "none" : "";
+  const taught = isTaught();
+  // Teach learns the cluster; Test checks one against it -- only when asked.
+  $("autoteach").style.display = RUN ? "none" : "";
+  $("autoteach").textContent = taught ? "Teach again" : "Teach";
+  $("autogo").style.display = RUN || !taught ? "none" : "";
+  $("autogo").textContent = "Test";
   $("autostop").style.display = RUN ? "" : "none";
   if (!p) return;
   const names = {starting: "Starting", camera: "Setting the camera", power: "Power cycle",
@@ -3319,7 +3334,7 @@ function paintAuto(p) {
 // after, which settings that frame was taken with and what the camera took.
 let CAM_SEQ = 0, CAM_REPORT = null;
 const CAM_KEYS = ["exposureMode", "exposureTime", "exposureCompensation", "whiteBalanceMode",
-                  "colorTemperature", "focusMode", "focusDistance", "sharpness", "iso"];
+                  "colorTemperature", "focusMode", "focusDistance", "sharpness", "iso", "brightness"];
 function camInfo() {
   const track = CAM && CAM.getVideoTracks()[0];
   let caps = {}, settings = {};
@@ -3370,6 +3385,8 @@ async function autoRun(teach) {
       const t0 = performance.now();
       p = await autoPost("frame", await grabJpeg());
       paintAuto(p);
+      if (p.ask && p.ask.what === "corners" && !AUTO_ASK) askCorners(p.ask);
+      if (!p.ask && AUTO_ASK) closeAsk();
       if (p.camera && p.camera.seq > CAM_SEQ) {
         await applyCam(p.camera.set);
         CAM_SEQ = p.camera.seq;
@@ -3384,12 +3401,38 @@ async function autoRun(teach) {
   } catch (e) {
     show({verdict: "FAILED", detail: String(e.message || e)});
   }
+  if (AUTO_ASK) closeAsk();
   RUN = null;
   paintAuto(null);
   await refresh();
 }
-$("autogo").onclick = () => autoRun();
+$("autogo").onclick = () => autoRun(false);
 $("autoteach").onclick = () => autoRun(true);
+function isTaught() {
+  return !!(STATUS && STATUS.calibrated && STATUS.has_reference
+            && (!STATUS.can || STATUS.can.taught));
+}
+// The run's display corners, found and shown to check (or to tap, when not
+// found or when asked for by hand): dragged like any other dots, then sent back.
+let AUTO_ASK = null;
+function askCorners(ask) {
+  AUTO_ASK = ask;
+  pending = null; outline = null; found = "";
+  taps = ask.corners ? ask.corners.map(c => c.slice()) : [];
+  $("markimg").onload = paintTaps;
+  $("markimg").src = `/shot/${encodeURI(ask.image)}?t=${TOKEN}`;
+  $("marktitle").textContent = ask.corners ? "Check the display's corners"
+                                           : "Tap the four corners of the display";
+  $("marknote").textContent = ask.note || "";
+  $("marksend").textContent = "Use these corners";
+  $("marker").style.display = "block";
+  $("marker").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+function closeAsk() {
+  AUTO_ASK = null; taps = [];
+  $("marker").style.display = "none";
+  $("marknote").textContent = "";
+}
 $("autostop").onclick = async () => { try { await autoPost("stop"); } catch (e) {} };
 
 $("canteach").onclick = () => canRun("teach");
@@ -3472,6 +3515,13 @@ $("markcv").addEventListener("pointermove", ev => {
   $("markcv").addEventListener(k, () => { dragging = -1; }));
 $("markundo").onclick = () => { taps.pop(); paintTaps(); };
 $("marksend").onclick = async () => {
+  if (AUTO_ASK) {
+    $("marksend").disabled = true;
+    try { await autoPost("corners", {corners: taps}); }
+    catch (e) { show({verdict: "FAILED", detail: String(e.message || e)}); }
+    closeAsk();
+    return;
+  }
   const body = new FormData();
   body.append("action", "corners");
   body.append("image", pending, pending.name || "capture.jpg");
@@ -3620,7 +3670,8 @@ async function lockCam(stream) {
   }
   setupExposure();
   // Start camera is all it takes: the run begins once the picture is held.
-  if (AUTO_START && !RUN && !RUN_DONE) setTimeout(autoRun, 500);
+  // Start camera starts teaching, if nothing is taught yet; testing waits for Test.
+  if (AUTO_START && !RUN && !RUN_DONE && !isTaught()) setTimeout(() => autoRun(true), 500);
   paintCam();
 }
 
@@ -4080,6 +4131,13 @@ class _Handler(BaseHTTPRequestHandler):
                     body, seq, report if isinstance(report, dict) else None)
             elif what == "stop":
                 payload = self.session.auto_stop()
+            elif what == "corners":
+                try:
+                    asked = json.loads(body or b"{}")
+                except ValueError:
+                    raise ValueError("the corners, as JSON") from None
+                corners = asked.get("corners") if isinstance(asked, dict) else None
+                payload = self.session.auto_corners(corners)
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"not found", "text/plain; charset=utf-8")
                 return

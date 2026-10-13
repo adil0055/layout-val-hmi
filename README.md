@@ -109,7 +109,7 @@ them; it is also slightly more accurate and needs no lens solve at all. Without
 a board, the border route asks the cluster for nothing, which is the only thing
 that is true of a production cluster.
 
-### Over CAN: Start camera, and everything else is automatic
+### Over CAN: Start camera to teach, Test to test
 
 A layout check that compares against a reference only knows elements as
 places (`auto@312,75`), and it never sees a telltale that is off when the
@@ -123,9 +123,13 @@ layoutval go --webcam --can --dbc cluster.dbc
 ```
 
 Aim the webcam at the cluster and press **Start camera** (with `--webcam` it
-starts by itself). The page streams frames to the computer, and the computer
-does the rest -- nobody picks a frame, marks a corner, types a resolution or
-touches a camera setting:
+starts by itself), and teaching starts: the page streams frames to the
+computer, and the computer does the rest -- nobody picks a frame, types a
+resolution or touches a camera setting. One thing is asked: the display's
+corners, found and shown on the page to check (drag any that is off, then
+**Use these corners**). `--corners auto` uses them unchecked; `--corners
+manual` asks for them to be tapped. Teaching ends once the cluster is learnt
+(steps 1-5); testing (6-7) runs only when **Test** is pressed:
 
 1. **Power cycle.** Ignition off until the screen is dark and still (if it
    stays lit, the bus is let sleep as well), then on, recording the start-up:
@@ -139,9 +143,11 @@ touches a camera setting:
    own. Where no outline is found -- a black bezel in a dark room -- an
    upright box is taken round the content, one display pixel to a camera
    pixel: the content's shape is not the display's, so it is not stretched to
-   a resolution. If the content runs off the edge of the camera's picture,
-   the run stops at once and says which edge: aim the camera so all of the
-   display is in view, with a little room round it.
+   a resolution. The corners are then shown to check, once: the second look,
+   after the camera is set up, uses them again. If the content runs off the
+   edge of the camera's picture, the check says so (with `--corners auto`
+   the run stops there): aim the camera so all of the display is in view,
+   with a little room round it.
 3. **Setting the camera.** A webcam left on automatic exposes for the room,
    and the display is the brightest thing in it: the screen comes out blown,
    white strokes bloom into each other, and a dial's ticks and numerals merge
@@ -149,7 +155,10 @@ touches a camera setting:
    what the display looks like through it:
    - **exposure**, so the brightest content -- on every colour channel, so a
      red lamp's red is not clipped either -- sits just under white, with
-     almost nothing clipped;
+     almost nothing clipped. Many webcams take an exposure only in steps,
+     each twice the last; the best setting seen is kept, never just the last
+     tried, and where the step under clipping leaves the text short of white
+     the camera's **brightness** brings it up (the background held dark);
    - **white balance**, so the display's white and grey text comes out grey
      (red as strong as blue);
    - **focus**, swept for the sharpest picture of the display, then fixed;
@@ -205,19 +214,20 @@ touches a camera setting:
    - what changed on its own while the cluster was taught -- an odometer, a
      trip counter, a clock -- is left out of the layout check and listed as
      not checked, since it would fail for being right.
-6. **Lamp check.** Every lamp state learnt, then all lamps together: which
+6. **Lamp check** (Test). Every lamp state learnt, then all lamps together: which
    lamps were lit, recognised by symbol, and whether that was right
    (**missing**, **unexpected**, **wrong colour**, **unknown symbol**,
    **position**, **order**, **not flashing**/**flashing**, **moves between
    shots**). In the bulb check, with every lamp lit, a lamp not picked out
    among the rest is looked for in its own place by its symbol alone: from
    farther off, the lamps' light runs into each other's margins.
-7. **Validate.** The layout at rest against the reference.
+7. **Validate** (Test). The layout at rest against the reference.
 
-**Test again** then tests a cluster against what was taught -- the same one
-after a change, or the next one off the line: the camera set as it was, a
-power cycle (every lamp lit in the bulb check, each in its place), the lamp
-check and the layout. **Teach again** starts over. Everything goes to
+**Test** tests a cluster against what was taught -- the same one after a
+change, or the next one off the line: the camera set as it was, a power
+cycle (every lamp lit in the bulb check, each in its place), the lamp check
+and the layout. It runs only when pressed, as often as wanted; with nothing
+taught it says so. **Teach again** starts over. Everything goes to
 `auto-HHMMSS/` in the output folder: `auto.json` (the run), `camera.json`,
 `teach.json`, `lamp-check.json`, `lamps.json` with the symbols, and pictures
 of the display found, the bulb check, the lamps and the named elements.
